@@ -1,5 +1,5 @@
 node_modules/
-users.db*
+users.json*
 .env
 .git/
 .gitignore

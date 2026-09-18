@@ -1,5 +1,5 @@
 node_modules/
-users.db*
+users.json*
 .env
 .DS_Store
 HDFCBANK_minute.csv

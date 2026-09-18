@@ -43,9 +43,9 @@ build check.
    - `ADMIN_USER=admin`
    - `ADMIN_PASS=<strong-secret>` (first boot creates this admin)
    - `SESSION_SECRET=<long-random-string>` (keeps logins alive across restarts)
-3. **Volumes** (keeps accounts after redeploys — without this `users.db`
+3. **Volumes** (keeps accounts after redeploys — without this `users.json`
    resets): add volume, mount path `/app/data`, plus variable
-   `DB_PATH=/app/data/users.db`.
+   `USERS_FILE=/app/data/users.json`.
 4. **Settings → Networking → Generate Domain** → share that URL.
    Your friend opens it, you create their account in 👥 Users, done.
 5. Data: the 51MB CSV is not in git — upload it in the sidebar each session

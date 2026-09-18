@@ -1,18 +1,18 @@
 /* XBOST server — session-auth gateway in front of the static terminal.
  * Public:  /login.html, /api/login
  * Guarded: everything else (terminal, engine, data) requires a login session.
- * Users live in SQLite (users.db). Admin bootstrap via ADMIN_USER/ADMIN_PASS.
+ * Users live in a JSON file (users.json). Admin bootstrap via ADMIN_USER/ADMIN_PASS.
  */
 'use strict';
 const express = require('express');
 const session = require('express-session');
 const bcrypt = require('bcryptjs');
-const Database = require('better-sqlite3');
+const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 8901;
 const PUBLIC_DIR = path.join(__dirname, 'public');
-const DB_PATH = process.env.DB_PATH || path.join(__dirname, 'users.db');
+const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'changeme';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'xbost-dev-secret-change-me';
@@ -20,21 +20,26 @@ const SESSION_SECRET = process.env.SESSION_SECRET || 'xbost-dev-secret-change-me
 if (!process.env.SESSION_SECRET) console.warn('[auth] SESSION_SECRET not set — using dev default. Set it in production.');
 if (!process.env.ADMIN_PASS) console.warn('[auth] ADMIN_PASS not set — admin password is "changeme". Change it on first login.');
 
-const db = new Database(DB_PATH);
-db.exec(`CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY AUTOINCREMENT,
-  username TEXT UNIQUE NOT NULL,
-  pass_hash TEXT NOT NULL,
-  role TEXT NOT NULL DEFAULT 'user',
-  active INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
-)`);
+// ---- tiny JSON user store (no native deps, no build toolchain needed) ----
+let users = [];
+function loadUsers() {
+  try { users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); if (!Array.isArray(users)) users = []; }
+  catch (e) { users = []; }
+}
+function saveUsers() {
+  fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
+  const tmp = USERS_FILE + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(users));
+  fs.renameSync(tmp, USERS_FILE);
+}
+loadUsers();
 
 // bootstrap admin
-const adminRow = db.prepare('SELECT id FROM users WHERE username = ?').get(ADMIN_USER);
-if (!adminRow) {
-  db.prepare("INSERT INTO users (username, pass_hash, role, active, created_at) VALUES (?, ?, 'admin', 1, datetime('now'))")
-    .run(ADMIN_USER, bcrypt.hashSync(ADMIN_PASS, 10));
+if (!users.some(u => u.username === ADMIN_USER)) {
+  users.push({ id: users.reduce((m, u) => Math.max(m, u.id), 0) + 1, username: ADMIN_USER,
+    pass_hash: bcrypt.hashSync(ADMIN_PASS, 10), role: 'admin', active: true,
+    created_at: new Date().toISOString().slice(0, 19).replace('T', ' ') });
+  saveUsers();
   console.log(`[auth] bootstrap admin user "${ADMIN_USER}" created`);
 }
 
@@ -67,7 +72,7 @@ app.post('/api/login', (req, res) => {
   if (throttled(ip)) return res.status(429).json({ error: 'Too many attempts. Try again in 5 minutes.' });
   const { username, password } = req.body || {};
   if (!username || !password) return res.status(400).json({ error: 'Username and password required.' });
-  const u = db.prepare('SELECT * FROM users WHERE username = ?').get(String(username).trim());
+  const u = users.find(x => x.username === String(username).trim());
   if (!u || !u.active || !bcrypt.compareSync(String(password), u.pass_hash)) {
     noteFail(ip);
     return res.status(401).json({ error: 'Invalid credentials.' });
@@ -93,7 +98,7 @@ function requireAdmin(req, res, next) {
 
 const pubUser = r => ({ id: r.id, username: r.username, role: r.role, active: !!r.active, created_at: r.created_at });
 app.get('/api/users', requireAdmin, (req, res) => {
-  res.json({ users: db.prepare('SELECT * FROM users ORDER BY id').all().map(pubUser) });
+  res.json({ users: users.slice().sort((a, b) => a.id - b.id).map(pubUser) });
 });
 
 app.post('/api/users', requireAdmin, (req, res) => {
@@ -101,35 +106,34 @@ app.post('/api/users', requireAdmin, (req, res) => {
   const name = String(username || '').trim();
   if (!/^[A-Za-z0-9_.-]{3,32}$/.test(name)) return res.status(400).json({ error: 'Username: 3-32 chars, letters/digits/._-' });
   if (!password || String(password).length < 8) return res.status(400).json({ error: 'Password: minimum 8 characters.' });
-  const r = role === 'admin' ? 'admin' : 'user';
-  try {
-    const info = db.prepare("INSERT INTO users (username, pass_hash, role, active, created_at) VALUES (?, ?, ?, 1, datetime('now'))")
-      .run(name, bcrypt.hashSync(String(password), 10), r);
-    res.status(201).json({ ok: true, user: pubUser(db.prepare('SELECT * FROM users WHERE id = ?').get(info.lastInsertRowid)) });
-  } catch (e) {
-    if (String(e.message).includes('UNIQUE')) return res.status(409).json({ error: 'Username already exists.' });
-    throw e;
-  }
+  if (users.some(u => u.username === name)) return res.status(409).json({ error: 'Username already exists.' });
+  const nu = { id: users.reduce((m, u) => Math.max(m, u.id), 0) + 1, username: name,
+    pass_hash: bcrypt.hashSync(String(password), 10), role: role === 'admin' ? 'admin' : 'user',
+    active: true, created_at: new Date().toISOString().slice(0, 19).replace('T', ' ') };
+  users.push(nu);
+  saveUsers();
+  res.status(201).json({ ok: true, user: pubUser(nu) });
 });
 
 app.patch('/api/users/:id', requireAdmin, (req, res) => {
   const id = +req.params.id;
-  const target = db.prepare('SELECT * FROM users WHERE id = ?').get(id);
+  const target = users.find(u => u.id === id);
   if (!target) return res.status(404).json({ error: 'User not found.' });
   const me = req.session.user;
   const { active, password, role } = req.body || {};
   if (target.id === me.id && active === false) return res.status(400).json({ error: 'Cannot deactivate yourself.' });
   if (target.id === me.id && role && role !== 'admin') return res.status(400).json({ error: 'Cannot demote yourself.' });
-  if (active !== undefined) db.prepare('UPDATE users SET active = ? WHERE id = ?').run(active ? 1 : 0, id);
+  if (active !== undefined) target.active = !!active;
   if (password !== undefined) {
     if (String(password).length < 8) return res.status(400).json({ error: 'Password: minimum 8 characters.' });
-    db.prepare('UPDATE users SET pass_hash = ? WHERE id = ?').run(bcrypt.hashSync(String(password), 10), id);
+    target.pass_hash = bcrypt.hashSync(String(password), 10);
   }
   if (role !== undefined) {
     if (target.id === me.id) return res.status(400).json({ error: 'Cannot change your own role.' });
-    db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role === 'admin' ? 'admin' : 'user', id);
+    target.role = role === 'admin' ? 'admin' : 'user';
   }
-  res.json({ ok: true, user: pubUser(db.prepare('SELECT * FROM users WHERE id = ?').get(id)) });
+  saveUsers();
+  res.json({ ok: true, user: pubUser(target) });
 });
 
 // ---- gate: login page + APIs public, everything else needs a session ----

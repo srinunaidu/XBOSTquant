@@ -25,7 +25,7 @@ jobs:
       ADMIN_USER: admin
       ADMIN_PASS: ci-smoke-pass
       SESSION_SECRET: ci-secret
-      DB_PATH: /tmp/xbost-ci.db
+      USERS_FILE: /tmp/xbost-ci-users.json
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
