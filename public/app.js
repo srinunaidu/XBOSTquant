@@ -6,15 +6,35 @@ const $ = id => document.getElementById(id);
 const TFS = [1,2,3,4,5,7,10,15];
 const state = { raw:null, data:null, board:[], sel:null, detail:null, sortKey:null, sortDir:1, charts:{}, worker:null };
 
-// ---------- sidebar: timeframes ----------
+// ---------- high-contrast alert banner (crimson on maroon) ----------
+function showAlert(msg){
+  const box=$('alertBox');
+  if(!box){alert(msg);return;}
+  box.innerHTML=`<span class="alert-ico">⚠</span><span>${msg}</span>`;
+  box.classList.remove('hidden');
+  box.scrollIntoView({block:'nearest'});
+}
+function clearAlert(){ const box=$('alertBox'); if(box){box.classList.add('hidden');box.innerHTML='';} }
+
+// ---------- sidebar: timeframes (pill toggles) ----------
 const tfBox = $('tfBox');
 TFS.forEach(tf=>{
-  const l=document.createElement('label');
-  l.className='flex items-center gap-1.5 text-xs bg-zinc-900 border border-zinc-700 rounded-md px-2 py-1 cursor-pointer hover:border-green-400';
-  l.innerHTML=`<input type="checkbox" data-tf="${tf}" checked/> <span class="num">${tf}m</span>`;
-  tfBox.appendChild(l);
+  const b=document.createElement('button');
+  b.type='button';
+  b.className='tf-pill on num';
+  b.dataset.tf=tf;
+  b.setAttribute('aria-pressed','true');
+  b.textContent=tf+'m';
+  b.onclick=()=>{ b.classList.toggle('on'); b.setAttribute('aria-pressed', b.classList.contains('on')); estimateCombos(); };
+  tfBox.appendChild(b);
 });
-tfBox.addEventListener('change', estimateCombos);
+
+// ---------- collapsible configuration sidebar (persisted) ----------
+try{ if(localStorage.getItem('xbost_sb')==='hide')document.body.classList.add('sb-hide'); }catch(e){}
+$('sideToggle').onclick=()=>{
+  document.body.classList.toggle('sb-hide');
+  try{localStorage.setItem('xbost_sb',document.body.classList.contains('sb-hide')?'hide':'show');}catch(e){}
+};
 
 // ---------- sidebar: indicators ----------
 const IND_META = [
@@ -102,7 +122,7 @@ $('btnAllInd').onclick=()=>{
   estimateCombos();
 };
 function getSelection(){
-  const tfs=[...tfBox.querySelectorAll('input:checked')].map(i=>+i.dataset.tf);
+  const tfs=[...tfBox.querySelectorAll('.tf-pill.on')].map(b=>+b.dataset.tf);
   const sels=[];
   document.querySelectorAll('.ind-card').forEach(c=>{
     if(!c.querySelector('[data-role=en]').checked)return;
@@ -180,12 +200,19 @@ $('fileInput').addEventListener('change', e=>{
   $('loadBarWrap').classList.remove('hidden');
   rd.onprogress=ev=>{ if(ev.lengthComputable)$('loadBar').style.width=(ev.loaded/ev.total*100)+'%'; };
   rd.onload=()=>{
-    const t0=performance.now();
-    const d=E.parseCSV(rd.result);
-    $('perfBadge').classList.remove('hidden');
-    $('perfBadge').textContent=`parsed ${(d.t.length/1000).toFixed(0)}k rows in ${((performance.now()-t0)/1000).toFixed(1)}s`;
-    setData(d, f.name+' · real'); $('loadBar').style.width='100%';
-    setTimeout(()=>$('loadBarWrap').classList.add('hidden'),800);
+    try{
+      const t0=performance.now();
+      const d=E.parseCSV(rd.result);
+      if(!d.t.length)throw new Error('no valid OHLCV rows found');
+      clearAlert();
+      $('perfBadge').classList.remove('hidden');
+      $('perfBadge').textContent=`parsed ${(d.t.length/1000).toFixed(0)}k rows in ${((performance.now()-t0)/1000).toFixed(1)}s`;
+      setData(d, f.name+' · real'); $('loadBar').style.width='100%';
+      setTimeout(()=>$('loadBarWrap').classList.add('hidden'),800);
+    }catch(err){
+      $('loadBarWrap').classList.add('hidden');
+      showAlert(`Could not parse "${f.name}": ${(err&&err.message)||err}. Expected header date,open,high,low,close,volume.`);
+    }
   };
   rd.readAsText(f);
 });
@@ -205,6 +232,7 @@ async function loadRepoCSV(){
   }catch(err){
     $('progTxt').textContent='idle';
     $('dataInfo').textContent='Bundled file not found on this server — upload your own 1-min CSV above.';
+    showAlert('Bundled HDFCBANK.csv not found on this server — upload a 1-min CSV file instead.');
   }
 }
 function tradeOpts(){
@@ -236,9 +264,9 @@ const EXIT_LBL={fixed:'FIX',breakeven:'BE',atr:'ATR'};
 // ---------- grid search ----------
 $('btnRun').onclick=runGrid;
 async function runGrid(){
-  if(!state.data){alert('Load real data first — upload a 1-min OHLCV CSV or click "Load HDFCBANK.csv".');return;}
+  if(!state.data){showAlert('No market data — upload a 1-min CSV (sidebar ①) before running a search.');return;}
   const {sels}=getSelection();
-  if(!sels.length){alert('Select at least one indicator.');return;}
+  if(!sels.length){showAlert('No indicators selected — enable at least one strategy in section ⑤.');return;}
   const risk=getRiskGrid();
   const dims=getExitDims();
   let grid=E.buildGrid(sels, risk, dims);
@@ -247,9 +275,10 @@ async function runGrid(){
   sels.forEach(s=>{ paramSteps[s.indicator]=s.steps||{}; });
   const cap=+$('maxCombos').value||60000;
   if(grid.length>cap){ if(!confirm(`Grid = ${grid.length} combos > cap ${cap}. Truncate to first ${cap}?`))return; grid=grid.slice(0,cap); }
-  if(!grid.length){alert('Empty grid — check parameter ranges.');return;}
+  if(!grid.length){showAlert('Empty grid — a parameter range produced zero values. Check min/max/step in ⑤.');return;}
   const objective=$('objective').value, topN=+$('topN').value||500;
   const opts=tradeOpts();
+  clearAlert();
   $('btnRun').disabled=true;
   $('liveBadge').classList.remove('hidden');
   $('progBar').style.width='0%';
@@ -290,6 +319,7 @@ async function runGrid(){
       if(runSeq===state.runSeq){
         $('progTxt').textContent=`❌ ERROR: ${(err2&&err2.message)||err2}`;
         $('nowRunning').textContent='Open DevTools console (F12) for the stack trace.';
+        showAlert(`Grid search failed: ${(err2&&err2.message)||err2} — see console (F12). Your data and settings are untouched.`);
         $('liveBadge').classList.add('hidden');
         $('btnRun').disabled=false;
       }
@@ -488,7 +518,7 @@ function renderBoard(){
     rows=rows.filter(r=>champSet.has(r));
     rows.sort((a,b)=>champs.indexOf(a)-champs.indexOf(b)); // keep champion order
   }
-  if(!rows.length){body.innerHTML='<tr><td class="text-zinc-500 text-center py-8">No results.</td></tr>';return;}
+  if(!rows.length){body.innerHTML='<tr><td><div class="empty-state">No strategies match — adjust the filter or run a grid search…</div></td></tr>';return;}
   const frag=document.createDocumentFragment();
   rows.forEach((r,ix)=>{
     const tr=document.createElement('tr');
@@ -542,7 +572,7 @@ function renderKPIs(){
     ['Sharpe / Sortino',m.sharpe.toFixed(2)+' / '+m.sortino.toFixed(2),m.sharpe>1],
   ]:[['Net P&L','—'],['Win Rate','—'],['Trades','—'],['Profit Factor','—'],['Max DD','—'],['Sharpe','—']];
   $('kpiStrip').innerHTML=items.map(([l,v,good])=>
-    `<div class="card kpi p-3${good===false?' neg-kpi':''}"><div class="lbl">${l}</div><div class="num font-disp text-xl font-bold mt-1 ${good===true?'pos':good===false?'neg':''}">${v}</div></div>`).join('');
+    `<div class="card glass kpi p-3${good===false?' neg-kpi':''}"><div class="lbl">${l}</div><div class="num font-disp text-xl font-bold mt-1 ${good===true?'pos':good===false?'neg':''}">${v}</div></div>`).join('');
 }
 
 // ---------- main candle canvas ----------
@@ -654,7 +684,7 @@ function renderSubCharts(){
 // ---------- trades ----------
 function renderTrades(){
   const tb=$('tradeBody'); tb.innerHTML='';
-  if(!state.detail){tb.innerHTML='<tr><td class="text-zinc-500 text-center py-8">No strategy loaded.</td></tr>';return;}
+  if(!state.detail){tb.innerHTML='<tr><td><div class="empty-state">No strategy loaded — run a search and click any row…</div></td></tr>';return;}
   const {bt}=state.detail, m=bt.metrics;
   $('tradeCount').textContent=`· ${bt.trades.length} closed trades`;
   $('tradeSummary').textContent=`avg ${fmtMoney(m.expectancy)} / trade · ${(m.tradesPerDay||0).toFixed(1)} trades/day · costs ${fmtMoney(-(bt.trades.length*(+$('costPer').value||0)))} · gross +${fmtMoney(m.grossProfit)} / -${fmtMoney(m.grossLoss)}`;
@@ -690,13 +720,13 @@ function dl(name, text){
   setTimeout(()=>URL.revokeObjectURL(a.href),2000);
 }
 $('btnExportBoard').onclick=()=>{
-  if(!state.board.length){alert('Nothing to export.');return;}
+  if(!state.board.length){showAlert('Nothing to export — run a grid search first.');return;}
   let s='rank,timeframe,indicator,params,exit,carry,sl_pct,tp_pct,net_pnl,win_rate,trades,trades_per_day,profit_factor,max_dd,sharpe,sortino,expectancy\n';
   state.board.forEach((r,i)=>{s+=`${i+1},${r.timeframe}m,${r.indicator},"${fmtParams(r.params)}",${r.exit||'fixed'},${r.carry?1:0},${(r.slPct||0).toFixed(3)},${(r.tpPct||0).toFixed(3)},${r.m.netPnL.toFixed(2)},${r.m.winRate.toFixed(2)},${r.m.totalTrades},${(r.m.tradesPerDay||0).toFixed(3)},${r.m.profitFactor.toFixed(3)},${r.m.maxDD.toFixed(3)},${r.m.sharpe.toFixed(3)},${r.m.sortino.toFixed(3)},${r.m.expectancy.toFixed(2)}\n`;});
   dl('xbost_leaderboard.csv',s);
 };
 $('btnExportTrades').onclick=()=>{
-  if(!state.detail){alert('Load a strategy first.');return;}
+  if(!state.detail){showAlert('No strategy loaded — run a search and click any leaderboard row.');return;}
   const {bt}=state.detail;
   let s='id,entry_time,exit_time,type,entry_px,exit_px,pnl,pnl_pct,reason\n';
   for(const t of bt.trades)s+=`${t.id},${new Date(t.entryTime).toISOString()},${new Date(t.exitTime).toISOString()},${t.type},${t.entryPx},${t.exitPx},${t.pnl.toFixed(2)},${t.pnlPct.toFixed(3)},${t.reason}\n`;
@@ -779,7 +809,7 @@ function runValidation(){
 }
 $('btnValidate').onclick=runValidation;
 $('btnLogDl').onclick=()=>{
-  if(!state.log.length){alert('Log is empty — run validation or a grid search first.');return;}
+  if(!state.log.length){showAlert('Session log is empty — run validation or a grid search first.');return;}
   dl(`xbost_log_${$('symbol').value}_${new Date().toISOString().slice(0,10)}.txt`,
     `XBOST run log · ${new Date().toString()}\n${'='.repeat(60)}\n`+state.log.join('\n')+'\n');
 };
