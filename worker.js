@@ -22,25 +22,30 @@ self.onmessage = function(e) {
   const batch = 25;
   const results = [];
   let errCount = 0;
-  // cache resampled bars + session mask per timeframe (built ONCE, reused by all combos)
+  // cache resampled bars + session masks per timeframe (built ONCE, reused by all combos)
+  // maskIn flattens outside session (intraday); maskCarry holds overnight
   const cache = {};
   function getTF(tf){
     if(!cache[tf]){
       const d=E.resample(d1m, tf);
-      cache[tf]={d, mask:E.buildSessionMask(d, tradeOpts.sessionStart, tradeOpts.sessionEnd)};
+      cache[tf]={d, maskIn:E.buildSessionMask(d, tradeOpts.sessionStart, tradeOpts.sessionEnd),
+        maskCarry:new Int8Array(d.c.length).fill(1)};
     }
     return cache[tf];
   }
-  function testCfg(cfg, idx){
+  function testCfg(cfg, idx, refined){
     const eff = Object.assign({}, tradeOpts);
     if(cfg.slPct!=null) eff.slPct=cfg.slPct;
     if(cfg.tpPct!=null) eff.tpPct=cfg.tpPct;
     if(cfg.trailPct!=null) eff.trailPct=cfg.trailPct;
+    eff.exit = cfg.exit||'fixed';
+    eff.carry = !!cfg.carry;
     const mk = (m, err) => ({ i: idx, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
-      slPct: eff.slPct||0, tpPct: eff.tpPct||0, trailPct: eff.trailPct||0, refined: !!cfg.refined, m: m, err: err });
+      slPct: eff.slPct||0, tpPct: eff.tpPct||0, trailPct: eff.trailPct||0,
+      exit: eff.exit, carry: eff.carry, refined: !!refined, m: m, err: err });
     try {
       const dd = getTF(cfg.timeframe);
-      eff.sessionMask = dd.mask;
+      eff.sessionMask = eff.carry ? dd.maskCarry : dd.maskIn;
       const sig = E.buildSignals(dd.d, cfg);
       const bt = E.backtest(dd.d, sig.pos, eff);
       return mk(bt.metrics);
@@ -57,7 +62,7 @@ self.onmessage = function(e) {
       const ranked = E.rankResults(results, objective).slice(0, topN);
       const cfg = grid[i];
       self.postMessage({ type:'progress', stage:'grid', done:i+1, total, top:ranked, errCount:errCount,
-        current:{ indicator:cfg.indicator, timeframe:cfg.timeframe, params:cfg.params, slPct:cfg.slPct||tradeOpts.slPct||0, tpPct:cfg.tpPct||tradeOpts.tpPct||0 } });
+        current:{ indicator:cfg.indicator, timeframe:cfg.timeframe, params:cfg.params, slPct:cfg.slPct||tradeOpts.slPct||0, tpPct:cfg.tpPct||tradeOpts.tpPct||0, exit:cfg.exit||'fixed', carry:!!cfg.carry } });
     }
   }
   // ---------- stage 2: hill-climb until best (max 4 passes over top-20) ----------
@@ -81,14 +86,15 @@ self.onmessage = function(e) {
     }
     if (!cands.length) break;
     for (let j = 0; j < cands.length; j++) {
-      results.push(testCfg(cands[j], total + refined));
+      results.push(testCfg(cands[j], total + refined, true));
       refined++;
       if ((j+1) % 25 === 0 || j === cands.length - 1) {
         const ranked = E.rankResults(results, objective).slice(0, topN);
         self.postMessage({ type:'progress', stage:'refine', done:total + refined, total: total + '+refine',
           top: ranked, errCount: errCount, pass: pass,
           current:{ indicator:cands[j].indicator, timeframe:cands[j].timeframe, params:cands[j].params,
-            slPct:cands[j].slPct||0, tpPct:cands[j].tpPct||0 } });
+            slPct:cands[j].slPct||0, tpPct:cands[j].tpPct||0,
+            exit:cands[j].exit||'fixed', carry:!!cands[j].carry } });
       }
     }
     pool = E.rankResults(results, objective).slice(0, 20);

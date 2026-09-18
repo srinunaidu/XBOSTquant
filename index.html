@@ -99,7 +99,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
     </select>
     <div class="grid grid-cols-2 gap-2 mt-2">
       <div><label class="lbl">Top-N board</label><input id="topN" type="number" value="500" min="10" max="5000" class="w-full mt-1 num"/></div>
-      <div><label class="lbl">Max combos cap</label><input id="maxCombos" type="number" value="20000" min="10" max="50000" class="w-full mt-1 num"/></div>
+      <div><label class="lbl">Max combos cap</label><input id="maxCombos" type="number" value="60000" min="10" max="200000" class="w-full mt-1 num"/></div>
     </div>
     <div id="comboEst" class="text-[11px] mt-2 num text-amber-300">Combos: 0</div>
     <div class="flex items-center gap-2 mt-2">
@@ -128,6 +128,26 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
       <div><label class="lbl">Cost / trade ₹</label><input id="costPer" type="number" step="1" value="20" class="w-full mt-1 num"/></div>
       <div><label class="lbl">Qty (× lot)</label><input id="qty" type="number" value="50" class="w-full mt-1 num"/></div>
       <div><label class="lbl">Lot size</label><input id="lotSize" type="number" value="1" class="w-full mt-1 num"/></div>
+    </div>
+    <div class="mt-2 rounded-lg border border-amber-900 bg-amber-950/20 p-2">
+      <div class="lbl mb-1.5">Exit logic — searched dimensions</div>
+      <div class="flex flex-col gap-1 text-[12px]">
+        <label class="flex items-center gap-2 cursor-pointer"><input id="exitFixed" type="checkbox" checked/> Fixed SL / TP</label>
+        <label class="flex items-center gap-2 cursor-pointer"><input id="exitBE" type="checkbox" checked/> Moving SL — breakeven + trail</label>
+        <label class="flex items-center gap-2 cursor-pointer"><input id="exitATR" type="checkbox"/> ATR Chandelier trailing stop</label>
+      </div>
+      <div class="grid grid-cols-2 gap-1.5 mt-1.5">
+        <div><label class="lbl">BE trigger %</label><input id="beTrigger" type="number" step="any" value="0.5" class="w-full mt-1 num"/></div>
+        <div><label class="lbl">BE lock %</label><input id="beLock" type="number" step="any" value="0.0" class="w-full mt-1 num"/></div>
+        <div><label class="lbl">ATR period</label><input id="atrP" type="number" step="1" value="14" class="w-full mt-1 num"/></div>
+        <div><label class="lbl">ATR mult</label><input id="atrM" type="number" step="any" value="3.0" class="w-full mt-1 num"/></div>
+      </div>
+      <div class="lbl mt-2 mb-1">Session handling — compare intraday vs carry</div>
+      <div class="flex gap-3 text-xs">
+        <label class="flex items-center gap-1"><input type="radio" name="sess" value="intraday" checked/> Intraday (flat 15:15)</label>
+        <label class="flex items-center gap-1"><input type="radio" name="sess" value="carry"/> Carry overnight</label>
+        <label class="flex items-center gap-1"><input type="radio" name="sess" value="both"/> Both ⚖</label>
+      </div>
     </div>
     <div class="mt-2 rounded-lg border border-green-900 bg-green-950/30 p-2">
       <label class="flex items-center gap-2 text-[12px] font-semibold text-green-300 cursor-pointer"><input id="optRisk" type="checkbox" checked/> 🎯 Optimize Stop / Target in grid search</label>
@@ -167,15 +187,29 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
       <div class="flex gap-1 ml-2">
         <button id="tabAll" class="btn !py-1 !px-2.5 !text-[11px]">📋 All results</button>
         <button id="tabBest" class="btn-ghost btn !py-1 !px-2.5 !text-[11px]">🏆 Best per indicator</button>
+        <button id="tabCmp" class="btn-ghost btn !py-1 !px-2.5 !text-[11px]">⚖ Compare exits</button>
       </div>
       <input id="boardFilter" placeholder="filter e.g. EMA 5m…" class="ml-auto !text-xs !py-1.5 px-2 w-52"/>
     </div>
     <div id="bestNote" class="hidden text-[11px] text-green-300 num mb-2">★ One champion row per indicator — the best combination found (grid + hill-climb refinement) for the current objective. Full details in every column.</div>
-    <div class="overflow-auto max-h-[380px] border border-zinc-800 rounded-lg">
-      <table class="w-full min-w-[1150px]">
+    <div id="boardWrap" class="overflow-auto max-h-[380px] border border-zinc-800 rounded-lg">
+      <table class="w-full min-w-[1300px]">
         <thead class="bg-zinc-900 sticky top-0"><tr id="boardHead"></tr></thead>
         <tbody id="boardBody"><tr><td class="text-zinc-500 text-center py-8">Run a grid search to populate strategies…</td></tr></tbody>
       </table>
+    </div>
+    <div id="cmpWrap" style="display:none">
+      <div id="cmpNote" class="text-[11px] text-amber-300 num mb-2"></div>
+      <div class="overflow-auto max-h-[300px] border border-zinc-800 rounded-lg mb-2">
+        <table class="w-full min-w-[1150px]">
+          <thead class="bg-zinc-900 sticky top-0"><tr>
+            <th>#</th><th>Exit profile</th><th>TF</th><th>Strategy</th><th>Params</th><th>SL %</th><th>TP %</th><th>Net P&L ₹</th><th>WR %</th><th>Trades</th><th>PF</th><th>MaxDD %</th><th>Sharpe</th>
+          </tr></thead>
+          <tbody id="cmpBody"><tr><td class="text-zinc-500 text-center py-8">Run a grid search to compare exit profiles…</td></tr></tbody>
+        </table>
+      </div>
+      <div class="font-bold text-sm mb-2">📊 Champion equity overlay <span class="text-zinc-500 font-normal text-xs">— one curve per exit profile</span></div>
+      <canvas id="cmpChart" class="chart"></canvas>
     </div>
   </section>
 

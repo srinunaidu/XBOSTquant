@@ -84,6 +84,17 @@ Flat (`0`) during indicator warmup; otherwise:
 - **Target** (`tpPct` %): long exits if `high ≥ entry·(1+tp)`; short if `low ≤ entry·(1−tp)`.
 - **Trailing** (`trailPct` %): tracks the favourable extreme, **armed only while the
   trade is profitable** (`ret > 0`); long exits if `low ≤ peak·(1−trail)`.
+- **Exit mode** (`exit`, searched dimension):
+  - `fixed`: SL / TP / trailing as above.
+  - `breakeven`: once trade profit `ret ≥ beTrigger` (default = SL %, i.e. 1R),
+    the stop floor locks to `entry·(1+beLock)` (default `beLock = 0` = flat);
+    exits print reason `BE`. TP and trailing stay active.
+  - `atr` (Chandelier): replaces the fixed SL with
+    `longStop = highestHigh_since_entry − atrMult·ATR(atrP)` (mirror for shorts);
+    exits print `ATR`. TP stays active; fixed SL and trailing are off.
+- **Session / carry** (`carry`, searched dimension): intraday (`carry=false`) uses
+  the session mask (flat outside hours, no overnight); carry (`carry=true`)
+  ignores the mask and holds positions across days. SL/TP/stops still apply.
 - **Same-bar precedence: SL > TP > TRAIL** (conservative: if a 1-minute bar touches
   both stop and target, the stop is assumed hit first).
 - **Signal flip**: close + immediate re-entry at the same close.
@@ -113,6 +124,7 @@ Flat (`0`) during indicator warmup; otherwise:
 ## 7. Search
 
 - **Stage 1 (grid)**: Cartesian product of timeframes × indicator params × SL × TP
+  × exit-mode × intraday/carry
   (`expandRange` caps each axis at 25 values; whole grid capped by Max-Combos).
 - **Stage 2 (refine)**: hill-climb on the top-20 rows — every param ±1 UI step
   plus SL/TP ±their steps (`paramNeighbors`) — repeated until the objective stops

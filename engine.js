@@ -443,24 +443,40 @@ function backtest(d, sigPos, opts){
     let s=sigPos[i];
     if(s===1&&!allowLong)s=0;
     if(s===-1&&!allowShort)s=0;
-    if(!mask[i])s=0; // force flat outside session
+    if(useMask&&!useMask[i])s=0; // intraday: force flat outside session; carry: hold overnight
     return s;
   }
   let curQty=0;
   let liveEq=capital0, ruined=false; // ruin guard: account blown -> no new entries
+  // dynamic exit plumbing
+  const exitMode=opts.exit||'fixed'; // fixed | breakeven | atr
+  const beTrig=((opts.beTrigger!=null?opts.beTrigger:((opts.slPct||0)))/100); // profit to lock breakeven (default 1R)
+  const beLock=(opts.beLock||0)/100; // locked profit once triggered (0 = flat breakeven)
+  const atrMult=opts.atrTrailMult||3;
+  let atrArr=null;
+  if(exitMode==='atr')atrArr=atr(d.h,d.l,d.c,Math.max(2,Math.round(opts.atrTrailPeriod||14)));
+  let hiEntry=0, loEntry=0, beDone=false;
+  const useMask=opts.carry?null:mask; // carry overnight => ignore session flattening
   for(let i=1;i<n;i++){
     const px=d.c[i];
     // manage open position: SL / target / trailing / signal flip / session exit
     if(position!==0){
       const ret=position===1?(px-entryPx)/entryPx:(entryPx-px)/entryPx;
-      if(position===1){if(px>trailPeak)trailPeak=px;}
-      else{if(px<trough||trough===0)trough=px; if(trough===0)trough=px;}
+      if(position===1){if(px>trailPeak)trailPeak=px;if(d.h[i]>hiEntry)hiEntry=d.h[i];}
+      else{if(px<trough||trough===0)trough=px; if(trough===0)trough=px;if(d.l[i]<loEntry||loEntry===0)loEntry=d.l[i];}
+      if(exitMode==='breakeven'&&!beDone&&ret>=beTrig)beDone=true; // lock floor once +beTrigger reached
       // trailing stop
       let stopHit=false, reason='';
-      if(slPct>0){
-        const slPx=position===1?entryPx*(1-slPct):entryPx*(1+slPct);
-        if(position===1&&d.l[i]<=slPx){stopHit=true;reason='SL';}
-        if(position===-1&&d.h[i]>=slPx){stopHit=true;reason='SL';}
+      if(exitMode==='atr'&&atrArr&&!isNaN(atrArr[i])){
+        // Chandelier: stop hangs k·ATR below highest-high (long) since entry; replaces fixed SL
+        const chL=hiEntry-atrMult*atrArr[i], chS=loEntry+atrMult*atrArr[i];
+        if(position===1&&d.l[i]<=chL){stopHit=true;reason='ATR';}
+        if(position===-1&&d.h[i]>=chS){stopHit=true;reason='ATR';}
+      } else if(slPct>0){
+        const slBase=position===1?entryPx*(1-slPct):entryPx*(1+slPct);
+        const slPx=(exitMode==='breakeven'&&beDone)?(position===1?entryPx*(1+beLock):entryPx*(1-beLock)):slBase;
+        if(position===1&&d.l[i]<=slPx){stopHit=true;reason=beDone&&exitMode==='breakeven'?'BE':'SL';}
+        if(position===-1&&d.h[i]>=slPx){stopHit=true;reason=beDone&&exitMode==='breakeven'?'BE':'SL';}
       }
       if(!stopHit&&tpPct>0){
         const tpPx=position===1?entryPx*(1+tpPct):entryPx*(1-tpPct);
@@ -479,6 +495,8 @@ function backtest(d, sigPos, opts){
         let exitPx=px;
         if(stopHit){
           if(reason==='SL')exitPx=position===1?entryPx*(1-slPct):entryPx*(1+slPct);
+          else if(reason==='BE')exitPx=position===1?entryPx*(1+beLock):entryPx*(1-beLock);
+          else if(reason==='ATR')exitPx=position===1?(hiEntry-atrMult*atrArr[i]):(loEntry+atrMult*atrArr[i]);
           else if(reason==='TP')exitPx=position===1?entryPx*(1+tpPct):entryPx*(1-tpPct);
           else exitPx=position===1?trailPeak*(1-trailPct):trough*(1+trailPct);
         }
@@ -490,15 +508,17 @@ function backtest(d, sigPos, opts){
         liveEq+=pnl;
         if(liveEq<=0)ruined=true; // blown up: manage nothing more, open nothing new
         // immediate re-entry on flip (enter at same close; mask already enforced via tgt)
-        if(flip&&mask[i]&&!ruined){
+        if(flip&&(!useMask||useMask[i])&&!ruined){
           position=tgt;entryPx=px;entryIdx=i;trailPeak=px;trough=px;curQty=units;
+          hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
         }
         continue;
       }
     } else {
       const tgt=desiredTarget(i);
-      if(tgt!==0&&mask[i]&&!ruined){
+      if(tgt!==0&&(!useMask||useMask[i])&&!ruined){
         position=tgt;entryPx=px;entryIdx=i;trailPeak=px;trough=px;curQty=qty*lotSize;
+        hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
       }
     }
   }
@@ -603,7 +623,7 @@ function paramNeighbors(row, steps, riskSteps){
       if(!isFinite(v)||v<=0||v===cur)continue;
       if(INT_KEYS[k]&&(!Number.isInteger(v)||v<2))continue;
       const np=Object.assign({},P);np[k]=v;
-      const c={timeframe:row.timeframe,indicator:row.indicator,params:np};
+      const c={timeframe:row.timeframe,indicator:row.indicator,params:np,exit:row.exit||'fixed',carry:!!row.carry};
       if(row.slPct!=null)c.slPct=row.slPct;
       if(row.tpPct!=null)c.tpPct=row.tpPct;
       if(row.trailPct!=null)c.trailPct=row.trailPct;
@@ -615,7 +635,7 @@ function paramNeighbors(row, steps, riskSteps){
     for(const dir of [-1,1]){
       const v=+((+row[key])+dir*step).toFixed(4);
       if(!isFinite(v)||v<lo||v>hi)continue;
-      const c={timeframe:row.timeframe,indicator:row.indicator,params:Object.assign({},P)};
+      const c={timeframe:row.timeframe,indicator:row.indicator,params:Object.assign({},P),exit:row.exit||'fixed',carry:!!row.carry};
       c.slPct=row.slPct;c.tpPct=row.tpPct;
       if(row.trailPct!=null)c.trailPct=row.trailPct;
       c[key]=v;out.push(c);
@@ -627,17 +647,21 @@ function paramNeighbors(row, steps, riskSteps){
 }
 
 function cfgKey(c){
-  return c.timeframe+'|'+c.indicator+'|'+JSON.stringify(c.params)+'|'+(c.slPct||'')+'|'+(c.tpPct||'');
+  return c.timeframe+'|'+c.indicator+'|'+JSON.stringify(c.params)+'|'+(c.slPct||'')+'|'+(c.tpPct||'')+'|'+(c.exit||'fixed')+'|'+(c.carry?1:0);
 }
 
-function buildGrid(selected, risk){
+function buildGrid(selected, risk, dims){
   // selected: [{indicator, ranges:{key:{min,max,step}}}, ...], timeframes:[...]
   // risk: {sl:[...], tp:[...], trail:[...]} — stop/target are searched per timeframe+indicator
   // so the data decides the best SL/TP (omit risk => fixed execution opts are used)
+  // dims: {exits:['fixed','breakeven','atr'], carry:[false,true]} — exit logic and
+  // intraday-vs-carry are searched dimensions too (mode params stay fixed inputs)
   const combos=[];
   const slVals=(risk&&risk.sl&&risk.sl.length)?risk.sl:[null];
   const tpVals=(risk&&risk.tp&&risk.tp.length)?risk.tp:[null];
   const trailVals=(risk&&risk.trail&&risk.trail.length)?risk.trail:[null];
+  const exits=(dims&&dims.exits&&dims.exits.length)?dims.exits:['fixed'];
+  const carrys=(dims&&dims.carry&&dims.carry.length)?dims.carry:[false];
   for(const s of selected){
     const schema=SCHEMA[s.indicator]||[];
     const axes=schema.map(p=>{
@@ -649,8 +673,8 @@ function buildGrid(selected, risk){
       for(const combo of prod){
         const params={};
         for(const kv of combo)params[kv.key]=kv.val;
-        for(const sl of slVals)for(const tp of tpVals)for(const tr of trailVals){
-          const c={timeframe:t,indicator:s.indicator,params};
+        for(const sl of slVals)for(const tp of tpVals)for(const tr of trailVals)for(const ex of exits)for(const cy of carrys){
+          const c={timeframe:t,indicator:s.indicator,params,exit:ex,carry:cy};
           if(sl!=null)c.slPct=sl; if(tp!=null)c.tpPct=tp; if(tr!=null)c.trailPct=tr;
           combos.push(c);
         }

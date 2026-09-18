@@ -122,9 +122,10 @@ function estimateCombos(){
   const {sels}=getSelection();
   try{
     const risk=getRiskGrid();
-    const grid=E.buildGrid(sels, risk);
+    const dims=getExitDims();
+    const grid=E.buildGrid(sels, risk, dims);
     const mult=risk?` × SL[${risk.sl.join(',')}] × TP[${risk.tp.join(',')}]`:' · fixed SL/TP';
-    $('comboEst').textContent=`Combos: ${grid.length}  (${sels.length} indicators × timeframes${mult})`;
+    $('comboEst').textContent=`Combos: ${grid.length}  (${sels.length} ind × TF × exit[${dims.exits.join('/')}] × ${dims.carry.length>1?'day+carry':(dims.carry[0]?'carry':'day')}${mult})`;
     $('comboEst').className='text-[11px] mt-2 num '+(grid.length>+$('maxCombos').value?'text-red-400':'text-amber-300');
   }catch(e){$('comboEst').textContent='Combos: —';}
 }
@@ -188,9 +189,23 @@ function tradeOpts(){
     sessionEnd:$('useSession').checked?$('sessEnd').value:null,
     slPct:+$('slPct').value||0, tpPct:+$('tpPct').value||0, trailPct:+$('trailPct').value||0,
     capital:+$('capital').value||100000, qty:+$('qty').value||1, lotSize:+$('lotSize').value||1,
-    cost:+$('costPer').value||0
+    cost:+$('costPer').value||0,
+    beTrigger:+$('beTrigger').value||0, beLock:+$('beLock').value||0,
+    atrTrailPeriod:+$('atrP').value||14, atrTrailMult:+$('atrM').value||3
   };
 }
+function getExitDims(){
+  const exits=[];
+  if($('exitFixed').checked)exits.push('fixed');
+  if($('exitBE').checked)exits.push('breakeven');
+  if($('exitATR').checked)exits.push('atr');
+  const sess=(document.querySelector('input[name=sess]:checked')||{}).value||'intraday';
+  const carry=sess==='carry'?[true]:sess==='both'?[false,true]:[false];
+  return {exits:exits.length?exits:['fixed'], carry};
+}
+['exitFixed','exitBE','exitATR'].forEach(id=>$(id).addEventListener('change',estimateCombos));
+document.querySelectorAll('input[name=sess]').forEach(r=>r.addEventListener('change',estimateCombos));
+const EXIT_LBL={fixed:'FIX',breakeven:'BE',atr:'ATR'};
 
 // ---------- grid search ----------
 $('btnRun').onclick=runGrid;
@@ -199,11 +214,12 @@ async function runGrid(){
   const {sels}=getSelection();
   if(!sels.length){alert('Select at least one indicator.');return;}
   const risk=getRiskGrid();
-  let grid=E.buildGrid(sels, risk);
+  const dims=getExitDims();
+  let grid=E.buildGrid(sels, risk, dims);
   // per-indicator param steps for the hill-climb refine loop
   const paramSteps={};
   sels.forEach(s=>{ paramSteps[s.indicator]=s.steps||{}; });
-  const cap=+$('maxCombos').value||20000;
+  const cap=+$('maxCombos').value||60000;
   if(grid.length>cap){ if(!confirm(`Grid = ${grid.length} combos > cap ${cap}. Truncate to first ${cap}?`))return; grid=grid.slice(0,cap); }
   if(!grid.length){alert('Empty grid — check parameter ranges.');return;}
   const objective=$('objective').value, topN=+$('topN').value||500;
@@ -224,7 +240,7 @@ async function runGrid(){
     if(typeof done==='number'&&typeof total==='number')$('progBar').style.width=Math.min(100,done/total*100)+'%';
     const perSec=(typeof done==='number'?done:0)/Math.max(0.5,(performance.now()-t0)/1000);
     $('progTxt').textContent=`${done} / ${total}${stage==='refine'?` · 🔁 refine pass ${pass||''}`:''} (${pct}%) · ${perSec.toFixed(0)}/s · leaderboard streaming live ↓`;
-    if(current) $('nowRunning').textContent=`${stage==='refine'?'🔁 refining best:':'⚙ now running:'} ${current.indicator} ${current.timeframe}m · ${fmtParams(current.params)}${current.slPct!=null?` · SL ${current.slPct}% TP ${current.tpPct}%`:''}`;
+    if(current) $('nowRunning').textContent=`${stage==='refine'?'🔁 refining best:':'⚙ now running:'} ${current.indicator} ${current.timeframe}m · ${fmtParams(current.params)}${current.slPct!=null?` · SL ${current.slPct}% TP ${current.tpPct}%`:''}${current.exit?` · ${EXIT_LBL[current.exit]||current.exit}${current.carry?'+carry':''}`:''}`;
     if(state.runError) $('nowRunning').textContent+=` · ⚠ ${state.runError} combos errored`;
     state.board=top;
     const now=performance.now(); // rebuilding 500 DOM rows every batch freezes UI — throttle
@@ -269,7 +285,7 @@ function runWithWorker(grid,opts,objective,topN,onBatch,paramSteps,risk){
     state.worker=w;
     const d=state.data;
     const payload={t:d.t,o:d.o,h:d.h,l:d.l,c:d.c,v:d.v};
-    const timer=setTimeout(()=>{try{w.terminate();}catch(e){}reject(new Error('worker timeout'));},1000*60*10);
+    const timer=setTimeout(()=>{try{w.terminate();}catch(e){}reject(new Error('worker timeout'));},1000*60*30);
     w.onmessage=e=>{
       const m=e.data;
       if(m.type==='progress'){ if(m.errCount) state.runError=m.errCount; onBatch(m.done,m.total,m.top,m.current,m.stage,m.pass); }
@@ -290,18 +306,19 @@ async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
   const getTF=tf=>{
     if(!cache[tf]){
       const d=E.resample(state.data,tf);
-      cache[tf]={d, mask:E.buildSessionMask(d, opts.sessionStart, opts.sessionEnd)};
+      cache[tf]={d, maskIn:E.buildSessionMask(d, opts.sessionStart, opts.sessionEnd), maskCarry:new Int8Array(d.c.length).fill(1)};
     }
     return cache[tf];
   };
   function testCfg(cfg, idx, refined){
-    const {d, mask}=getTF(cfg.timeframe);
-    const eff=Object.assign({},opts,{sessionMask:mask});
+    const tfc=getTF(cfg.timeframe), d=tfc.d;
+    const eff=Object.assign({},opts,{sessionMask:(cfg.carry?tfc.maskCarry:tfc.maskIn)});
     if(cfg.slPct!=null)eff.slPct=cfg.slPct;
     if(cfg.tpPct!=null)eff.tpPct=cfg.tpPct;
     if(cfg.trailPct!=null)eff.trailPct=cfg.trailPct;
+    eff.exit=cfg.exit||'fixed'; eff.carry=!!cfg.carry;
     const sig=E.buildSignals(d,cfg), bt=E.backtest(d,sig.pos,eff);
-    return {i:idx,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0,trailPct:eff.trailPct||0,refined:!!refined,m:bt.metrics};
+    return {i:idx,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0,trailPct:eff.trailPct||0,exit:eff.exit,carry:eff.carry,refined:!!refined,m:bt.metrics};
   }
   for(let i=0;i<grid.length;i++){
     const cfg=grid[i];
@@ -343,10 +360,11 @@ async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
 // ---------- leaderboard ----------
 const COLS=[
   {k:'rank',l:'#'},{k:'timeframe',l:'TF'},{k:'indicator',l:'Strategy'},{k:'params',l:'Params'},
-  {k:'sl',l:'SL %'},{k:'tp',l:'TP %'},
+  {k:'exit',l:'Exit'},{k:'sess',l:'Sess'},{k:'sl',l:'SL %'},{k:'tp',l:'TP %'},
   {k:'netPnL',l:'Net P&L ₹'},{k:'winRate',l:'WR %'},{k:'totalTrades',l:'Trades'},{k:'tradesPerDay',l:'T/Day'},
   {k:'profitFactor',l:'PF'},{k:'maxDD',l:'MaxDD %'},{k:'sharpe',l:'Sharpe'},{k:'sortino',l:'Sortino'},
 ];
+function exitTag(r){return (EXIT_LBL[r.exit||'fixed']||'FIX')+(r.carry?'+C':'');}
 function fmtParams(p){return Object.entries(p||{}).map(([k,v])=>`${k}=${v}`).join(' ')||'—';}
 state.view=state.view||'all';
 function bestPerIndicator(){
@@ -358,14 +376,74 @@ function bestPerIndicator(){
 }
 function setView(v){
   state.view=v;
-  const all=v==='all';
-  $('tabAll').className=all?'btn !py-1 !px-2.5 !text-[11px]':'btn-ghost btn !py-1 !px-2.5 !text-[11px]';
-  $('tabBest').className=!all?'btn !py-1 !px-2.5 !text-[11px]':'btn-ghost btn !py-1 !px-2.5 !text-[11px]';
-  $('bestNote').classList.toggle('hidden', all);
-  renderBoard();
+  const btn=(id,on)=>{$(id).className=on?'btn !py-1 !px-2.5 !text-[11px]':'btn-ghost btn !py-1 !px-2.5 !text-[11px]';};
+  btn('tabAll',v==='all');btn('tabBest',v==='best');btn('tabCmp',v==='cmp');
+  $('bestNote').classList.toggle('hidden', v==='all');
+  $('bestNote').textContent = v==='best'
+    ? '★ One champion row per indicator — the best combination found (grid + hill-climb refinement) for the current objective. Full details in every column.'
+    : '⚖ Champion per exit profile (exit logic × intraday/carry) with overlaid equity curves below. Click any row to load it on the charts.';
+  $('boardWrap').style.display=v==='cmp'?'none':'';
+  $('cmpWrap').style.display=v==='cmp'?'':'none';
+  if(v==='cmp')renderCompare();else renderBoard();
 }
 $('tabAll').onclick=()=>setView('all');
 $('tabBest').onclick=()=>setView('best');
+$('tabCmp').onclick=()=>setView('cmp');
+function profileKey(r){return (EXIT_LBL[r.exit||'fixed']||'FIX')+(r.carry?' + carry':' intraday');}
+function profileChampions(){
+  // best row per exit-profile (exit mode × day/carry) under current objective
+  const ranked=E.rankResults(state.board, $('objective').value);
+  const seen={}, out=[];
+  for(const r of ranked){const k=profileKey(r);if(!seen[k]){seen[k]=1;out.push(r);}}
+  return out;
+}
+function runDetailFor(r){
+  // full detail backtest for any board row (used by compare overlay)
+  const d=E.resample(state.data, r.timeframe);
+  const sig=E.buildSignals(d,{indicator:r.indicator,params:r.params});
+  const eff=tradeOpts();
+  if(r.slPct!=null)eff.slPct=r.slPct;
+  if(r.tpPct!=null)eff.tpPct=r.tpPct;
+  if(r.trailPct!=null)eff.trailPct=r.trailPct;
+  eff.exit=r.exit||'fixed'; eff.carry=!!r.carry;
+  eff.sessionMask=eff.carry?new Int8Array(d.c.length).fill(1):E.buildSessionMask(d, eff.sessionStart, eff.sessionEnd);
+  const bt=E.backtest(d,sig.pos,eff);
+  return {cfg:r,data:d,sig,bt};
+}
+function renderCompare(){
+  const tb=$('cmpBody'); tb.innerHTML='';
+  $('cmpNote').textContent=state.board.length?`${state.board.length} combos ranked by ${$('objective').selectedOptions[0].textContent}`:'Run a grid search first.';
+  if(!state.board.length)return;
+  const champs=profileChampions();
+  const frag=document.createDocumentFragment();
+  champs.forEach((r,ix)=>{
+    const tr=document.createElement('tr');
+    if(state.sel===r)tr.classList.add('sel');
+    const m=r.m;
+    [ix+1,profileKey(r),r.timeframe+'m',r.indicator,fmtParams(r.params),
+     (r.slPct||0).toFixed(2),(r.tpPct||0).toFixed(2),
+     fmtMoney(m.netPnL),m.winRate.toFixed(1),m.totalTrades,m.profitFactor.toFixed(2),m.maxDD.toFixed(2),m.sharpe.toFixed(2)
+    ].forEach(v=>{const td=document.createElement('td');td.textContent=v;tr.appendChild(td);});
+    tr.children[7].className=m.netPnL>=0?'pos':'neg';
+    tr.onclick=()=>{selectRow(r);tr.classList.add('sel');};
+    frag.appendChild(tr);
+  });
+  tb.appendChild(frag);
+  // overlaid equity curves of the profile champions
+  const colors=['#22ff88','#38bdf8','#facc15','#f472b6','#c084fc','#fb923c'];
+  const details=champs.slice(0,6).map(runDetailFor);
+  const stride=Math.max(1,Math.floor(details[0].data.t.length/1500));
+  const labels=[];
+  for(let i=0;i<details[0].data.t.length;i+=stride)labels.push(new Date(details[0].data.t[i]).toLocaleDateString('en-IN',{day:'2-digit',month:'short'}));
+  const datasets=details.map((dt,di)=>{
+    const pts=[];
+    for(let i=0;i<dt.data.t.length;i+=stride)pts.push(+dt.bt.equity[i].toFixed(0));
+    return {label:profileKey(dt.cfg)+' · '+dt.cfg.indicator+' '+dt.cfg.timeframe+'m',data:pts,borderColor:colors[di%colors.length],borderWidth:1.5,pointRadius:0,tension:0.15};
+  });
+  mkChart('cmpChart',{type:'line',data:{labels,datasets},
+    options:{responsive:true,plugins:{legend:{labels:{color:'#a1a1aa',font:{size:10},boxWidth:12}}},
+      scales:{x:{display:false},y:{grid:{color:gridColor},ticks:{color:tickColor,font:{size:10}}}}}});
+}
 function renderBoard(){
   const head=$('boardHead'); head.innerHTML='';
   COLS.forEach(c=>{
@@ -375,7 +453,7 @@ function renderBoard(){
   });
   const q=($('boardFilter').value||'').toLowerCase();
   const body=$('boardBody'); body.innerHTML='';
-  let rows=state.board.filter(r=>!q||(r.indicator+' '+r.timeframe+' '+fmtParams(r.params)).toLowerCase().includes(q));
+  let rows=state.board.filter(r=>!q||(r.indicator+' '+r.timeframe+' '+fmtParams(r.params)+' '+(r.exit||'')+(r.carry?' carry':'')).toLowerCase().includes(q));
   if(state.view==='best'){
     const champs=bestPerIndicator();
     const champSet=new Set(champs);
@@ -388,14 +466,15 @@ function renderBoard(){
     const tr=document.createElement('tr');
     if(state.sel===r)tr.classList.add('sel');
     const m=r.m;
-    const cells=[ix+1,r.timeframe+'m',r.indicator,fmtParams(r.params),
+    const cells=[ix+1,r.timeframe+'m',r.indicator+(r.refined?' 🔁':''),fmtParams(r.params),
+      EXIT_LBL[r.exit||'fixed']||'FIX',r.carry?'CRY':'DAY',
       (r.slPct||0).toFixed(2),(r.tpPct||0).toFixed(2),
       fmtMoney(m.netPnL),m.winRate.toFixed(1),m.totalTrades,(m.tradesPerDay||0).toFixed(1),m.profitFactor.toFixed(2),m.maxDD.toFixed(2),m.sharpe.toFixed(2),m.sortino.toFixed(2)];
     cells.forEach((v,ci)=>{
-      const td=document.createElement('td'); td.textContent=v+(ci===2&&r.refined?' 🔁':'');
-      if(ci===6)td.className=m.netPnL>=0?'pos':'neg';
-      if(ci===7)td.className=m.winRate>=50?'pos':'';
-      if(ci===11)td.className='neg';
+      const td=document.createElement('td'); td.textContent=v;
+      if(ci===8)td.className=m.netPnL>=0?'pos':'neg';
+      if(ci===9)td.className=m.winRate>=50?'pos':'';
+      if(ci===13)td.className='neg';
       tr.appendChild(td);
     });
     tr.onclick=()=>selectRow(r);
@@ -405,7 +484,7 @@ function renderBoard(){
 }
 function sortBoard(){
   const k=state.sortKey; if(!k||k==='rank')return;
-  const val=r=>k==='params'?fmtParams(r.params):k==='sl'?(r.slPct||0):k==='tp'?(r.tpPct||0):(r.m[k]??r[k]);
+  const val=r=>k==='params'?fmtParams(r.params):k==='sl'?(r.slPct||0):k==='tp'?(r.tpPct||0):k==='exit'?(r.exit||'fixed'):k==='sess'?(r.carry?'carry':'day'):(r.m[k]??r[k]);
   state.board.sort((a,b)=>{const x=val(a),y=val(b);return(typeof x==='string'?x.localeCompare(y):x-y)*state.sortDir;});
 }
 $('boardFilter').addEventListener('input',renderBoard);
@@ -416,17 +495,9 @@ function fmtT(t){const d=new Date(t);return d.toLocaleString('en-IN',{day:'2-dig
 function selectRow(r, auto){
   state.sel=r;
   if(!auto) state.userPicked=state.runSeq||0;
-  document.querySelectorAll('#boardBody tr').forEach(tr=>tr.classList.remove('sel'));
+  document.querySelectorAll('#boardBody tr, #cmpBody tr').forEach(tr=>tr.classList.remove('sel'));
   renderBoardKeepSel();
-  const d=E.resample(state.data, r.timeframe);
-  const sig=E.buildSignals(d,{indicator:r.indicator,params:r.params});
-  const eff=tradeOpts(); // row's data-driven SL/TP override the fixed inputs
-  if(r.slPct!=null)eff.slPct=r.slPct;
-  if(r.tpPct!=null)eff.tpPct=r.tpPct;
-  if(r.trailPct!=null)eff.trailPct=r.trailPct;
-  eff.sessionMask=E.buildSessionMask(d, eff.sessionStart, eff.sessionEnd);
-  const bt=E.backtest(d,sig.pos,eff);
-  state.detail={cfg:r,data:d,sig,bt};
+  state.detail=runDetailFor(r);
   renderAll();
 }
 function renderBoardKeepSel(){ /* re-render but keep highlight */ renderBoard(); }
@@ -499,7 +570,7 @@ function renderCandles(){
   ctx.fillStyle='#52525b';
   for(let i=0;i<N;i+=Math.ceil(N/6)){const dt=new Date(t[i]);ctx.fillText(dt.toLocaleDateString('en-IN',{day:'2-digit',month:'short'})+' '+String(dt.getHours()).padStart(2,'0')+':'+String(dt.getMinutes()).padStart(2,'0'),X(i)-20,H-10);}
   const r=state.sel;
-  $('chartTitle').textContent=`· ${$('symbol').value} · ${r.timeframe}m · ${r.indicator} · ${fmtParams(r.params)} · SL ${(r.slPct||0).toFixed(2)}% / TP ${(r.tpPct||0).toFixed(2)}%`;
+  $('chartTitle').textContent=`· ${$('symbol').value} · ${r.timeframe}m · ${r.indicator} · ${fmtParams(r.params)} · SL ${(r.slPct||0).toFixed(2)}% / TP ${(r.tpPct||0).toFixed(2)}% · ${EXIT_LBL[r.exit||'fixed']||'FIX'}${r.carry?' +carry':''}`;
   $('chartLegend').innerHTML=`<span><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#22ff88"></i> bull</span>
     <span><i class="inline-block w-2.5 h-2.5 rounded-sm" style="background:#ff3b5c"></i> bear</span>
     ${Object.keys(ov).map(k=>`<span><i class="inline-block w-4 h-[3px] align-middle" style="background:${colors[k]||'#e4e4e7'}"></i> ${k}</span>`).join('')}
@@ -589,8 +660,8 @@ function dl(name, text){
 }
 $('btnExportBoard').onclick=()=>{
   if(!state.board.length){alert('Nothing to export.');return;}
-  let s='rank,timeframe,indicator,params,sl_pct,tp_pct,net_pnl,win_rate,trades,trades_per_day,profit_factor,max_dd,sharpe,sortino,expectancy\n';
-  state.board.forEach((r,i)=>{s+=`${i+1},${r.timeframe}m,${r.indicator},"${fmtParams(r.params)}",${(r.slPct||0).toFixed(3)},${(r.tpPct||0).toFixed(3)},${r.m.netPnL.toFixed(2)},${r.m.winRate.toFixed(2)},${r.m.totalTrades},${(r.m.tradesPerDay||0).toFixed(3)},${r.m.profitFactor.toFixed(3)},${r.m.maxDD.toFixed(3)},${r.m.sharpe.toFixed(3)},${r.m.sortino.toFixed(3)},${r.m.expectancy.toFixed(2)}\n`;});
+  let s='rank,timeframe,indicator,params,exit,carry,sl_pct,tp_pct,net_pnl,win_rate,trades,trades_per_day,profit_factor,max_dd,sharpe,sortino,expectancy\n';
+  state.board.forEach((r,i)=>{s+=`${i+1},${r.timeframe}m,${r.indicator},"${fmtParams(r.params)}",${r.exit||'fixed'},${r.carry?1:0},${(r.slPct||0).toFixed(3)},${(r.tpPct||0).toFixed(3)},${r.m.netPnL.toFixed(2)},${r.m.winRate.toFixed(2)},${r.m.totalTrades},${(r.m.tradesPerDay||0).toFixed(3)},${r.m.profitFactor.toFixed(3)},${r.m.maxDD.toFixed(3)},${r.m.sharpe.toFixed(3)},${r.m.sortino.toFixed(3)},${r.m.expectancy.toFixed(2)}\n`;});
   dl('xbost_leaderboard.csv',s);
 };
 $('btnExportTrades').onclick=()=>{
