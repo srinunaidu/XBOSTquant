@@ -1,6 +1,9 @@
 node_modules/
 users.db*
 .env
-.DS_Store
+.git/
+.gitignore
 HDFCBANK_minute.csv
 public/HDFCBANK_minute.csv
+Dockerfile
+.dockerignore

@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>XBOST — Login</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body{background:#09090b;color:#e4e4e7;font-family:Inter,system-ui,sans-serif}
+  .card{background:#101014;border:1px solid #27272a;border-radius:12px}
+  input{background:#18181b!important;border:1px solid #3f3f46!important;color:#e4e4e7!important;border-radius:8px;padding:10px 12px;width:100%;font-size:14px}
+  input:focus{border-color:#22ff88!important;outline:none}
+  .btn{background:#22ff88;color:#052e16;font-weight:700;border-radius:8px;padding:10px;font-size:14px;width:100%}
+  .btn:hover{background:#4dff9f}
+</style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+  <div class="card p-8 w-full max-w-sm">
+    <div class="flex items-center gap-3 mb-1">
+      <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-green-400 to-emerald-700 flex items-center justify-center font-black text-zinc-950 text-xl">X</div>
+      <div>
+        <div class="font-extrabold tracking-tight">XBOST // QUANT TERMINAL</div>
+        <div class="text-[10px] text-zinc-500 tracking-widest uppercase">Restricted · login required</div>
+      </div>
+    </div>
+    <form id="f" class="space-y-3 mt-6">
+      <div><label class="text-[11px] uppercase tracking-widest text-zinc-400">Username</label><input id="u" autocomplete="username" class="mt-1"/></div>
+      <div><label class="text-[11px] uppercase tracking-widest text-zinc-400">Password</label><input id="p" type="password" autocomplete="current-password" class="mt-1"/></div>
+      <div id="err" class="hidden text-[13px] text-red-400 bg-red-950/40 border border-red-900 rounded-md px-3 py-2"></div>
+      <button class="btn" type="submit">Sign in →</button>
+    </form>
+    <div class="text-[11px] text-zinc-600 mt-4 text-center">Contact your admin for an account.</div>
+  </div>
+<script>
+document.getElementById('f').onsubmit = async (e) => {
+  e.preventDefault();
+  const err = document.getElementById('err');
+  err.classList.add('hidden');
+  const r = await fetch('/api/login', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ username: document.getElementById('u').value, password: document.getElementById('p').value })
+  });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok && j.ok) location.href = '/';
+  else { err.textContent = j.error || ('Login failed (HTTP ' + r.status + ')'); err.classList.remove('hidden'); }
+};
+</script>
+</body>
+</html>

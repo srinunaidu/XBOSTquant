@@ -1,0 +1,20 @@
+{
+  "name": "xbost",
+  "version": "1.0.0",
+  "description": "XBOST institutional algo-backtesting terminal (Nifty/BankNifty) with login-gated access",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "better-sqlite3": "^13.0.3",
+    "express": "^5.2.1",
+    "express-session": "^1.19.0"
+  }
+}

@@ -1,0 +1,67 @@
+name: xbost-pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  auth-smoke:
+    runs-on: ubuntu-latest
+    needs: test
+    env:
+      PORT: 8901
+      ADMIN_USER: admin
+      ADMIN_PASS: ci-smoke-pass
+      SESSION_SECRET: ci-secret
+      DB_PATH: /tmp/xbost-ci.db
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: |
+          node server.js & echo $! > server.pid
+          for i in $(seq 1 30); do curl -sf http://localhost:8901/login.html && break || sleep 1; done
+      - name: login page is public
+        run: curl -sf http://localhost:8901/login.html -o /dev/null
+      - name: terminal is guarded
+        run: |
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/)" = "302"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/engine.js)" = "401"
+      - name: login + use terminal + manage users
+        run: |
+          set -e
+          curl -sf -c jar -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"ci-smoke-pass"}' \
+            http://localhost:8901/api/login -o /dev/null
+          curl -sf -b jar http://localhost:8901/api/me | grep -q admin
+          curl -sf -b jar http://localhost:8901/ -o /dev/null
+          curl -sf -b jar -H 'Content-Type: application/json' \
+            -d '{"username":"desk1","password":"desk1pass1"}' \
+            http://localhost:8901/api/users | grep -q desk1
+          curl -sf -b jar -X POST -H 'Content-Type: application/json' \
+            -d '{"username":"desk1","password":"desk1pass1"}' \
+            http://localhost:8901/api/login -o /dev/null
+          echo AUTH-SMOKE-OK
+      - run: kill $(cat server.pid) || true
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [test, auth-smoke]
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t xbost:${{ github.sha }} .

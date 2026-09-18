@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>XBOST — User Management</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<style>
+  body{background:#09090b;color:#e4e4e7;font-family:Inter,system-ui,sans-serif}
+  .card{background:#101014;border:1px solid #27272a;border-radius:10px}
+  input,select{background:#18181b!important;border:1px solid #3f3f46!important;color:#e4e4e7!important;border-radius:6px;font-size:13px;padding:7px 9px}
+  th{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#a1a1aa;text-align:left;padding:8px}
+  td{font-size:13px;padding:8px;border-top:1px solid #1f1f23;font-family:'JetBrains Mono',monospace}
+  .btn{background:#22ff88;color:#052e16;font-weight:700;border-radius:8px;padding:8px 14px;font-size:13px}
+  .btn-ghost{background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;border-radius:8px;padding:6px 10px;font-size:12px}
+</style>
+</head>
+<body class="p-4 max-w-3xl mx-auto">
+  <div class="flex items-center gap-3 mb-4">
+    <a href="/" class="btn-ghost" style="text-decoration:none">← Terminal</a>
+    <h1 class="font-extrabold text-lg">👥 User Management <span class="text-xs text-zinc-500 font-normal">admin only</span></h1>
+  </div>
+  <div class="card p-4 mb-4">
+    <div class="font-bold text-sm mb-2">＋ Add user</div>
+    <div class="flex flex-wrap gap-2">
+      <input id="nu" placeholder="username (3-32)" class="flex-1 min-w-[140px]"/>
+      <input id="np" type="password" placeholder="password (min 8)" class="flex-1 min-w-[140px]"/>
+      <select id="nr"><option value="user">user</option><option value="admin">admin</option></select>
+      <button id="btnAdd" class="btn">Create</button>
+    </div>
+    <div id="msg" class="text-xs mt-2 h-4"></div>
+  </div>
+  <div class="card p-4">
+    <div class="font-bold text-sm mb-2">Accounts</div>
+    <table class="w-full"><thead><tr><th>ID</th><th>Username</th><th>Role</th><th>Status</th><th>Created</th><th></th></tr></thead>
+    <tbody id="rows"></tbody></table>
+  </div>
+<script src="auth.js"></script>
+<script>
+async function api(url, opts) {
+  const r = await fetch(url, Object.assign({ headers: {'Content-Type':'application/json'} }, opts));
+  const j = await r.json().catch(() => ({}));
+  if (r.status === 401 || r.status === 403) { location.href = '/login.html'; throw new Error('forbidden'); }
+  return { status: r.status, body: j };
+}
+async function refresh() {
+  const { body } = await api('/api/users');
+  const tb = document.getElementById('rows');
+  tb.innerHTML = '';
+  (body.users || []).forEach(u => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td>${u.id}</td><td>${u.username}</td><td>${u.role}</td>` +
+      `<td>${u.active ? '<span style="color:#22ff88">active</span>' : '<span style="color:#ff3b5c">disabled</span>'}</td>` +
+      `<td>${u.created_at}</td><td></td>`;
+    const td = tr.lastChild;
+    const tgl = document.createElement('button');
+    tgl.className = 'btn-ghost'; tgl.textContent = u.active ? 'Disable' : 'Enable';
+    tgl.onclick = async () => { await api('/api/users/' + u.id, { method: 'PATCH', body: JSON.stringify({ active: !u.active }) }); refresh(); };
+    const rst = document.createElement('button');
+    rst.className = 'btn-ghost'; rst.textContent = 'Reset pw';
+    rst.onclick = async () => {
+      const p = prompt('New password for ' + u.username + ' (min 8 chars):');
+      if (!p) return;
+      const r = await api('/api/users/' + u.id, { method: 'PATCH', body: JSON.stringify({ password: p }) });
+      msg(r.body.error || (r.status === 200 ? 'Password updated.' : 'Failed.'), !r.body.error && r.status === 200);
+      refresh();
+    };
+    td.appendChild(tgl); td.appendChild(document.createTextNode(' ')); td.appendChild(rst);
+    tb.appendChild(tr);
+  });
+}
+function msg(t, ok) {
+  const m = document.getElementById('msg');
+  m.textContent = t; m.style.color = ok ? '#22ff88' : '#ff3b5c';
+}
+document.getElementById('btnAdd').onclick = async () => {
+  const r = await api('/api/users', { method: 'POST', body: JSON.stringify({
+    username: document.getElementById('nu').value,
+    password: document.getElementById('np').value,
+    role: document.getElementById('nr').value }) });
+  if (r.status === 201) {
+    msg('User ' + r.body.user.username + ' created.', true);
+    document.getElementById('nu').value = ''; document.getElementById('np').value = '';
+    refresh();
+  } else msg(r.body.error || 'Failed.', false);
+};
+refresh();
+</script>
+</body>
+</html>
