@@ -257,6 +257,82 @@ function pocSeries(d,lookback){
   return out;
 }
 
+// ---------- proprietary-style indicators (rare in retail screeners) ----------
+function kama(close, erP, fast, slow){
+  // Kaufman Adaptive MA — efficiency-ratio driven, fast in trends, slow in chop
+  const n=close.length,out=new Float64Array(n).fill(NaN);
+  erP=Math.max(2,Math.round(erP));fast=Math.max(1,Math.round(fast));slow=Math.max(fast+1,Math.round(slow));
+  const fsc=2/(fast+1), ssc=2/(slow+1);
+  let k=0;
+  for(let i=0;i<n;i++){
+    if(i<erP)continue;
+    if(i===erP){let s=0;for(let j=i-erP+1;j<=i;j++)s+=close[j];k=s/erP;out[i]=k;continue;}
+    const change=Math.abs(close[i]-close[i-erP]);
+    let vol=0;for(let j=i-erP+1;j<=i;j++)vol+=Math.abs(close[j]-close[j-1]);
+    const er=vol===0?0:change/vol;
+    const sc=Math.pow(er*(fsc-ssc)+ssc,2);
+    k=k+sc*(close[i]-k);out[i]=k;
+  }
+  return out;
+}
+function fisherTransform(h,l,c,p){
+  // Fisher Transform of median price — sharp major turning-point signals
+  const n=c.length,out=new Float64Array(n).fill(NaN);
+  p=Math.max(2,Math.round(p));
+  let prev=0;
+  for(let i=0;i<n;i++){
+    if(i<p-1)continue;
+    let hh=-Infinity,ll=Infinity;
+    for(let j=i-p+1;j<=i;j++){const m=(h[j]+l[j])/2;if(m>hh)hh=m;if(m<ll)ll=m;}
+    let v=hh===ll?0:2*(((h[i]+l[i])/2-ll)/(hh-ll)-0.5);
+    v=Math.max(-0.999,Math.min(0.999,v));
+    const f=0.5*Math.log((1+v)/Math.max(1e-9,1-v))+0.5*prev;
+    prev=f;out[i]=f;
+  }
+  return out;
+}
+function ttmSqueeze(h,l,c,bbP,bbM,kcP,kcM){
+  // Bollinger-inside-Keltner squeeze + momentum; signal fires on squeeze release
+  const b=bollinger(c,bbP,bbM), k=keltner(h,l,c,kcP,kcP,kcM);
+  const n=c.length, mom=new Float64Array(n).fill(NaN), fire=new Int8Array(n);
+  const hl2=new Float64Array(n);
+  for(let i=0;i<n;i++)hl2[i]=(h[i]+l[i])/2;
+  const base=sma(hl2,kcP);
+  for(let i=0;i<n;i++){
+    if(isNaN(b.up[i])||isNaN(k.up[i])||isNaN(base[i]))continue;
+    const on=(b.lo[i]>k.lo[i]&&b.up[i]<k.up[i])?1:0;
+    mom[i]=c[i]-base[i];
+    fire[i]=(i>0&&!on&&((b.lo[i-1]>k.lo[i-1]&&b.up[i-1]<k.up[i-1])?1:0))?1:0;
+  }
+  return {mom,fire};
+}
+function connorsRSI(c, rsiP, streakP, rankP){
+  // Connors RSI = mean(RSI(period), RSI(streak), PercentRank) — short-horizon mean reversion
+  const n=c.length;
+  const r=rsi(c,Math.max(2,Math.round(rsiP)));
+  const streak=new Float64Array(n);
+  let s=0;
+  for(let i=1;i<n;i++){
+    if(c[i]>c[i-1])s=s>0?s+1:1;
+    else if(c[i]<c[i-1])s=s<0?s-1:-1;
+    else s=0;
+    streak[i]=s;
+  }
+  const rs=rsi(streak,Math.max(2,Math.round(streakP)));
+  rankP=Math.max(5,Math.round(rankP));
+  const pr=new Float64Array(n).fill(NaN);
+  for(let i=1;i<n;i++){
+    if(i<rankP)continue;
+    const cur=c[i]-c[i-1];
+    let cnt=0;
+    for(let j=i-rankP+1;j<=i;j++)if((c[j]-c[j-1])<cur)cnt++;
+    pr[i]=cnt/rankP*100;
+  }
+  const out=new Float64Array(n).fill(NaN);
+  for(let i=0;i<n;i++)if(!isNaN(r[i])&&!isNaN(rs[i])&&!isNaN(pr[i]))out[i]=(r[i]+rs[i]+pr[i])/3;
+  return out;
+}
+
 // ---------- signals ----------
 function buildSignals(d, cfg){
   // cfg: {indicator, params:{}}
@@ -312,6 +388,28 @@ function buildSignals(d, cfg){
     const poc=pocSeries(d,P.lookback||50);
     overlay={poc};
     for(let i=0;i<n;i++){if(isNaN(poc[i]))continue;pos[i]=d.c[i]>poc[i]?1:-1;}
+  } else if(ind==='KAMA'){
+    const k=kama(d.c,P.erPeriod||10,P.fast||2,P.slow||30);
+    overlay={ma:k};
+    for(let i=0;i<n;i++){if(isNaN(k[i]))continue;pos[i]=d.c[i]>k[i]?1:-1;}
+  } else if(ind==='Fisher'){
+    const f=fisherTransform(d.h,d.l,d.c,P.period||10);
+    osc={fisher:f};
+    for(let i=0;i<n;i++){if(isNaN(f[i]))continue;pos[i]=f[i]>0?1:-1;}
+  } else if(ind==='Squeeze'){
+    const sq=ttmSqueeze(d.h,d.l,d.c,P.bbPeriod||20,P.bbMult||2,P.kcPeriod||20,P.kcMult||1.5);
+    osc={sqzMom:sq.mom};
+    let dir=0;
+    for(let i=0;i<n;i++){
+      if(isNaN(sq.mom[i]))continue;
+      if(sq.fire[i])dir=sq.mom[i]>0?1:-1; // squeeze released: trade the momentum burst
+      pos[i]=dir;
+    }
+  } else if(ind==='CRSI'){
+    const cr=connorsRSI(d.c,P.rsiPeriod||3,P.streakPeriod||2,P.rankPeriod||100);
+    const os=P.oversold??30, ob=P.overbought??70;
+    osc={crsi:cr};
+    for(let i=0;i<n;i++){if(isNaN(cr[i]))continue;if(cr[i]<os)pos[i]=1;else if(cr[i]>ob)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;}
   }
   return {pos,overlay,osc};
 }
@@ -457,12 +555,69 @@ const SCHEMA={
   Stochastic:[{key:'k',min:5,max:21,def:14},{key:'d',min:2,max:7,def:3},{key:'oversold',min:10,max:30,def:20},{key:'overbought',min:70,max:90,def:80}],
   ChandeKroll:[{key:'period',min:5,max:21,def:10},{key:'mult',min:1,max:4,def:3}],
   POC:[{key:'lookback',min:20,max:200,def:50}],
+  KAMA:[{key:'erPeriod',min:5,max:30,def:10},{key:'fast',min:2,max:8,def:2},{key:'slow',min:15,max:60,def:30}],
+  Fisher:[{key:'period',min:5,max:30,def:10}],
+  Squeeze:[{key:'bbPeriod',min:10,max:30,def:20},{key:'bbMult',min:1,max:3,def:2},{key:'kcPeriod',min:10,max:30,def:20},{key:'kcMult',min:1,max:3,def:1.5}],
+  CRSI:[{key:'rsiPeriod',min:2,max:7,def:3},{key:'streakPeriod',min:2,max:7,def:2},{key:'rankPeriod',min:20,max:200,def:100},{key:'oversold',min:5,max:40,def:30},{key:'overbought',min:60,max:95,def:70}],
 };
 
 function cartesian(arrays){
   let res=[[]];
   for(const arr of arrays){const tmp=[];for(const r of res)for(const v of arr)tmp.push(r.concat([v]));res=tmp;}
   return res;
+}
+
+function objectiveValue(m, objective){
+  if(!m) return -Infinity;
+  if(objective==='winrate')return m.winRate;
+  if(objective==='trades')return m.totalTrades;
+  if(objective==='drawdown')return m.maxDD; // negative; closer to 0 wins
+  if(objective==='sortino')return m.sortino;
+  return m.sharpe;
+}
+
+const INT_KEYS={period:1,fast:1,slow:1,signal:1,k:1,d:1,emaPeriod:1,atrPeriod:1,adxPeriod:1,maPeriod:1,
+  lookback:1,rsiPeriod:1,streakPeriod:1,rankPeriod:1,erPeriod:1,bbPeriod:1,kcPeriod:1};
+
+// One-step neighbors of a config for hill-climbing: each numeric param ±step,
+// plus SL/TP ±their steps. Used by the refine loop until no improvement.
+function paramNeighbors(row, steps, riskSteps){
+  const out=[];
+  const P=row.params||{};
+  for(const k of Object.keys(steps||{})){
+    if(!(k in P))continue;
+    const st=+steps[k]||0; if(st<=0)continue;
+    const cur=+P[k];
+    for(const dir of [-1,1]){
+      let v=+(cur+dir*st).toFixed(4);
+      if(!isFinite(v)||v<=0||v===cur)continue;
+      if(INT_KEYS[k]&&(!Number.isInteger(v)||v<2))continue;
+      const np=Object.assign({},P);np[k]=v;
+      const c={timeframe:row.timeframe,indicator:row.indicator,params:np};
+      if(row.slPct!=null)c.slPct=row.slPct;
+      if(row.tpPct!=null)c.tpPct=row.tpPct;
+      if(row.trailPct!=null)c.trailPct=row.trailPct;
+      out.push(c);
+    }
+  }
+  function riskNeighbor(key, step, lo, hi){
+    if(!step||step<=0||row[key]==null)return;
+    for(const dir of [-1,1]){
+      const v=+((+row[key])+dir*step).toFixed(4);
+      if(!isFinite(v)||v<lo||v>hi)continue;
+      const c={timeframe:row.timeframe,indicator:row.indicator,params:Object.assign({},P)};
+      c.slPct=row.slPct;c.tpPct=row.tpPct;
+      if(row.trailPct!=null)c.trailPct=row.trailPct;
+      c[key]=v;out.push(c);
+    }
+  }
+  riskNeighbor('slPct',(riskSteps||{}).sl,0.05,15);
+  riskNeighbor('tpPct',(riskSteps||{}).tp,0.05,30);
+  return out;
+}
+
+function cfgKey(c){
+  return c.timeframe+'|'+c.indicator+'|'+JSON.stringify(c.params)+'|'+(c.slPct||'')+'|'+(c.tpPct||'');
 }
 
 function buildGrid(selected, risk){
@@ -505,7 +660,7 @@ function rankResults(rows, objective){
   return r;
 }
 
-const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

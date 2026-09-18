@@ -25,6 +25,8 @@ const IND_META = [
   {n:'VWAP',d:'Intraday session VWAP',on:true},{n:'SuperTrend',d:'ATR trailing trend',on:true},
   {n:'ADX',d:'ADX strength + MA',on:true},{n:'Stochastic',d:'%K/%D stochastic',on:true},
   {n:'ChandeKroll',d:'Chande-Kroll stops',on:true},{n:'POC',d:'Volume Profile POC',on:true},
+  {n:'KAMA',d:'★ Kaufman adaptive MA',on:true},{n:'Fisher',d:'★ Fisher Transform turns',on:true},
+  {n:'Squeeze',d:'★ TTM squeeze release',on:true},{n:'CRSI',d:'★ Connors RSI mean-rev',on:true},
 ];
 // Max-coverage default ranges: [min, max, step] — ~115 configs per timeframe
 const DEFAULT_RANGES = {
@@ -36,9 +38,13 @@ const DEFAULT_RANGES = {
   VWAP:{},
   SuperTrend:{atrPeriod:[7,14,7], mult:[2,4,1]},
   ADX:{adxPeriod:[10,14,4], maPeriod:[30,50,20], threshold:[20,25,5]},
-  Stochastic:{k:[10,14,4], d:[3,5,2], oversold:[20,20,1], overbought:[80,80,1]},
+  Stochastic:{k:[10,14,4], d:[3,5,2], oversold:[15,25,10], overbought:[75,85,10]},
   ChandeKroll:{period:[7,10,3], mult:[2,3,1]},
   POC:{lookback:[30,90,30]},
+  KAMA:{erPeriod:[10,15,5], fast:[2,4,2], slow:[20,30,10]},
+  Fisher:{period:[9,17,4]},
+  Squeeze:{bbPeriod:[14,21,7], bbMult:[2,2.5,0.5], kcPeriod:[14,21,7], kcMult:[1.5,2,0.5]},
+  CRSI:{rsiPeriod:[2,4,1], streakPeriod:[2,3,1], rankPeriod:[50,100,50], oversold:[10,20,10], overbought:[80,90,10]},
 };
 const indList=$('indList');
 function buildIndCards(){
@@ -85,11 +91,12 @@ function getSelection(){
   const sels=[];
   document.querySelectorAll('.ind-card').forEach(c=>{
     if(!c.querySelector('[data-role=en]').checked)return;
-    const ind=c.dataset.ind, ranges={};
+    const ind=c.dataset.ind, ranges={}, steps={};
     c.querySelectorAll('input[type=number]').forEach(i=>{
       const k=i.dataset.k,b=i.dataset.b; ranges[k]=ranges[k]||{}; ranges[k][b]=+i.value;
     });
-    sels.push({indicator:ind, ranges, timeframes:tfs.length?tfs:[5]});
+    Object.keys(ranges).forEach(k=>{ steps[k]=+ranges[k].step||0; });
+    sels.push({indicator:ind, ranges, steps, timeframes:tfs.length?tfs:[5]});
   });
   return {tfs, sels};
 }
@@ -184,6 +191,9 @@ async function runGrid(){
   if(!sels.length){alert('Select at least one indicator.');return;}
   const risk=getRiskGrid();
   let grid=E.buildGrid(sels, risk);
+  // per-indicator param steps for the hill-climb refine loop
+  const paramSteps={};
+  sels.forEach(s=>{ paramSteps[s.indicator]=s.steps||{}; });
   const cap=+$('maxCombos').value||20000;
   if(grid.length>cap){ if(!confirm(`Grid = ${grid.length} combos > cap ${cap}. Truncate to first ${cap}?`))return; grid=grid.slice(0,cap); }
   if(!grid.length){alert('Empty grid — check parameter ranges.');return;}
@@ -199,28 +209,30 @@ async function runGrid(){
   state.userPicked=0;
   state.runError=null;
   let lastRender=0;
-  const onBatch=(done,total,top,current)=>{
+  const onBatch=(done,total,top,current,stage,pass)=>{
     if(runSeq!==state.runSeq)return;
-    $('progBar').style.width=(done/total*100)+'%';
-    const pct=(done/total*100).toFixed(1);
-    const perSec=done/Math.max(0.5,(performance.now()-t0)/1000);
-    $('progTxt').textContent=`${done} / ${total} (${pct}%) · ${perSec.toFixed(0)}/s · leaderboard streaming live ↓`;
-    if(current) $('nowRunning').textContent=`⚙ now running: ${current.indicator} ${current.timeframe}m · ${fmtParams(current.params)}${current.slPct!=null?` · SL ${current.slPct}% TP ${current.tpPct}%`:''}`;
+    const pct=typeof done==='number'&&typeof total==='number'?(done/total*100).toFixed(1):'—';
+    if(typeof done==='number'&&typeof total==='number')$('progBar').style.width=Math.min(100,done/total*100)+'%';
+    const perSec=(typeof done==='number'?done:0)/Math.max(0.5,(performance.now()-t0)/1000);
+    $('progTxt').textContent=`${done} / ${total}${stage==='refine'?` · 🔁 refine pass ${pass||''}`:''} (${pct}%) · ${perSec.toFixed(0)}/s · leaderboard streaming live ↓`;
+    if(current) $('nowRunning').textContent=`${stage==='refine'?'🔁 refining best:':'⚙ now running:'} ${current.indicator} ${current.timeframe}m · ${fmtParams(current.params)}${current.slPct!=null?` · SL ${current.slPct}% TP ${current.tpPct}%`:''}`;
     if(state.runError) $('nowRunning').textContent+=` · ⚠ ${state.runError} combos errored`;
     state.board=top;
     const now=performance.now(); // rebuilding 500 DOM rows every batch freezes UI — throttle
     if(now-lastRender>700||done===total){lastRender=now;renderBoard();}
     if(top.length && !state.detail) selectRow(top[0], true); // populate charts with first live leader
   };
-  let top=[];
+  let top=[], refineInfo='';
   try{
-    top=await runWithWorker(grid,opts,objective,topN,onBatch);
+    const out=await runWithWorker(grid,opts,objective,topN,onBatch,paramSteps,risk);
+    top=out.top; refineInfo=out.refined?` · 🔁 +${out.refined} refined (${out.passes} passes)`:'';
     if(runSeq===state.runSeq) state.board=top;
   }catch(err){
     console.warn('worker failed, fallback async',err);
     if(runSeq===state.runSeq) $('nowRunning').textContent=`⚠ worker unavailable (${err&&err.message||err}) — running on main thread…`;
     try{
-      top=await runAsync(grid,opts,objective,topN,onBatch);
+      const out=await runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk);
+      top=out.top; refineInfo=out.refined?` · 🔁 +${out.refined} refined (${out.passes} passes)`:'';
       if(runSeq===state.runSeq) state.board=top;
     }catch(err2){
       console.error(err2);
@@ -234,14 +246,14 @@ async function runGrid(){
     }
   }
   if(runSeq!==state.runSeq) return; // superseded by a newer run
-  $('progTxt').textContent=`done · ${grid.length} combos in ${((performance.now()-t0)/1000).toFixed(1)}s${state.runError?` · ⚠ ${state.runError} errored`:''}`;
+  $('progTxt').textContent=`done · ${grid.length} combos in ${((performance.now()-t0)/1000).toFixed(1)}s${refineInfo}${state.runError?` · ⚠ ${state.runError} errored`:''}`;
   $('nowRunning').textContent='';
   $('liveBadge').classList.add('hidden');
   $('btnRun').disabled=false;
   renderBoard();
   if(state.board.length && state.userPicked!==runSeq) selectRow(state.board[0], true);
 }
-function runWithWorker(grid,opts,objective,topN,onBatch){
+function runWithWorker(grid,opts,objective,topN,onBatch,paramSteps,risk){
   return new Promise((resolve,reject)=>{
     let w;
     try{ w=new Worker('worker.js'); }catch(e){return reject(e);}
@@ -251,15 +263,20 @@ function runWithWorker(grid,opts,objective,topN,onBatch){
     const timer=setTimeout(()=>{try{w.terminate();}catch(e){}reject(new Error('worker timeout'));},1000*60*10);
     w.onmessage=e=>{
       const m=e.data;
-      if(m.type==='progress'){ if(m.errCount) state.runError=m.errCount; onBatch(m.done,m.total,m.top,m.current); }
-      else if(m.type==='done'){clearTimeout(timer);w.terminate(); if(m.errCount) state.runError=m.errCount; resolve(m.top);}
+      if(m.type==='progress'){ if(m.errCount) state.runError=m.errCount; onBatch(m.done,m.total,m.top,m.current,m.stage,m.pass); }
+      else if(m.type==='done'){clearTimeout(timer);w.terminate(); if(m.errCount) state.runError=m.errCount; resolve({top:m.top, refined:m.refined||0, passes:m.passes||0});}
     };
     w.onerror=e=>{clearTimeout(timer);try{w.terminate();}catch(_){}reject(e.message||e);};
     // structured-clone copies (originals stay intact for re-runs / charting)
-    w.postMessage({type:'run',t:payload.t,o:payload.o,h:payload.h,l:payload.l,c:payload.c,v:payload.v,grid,tradeOpts:opts,objective,topN});
+    w.postMessage({type:'run',t:payload.t,o:payload.o,h:payload.h,l:payload.l,c:payload.c,v:payload.v,grid,tradeOpts:opts,objective,topN,
+      paramSteps:paramSteps||{}, slStep:risk&&risk.sl?stepsOf(risk.sl):0, tpStep:risk&&risk.tp?stepsOf(risk.tp):0});
   });
 }
-async function runAsync(grid,opts,objective,topN,onBatch){
+function stepsOf(arr){ // infer uniform step from an expanded value list
+  if(!arr||arr.length<2)return 0;
+  return Math.abs(arr[1]-arr[0]);
+}
+async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
   const cache={}; const res=[];
   const getTF=tf=>{
     if(!cache[tf]){
@@ -268,17 +285,50 @@ async function runAsync(grid,opts,objective,topN,onBatch){
     }
     return cache[tf];
   };
-  for(let i=0;i<grid.length;i++){
-    const cfg=grid[i], {d, mask}=getTF(cfg.timeframe);
+  function testCfg(cfg, idx, refined){
+    const {d, mask}=getTF(cfg.timeframe);
     const eff=Object.assign({},opts,{sessionMask:mask});
     if(cfg.slPct!=null)eff.slPct=cfg.slPct;
     if(cfg.tpPct!=null)eff.tpPct=cfg.tpPct;
     if(cfg.trailPct!=null)eff.trailPct=cfg.trailPct;
     const sig=E.buildSignals(d,cfg), bt=E.backtest(d,sig.pos,eff);
-    res.push({i,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0,trailPct:eff.trailPct||0,m:bt.metrics});
-    if(i%10===0||i===grid.length-1){ onBatch(i+1,grid.length,E.rankResults(res,objective).slice(0,topN),{indicator:cfg.indicator,timeframe:cfg.timeframe,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0}); await new Promise(r=>setTimeout(r,0)); }
+    return {i:idx,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0,trailPct:eff.trailPct||0,refined:!!refined,m:bt.metrics};
   }
-  return E.rankResults(res,objective).slice(0,topN);
+  for(let i=0;i<grid.length;i++){
+    const cfg=grid[i];
+    res.push(testCfg(cfg, i, false));
+    if(i%10===0||i===grid.length-1){ onBatch(i+1,grid.length,E.rankResults(res,objective).slice(0,topN),{indicator:cfg.indicator,timeframe:cfg.timeframe,params:cfg.params,slPct:cfg.slPct||opts.slPct||0,tpPct:cfg.tpPct||opts.tpPct||0},'grid'); await new Promise(r=>setTimeout(r,0)); }
+  }
+  // hill-climb refinement (mirrors worker stage 2)
+  const tested=new Set(grid.map(c=>E.cfgKey(c)));
+  const riskSteps={sl:risk&&risk.sl?stepsOf(risk.sl):0, tp:risk&&risk.tp?stepsOf(risk.tp):0};
+  let pool=E.rankResults(res,objective).slice(0,20);
+  let best=E.objectiveValue(pool[0].m,objective);
+  let pass=0, refined=0, improved=true;
+  while(improved&&pass<4){
+    improved=false;pass++;
+    const cands=[];
+    for(const row of pool){
+      for(const nb of E.paramNeighbors(row,(paramSteps||{})[row.indicator]||{},riskSteps)){
+        const k=E.cfgKey(nb);
+        if(!tested.has(k)){tested.add(k);cands.push(nb);}
+      }
+      if(cands.length>600)break;
+    }
+    if(!cands.length)break;
+    for(let j=0;j<cands.length;j++){
+      res.push(testCfg(cands[j],grid.length+refined,true));refined++;
+      if(j%25===0||j===cands.length-1){
+        onBatch(grid.length+refined,grid.length+'+refine',E.rankResults(res,objective).slice(0,topN),
+          {indicator:cands[j].indicator,timeframe:cands[j].timeframe,params:cands[j].params,slPct:cands[j].slPct||0,tpPct:cands[j].tpPct||0},'refine',pass);
+        await new Promise(r=>setTimeout(r,0));
+      }
+    }
+    pool=E.rankResults(res,objective).slice(0,20);
+    const nowBest=E.objectiveValue(pool[0].m,objective);
+    if(nowBest>best+1e-9){best=nowBest;improved=true;}
+  }
+  return {top:E.rankResults(res,objective).slice(0,topN), refined, passes:pass};
 }
 
 // ---------- leaderboard ----------
@@ -289,6 +339,24 @@ const COLS=[
   {k:'profitFactor',l:'PF'},{k:'maxDD',l:'MaxDD %'},{k:'sharpe',l:'Sharpe'},{k:'sortino',l:'Sortino'},
 ];
 function fmtParams(p){return Object.entries(p||{}).map(([k,v])=>`${k}=${v}`).join(' ')||'—';}
+state.view=state.view||'all';
+function bestPerIndicator(){
+  // champion row per indicator under the CURRENT objective (grid + refined)
+  const ranked=E.rankResults(state.board, $('objective').value);
+  const seen={}, out=[];
+  for(const r of ranked){ if(!seen[r.indicator]){seen[r.indicator]=1;out.push(r);} }
+  return out;
+}
+function setView(v){
+  state.view=v;
+  const all=v==='all';
+  $('tabAll').className=all?'btn !py-1 !px-2.5 !text-[11px]':'btn-ghost btn !py-1 !px-2.5 !text-[11px]';
+  $('tabBest').className=!all?'btn !py-1 !px-2.5 !text-[11px]':'btn-ghost btn !py-1 !px-2.5 !text-[11px]';
+  $('bestNote').classList.toggle('hidden', all);
+  renderBoard();
+}
+$('tabAll').onclick=()=>setView('all');
+$('tabBest').onclick=()=>setView('best');
 function renderBoard(){
   const head=$('boardHead'); head.innerHTML='';
   COLS.forEach(c=>{
@@ -298,7 +366,13 @@ function renderBoard(){
   });
   const q=($('boardFilter').value||'').toLowerCase();
   const body=$('boardBody'); body.innerHTML='';
-  const rows=state.board.filter(r=>!q||(r.indicator+' '+r.timeframe+' '+fmtParams(r.params)).toLowerCase().includes(q));
+  let rows=state.board.filter(r=>!q||(r.indicator+' '+r.timeframe+' '+fmtParams(r.params)).toLowerCase().includes(q));
+  if(state.view==='best'){
+    const champs=bestPerIndicator();
+    const champSet=new Set(champs);
+    rows=rows.filter(r=>champSet.has(r));
+    rows.sort((a,b)=>champs.indexOf(a)-champs.indexOf(b)); // keep champion order
+  }
   if(!rows.length){body.innerHTML='<tr><td class="text-zinc-500 text-center py-8">No results.</td></tr>';return;}
   const frag=document.createDocumentFragment();
   rows.forEach((r,ix)=>{
@@ -309,7 +383,7 @@ function renderBoard(){
       (r.slPct||0).toFixed(2),(r.tpPct||0).toFixed(2),
       fmtMoney(m.netPnL),m.winRate.toFixed(1),m.totalTrades,(m.tradesPerDay||0).toFixed(1),m.profitFactor.toFixed(2),m.maxDD.toFixed(2),m.sharpe.toFixed(2),m.sortino.toFixed(2)];
     cells.forEach((v,ci)=>{
-      const td=document.createElement('td'); td.textContent=v;
+      const td=document.createElement('td'); td.textContent=v+(ci===2&&r.refined?' 🔁':'');
       if(ci===6)td.className=m.netPnL>=0?'pos':'neg';
       if(ci===7)td.className=m.winRate>=50?'pos':'';
       if(ci===11)td.className='neg';
@@ -440,6 +514,9 @@ function renderSubCharts(){
   // oscillator: pick first available osc series else RSI computed
   let oscName='RSI',series=null;
   if(sig.osc.rsi){series=sig.osc.rsi.slice(s0);oscName='RSI';}
+  else if(sig.osc.crsi){series=sig.osc.crsi.slice(s0);oscName='Connors RSI';}
+  else if(sig.osc.fisher){series=sig.osc.fisher.slice(s0);oscName='Fisher Transform';}
+  else if(sig.osc.sqzMom){series=sig.osc.sqzMom.slice(s0);oscName='Squeeze momentum';}
   else if(sig.osc.macdHist){series=sig.osc.macdHist.slice(s0);oscName='MACD hist';}
   else if(sig.osc.adx){series=sig.osc.adx.slice(s0);oscName='ADX';}
   else if(sig.osc.stochK){series=sig.osc.stochK.slice(s0);oscName='Stoch %K';}

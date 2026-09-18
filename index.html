@@ -163,8 +163,13 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
   <section class="card p-3">
     <div class="flex flex-wrap items-center gap-2 mb-2">
       <div class="font-bold text-sm">🏆 Master Leaderboard <span class="text-zinc-500 font-normal text-xs">— click any row to load it on the charts</span></div>
+      <div class="flex gap-1 ml-2">
+        <button id="tabAll" class="btn !py-1 !px-2.5 !text-[11px]">📋 All results</button>
+        <button id="tabBest" class="btn-ghost btn !py-1 !px-2.5 !text-[11px]">🏆 Best per indicator</button>
+      </div>
       <input id="boardFilter" placeholder="filter e.g. EMA 5m…" class="ml-auto !text-xs !py-1.5 px-2 w-52"/>
     </div>
+    <div id="bestNote" class="hidden text-[11px] text-green-300 num mb-2">★ One champion row per indicator — the best combination found (grid + hill-climb refinement) for the current objective. Full details in every column.</div>
     <div class="overflow-auto max-h-[380px] border border-zinc-800 rounded-lg">
       <table class="w-full min-w-[1150px]">
         <thead class="bg-zinc-900 sticky top-0"><tr id="boardHead"></tr></thead>
