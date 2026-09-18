@@ -30,7 +30,7 @@ const IND_META = [
   {n:'Squeeze',d:'★ TTM squeeze release',on:true},{n:'CRSI',d:'★ Connors RSI mean-rev',on:true},
   {cat:'B · Institutional Order Flow & Smart Money'},
   {n:'VWAPBands',d:'★ VWAP ±1–3σ deviation bands',on:true},{n:'CVD',d:'★ Cumulative Volume Delta divergence',on:true},
-  {n:'FVG',d:'★ Fair Value Gap / imbalance taps',on:true},{n:'OI',d:'★ OI derivative build-up filter',on:true,oi:true},
+  {n:'FVG',d:'★ Fair Value Gap / imbalance taps',on:true},
   {n:'Regime',d:'★ Choppiness gate for trend loops',on:true},
 ];
 // Max-coverage default ranges: [min, max, step] — ~115 configs per timeframe
@@ -53,7 +53,6 @@ const DEFAULT_RANGES = {
   VWAPBands:{sd1:[1,2,1], sd2:[2,3,1]},
   CVD:{lookback:[20,60,20]},
   FVG:{maxZones:[3,7,2], mitAge:[20,60,20]},
-  OI:{oiLen:[5,15,5], minMove:[0.1,0.5,0.2]},
   Regime:{chopPeriod:[10,20,5], gate:[55,65,5], maPeriod:[20,40,10]},
 };
 const indList=$('indList');
@@ -80,7 +79,6 @@ function buildIndCards(){
     });
     card.innerHTML=`<label class="flex items-center gap-2 text-[13px] font-semibold cursor-pointer">
       <input type="checkbox" data-role="en" ${m.on?'checked':''}/> ${m.n} <span class="text-[10px] text-zinc-500 font-normal">${m.d}</span></label>
-      ${m.oi?`<div id="oiNote" class="text-[10px] text-amber-300 mt-1">○ no OI column in this file — OI leg stays flat</div>`:''}
       ${schema.length?`<div class="param-grid">${params}</div>`:`<div class="text-[10px] text-zinc-500 mt-1">No parameters — single config per timeframe.</div>`}`;
     indList.appendChild(card);
   });
@@ -166,11 +164,7 @@ function applyDateFilter(){
   const lo=f?new Date(f+'T00:00:00').getTime():-Infinity, hi=t?new Date(t+'T23:59:59').getTime():Infinity;
   const idx=[]; for(let i=0;i<d.t.length;i++) if(d.t[i]>=lo&&d.t[i]<=hi) idx.push(i);
   const pick=(a)=>Float64Array.from(idx.map(i=>a[i]));
-  const hasOI=!!(d.oi&&d.hasOI);
-  state.data={t:pick(d.t),o:pick(d.o),h:pick(d.h),l:pick(d.l),c:pick(d.c),v:pick(d.v),
-    oi:hasOI?pick(d.oi):null, hasOI};
-  const oiNote=$('oiNote');
-  if(oiNote)oiNote.textContent=hasOI?'● OI column detected — build-up filter active':'○ no OI column in this file — OI leg stays flat';
+  state.data={t:pick(d.t),o:pick(d.o),h:pick(d.h),l:pick(d.l),c:pick(d.c),v:pick(d.v)};
 }
 $('fromDate').addEventListener('change',()=>{if(state.raw){applyDateFilter();$('dataInfo').textContent=`Filtered: ${state.data.t.length.toLocaleString()} bars`;}});
 $('toDate').addEventListener('change',()=>{if(state.raw){applyDateFilter();$('dataInfo').textContent=`Filtered: ${state.data.t.length.toLocaleString()} bars`;}});
@@ -630,7 +624,6 @@ function renderSubCharts(){
   else if(sig.osc.stochK){series=sig.osc.stochK.slice(s0);oscName='Stoch %K';}
   else if(sig.osc.cvd){series=Array.from(sig.osc.cvd.slice(s0));oscName='Cumulative Volume Delta';}
   else if(sig.osc.chop){series=sig.osc.chop.slice(s0);oscName='Choppiness Index';}
-  else if(sig.osc.oi){series=sig.osc.oi.slice(s0);oscName='Open Interest';}
   else if(sig.osc.fvgBias){series=Array.from(sig.osc.fvgBias.slice(s0));oscName='FVG bias';}
   else{series=E.rsi(d.c,14).slice(s0);oscName='RSI (ref)';}
   $('oscTitle').textContent='· '+oscName;
@@ -767,9 +760,9 @@ function runValidation(){
     // L6 metrics finite, DD bounded
     ok('L6 metrics finite, DD in [-101,0]',isFinite(m.sharpe)&&isFinite(m.sortino)&&isFinite(m.maxDD)&&m.maxDD<=0&&m.maxDD>=-101,
       `sharpe=${m.sharpe.toFixed(2)} sortino=${m.sortino.toFixed(2)} dd=${m.maxDD.toFixed(2)}`);
-    // L7 session + OI status
+    // L7 session status
     let inn=0;for(let i=0;i<eff.sessionMask.length;i++)inn+=eff.sessionMask[i];
-    out.push(`L7 session coverage ${(inn/eff.sessionMask.length*100).toFixed(1)}% · OI column ${d.hasOI?'present':'absent'} · fill=${eff.fill} · exit=${eff.exit||'fixed'}${eff.carry?' +carry':''}`);
+    out.push(`L7 session coverage ${(inn/eff.sessionMask.length*100).toFixed(1)}% · OHLCV-only engine · fill=${eff.fill} · exit=${eff.exit||'fixed'}${eff.carry?' +carry':''}`);
     out.push('');
     out.push(`LIVE VALIDATION: ${pass} passed, ${fail} failed — ${$('symbol').value}, real data only.`);
     logLine(`validation: ${pass} passed, ${fail} failed`);

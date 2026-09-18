@@ -4,8 +4,8 @@
 
 function parseCSV(text) {
   const lines = text.split(/\r?\n/);
-  let header = null, di=-1, oi=-1, hi=-1, li=-1, ci=-1, vi=-1, oii=-1;
-  const T=[],O=[],H=[],L=[],C=[],V=[],OI=[];
+  let header = null, di=-1, oi=-1, hi=-1, li=-1, ci=-1, vi=-1;
+  const T=[],O=[],H=[],L=[],C=[],V=[];
   for (let i=0;i<lines.length;i++) {
     const ln = lines[i].trim();
     if (!ln) continue;
@@ -16,9 +16,8 @@ function parseCSV(text) {
       oi=h.findIndex(x=>x==='open'); hi=h.findIndex(x=>x==='high');
       li=h.findIndex(x=>x==='low'); ci=h.findIndex(x=>x==='close');
       vi=h.findIndex(x=>/vol/.test(x));
-      oii=h.findIndex(x=>/open.?interest|^oi$|chg.?oi|oi.?chg|coi/.test(x));
       if (oi<0||hi<0||li<0||ci<0) { // assume positional w/o header
-        header=null; di=0;oi=1;hi=2;li=3;ci=4;vi=5;oii=-1;
+        header=null; di=0;oi=1;hi=2;li=3;ci=4;vi=5;
       } else continue;
     }
     // fast split (no quoted commas expected in OHLCV)
@@ -30,18 +29,13 @@ function parseCSV(text) {
     const o=+p[oi],h2=+p[hi],l2=+p[li],c2=+p[ci],v=+(p[vi]||0);
     if (!isFinite(o)||!isFinite(h2)||!isFinite(l2)||!isFinite(c2)||!isFinite(t)) continue;
     T.push(t);O.push(o);H.push(h2);L.push(l2);C.push(c2);V.push(v||0);
-    OI.push(oii>=0?+p[oii]||0:NaN);
   }
   // sort by time
   const n=T.length, idx=new Array(n);
   for(let i=0;i<n;i++) idx[i]=i;
   idx.sort((a,b)=>T[a]-T[b]);
-  const out={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n),oi:null,hasOI:false};
+  const out={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n)};
   for(let i=0;i<n;i++){const j=idx[i];out.t[i]=T[j];out.o[i]=O[j];out.h[i]=H[j];out.l[i]=L[j];out.c[i]=C[j];out.v[i]=V[j];}
-  // OI column present and non-trivial? (all-NaN/zeros => treat as absent)
-  let oiSum=0, oiN=0;
-  for(let i=0;i<n;i++){const j=idx[i];if(isFinite(OI[j])&&OI[j]!==0){oiSum+=Math.abs(OI[j]);oiN++;}}
-  if(oiN>n*0.5){out.oi=new Float64Array(n);for(let i=0;i<n;i++)out.oi[i]=OI[idx[i]]||0;out.hasOI=true;}
   return out;
 }
 
@@ -50,26 +44,22 @@ function resample(d, tfMin) {
   if (tfMin===1) return d;
   const n=d.t.length, ms=tfMin*60000;
   // align buckets to 09:15 IST session grid: bucket = floor((t - sessionStart)/ms)? simpler: floor(t/ms)
-  const T=[],O=[],H=[],L=[],C=[],V=[],OI=[];
-  const hasOI=!!(d.oi&&d.hasOI);
-  let bt=-1,bo=0,bh=-Infinity,bl=Infinity,bc=0,bv=0,boi=0;
+  const T=[],O=[],H=[],L=[],C=[],V=[];
+  let bt=-1,bo=0,bh=-Infinity,bl=Infinity,bc=0,bv=0;
   for(let i=0;i<n;i++){
     const b=Math.floor(d.t[i]/ms);
     if(b!==bt){
-      if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);if(hasOI)OI.push(boi);}
-      bt=b;bo=d.o[i];bh=d.h[i];bl=d.l[i];bc=d.c[i];bv=d.v[i];boi=hasOI?d.oi[i]:0;
+      if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);}
+      bt=b;bo=d.o[i];bh=d.h[i];bl=d.l[i];bc=d.c[i];bv=d.v[i];
     } else {
       if(d.h[i]>bh)bh=d.h[i];
       if(d.l[i]<bl)bl=d.l[i];
       bc=d.c[i];bv+=d.v[i];
-      if(hasOI)boi=d.oi[i]; // OI is a stock: last value wins
     }
   }
-  if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);if(hasOI)OI.push(boi);}
+  if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);}
   const m=T.length;
-  const out={t:Float64Array.from(T),o:Float64Array.from(O),h:Float64Array.from(H),l:Float64Array.from(L),c:Float64Array.from(C),v:Float64Array.from(V),oi:null,hasOI:false};
-  if(hasOI){out.oi=Float64Array.from(OI);out.hasOI=true;}
-  return out;
+  return {t:Float64Array.from(T),o:Float64Array.from(O),h:Float64Array.from(H),l:Float64Array.from(L),c:Float64Array.from(C),v:Float64Array.from(V)};
 }
 
 // ---------- indicators (Float64Array in/out, NaN for warmup) ----------
@@ -523,22 +513,6 @@ function buildSignals(d, cfg){
     const fz=fvgZones(d,P.maxZones||5,P.mitAge||60);
     osc={fvgBias:Array.from(fz.bias)};
     for(let i=0;i<n;i++)pos[i]=fz.bias[i]; // +1 tap bull zone, -1 tap bear zone, else flat
-  } else if(ind==='OI'){
-    // Derivative build-up: needs OI column; without it the leg is flat (never trades)
-    if(d.oi&&d.hasOI){
-      const L=Math.max(2,Math.round(P.oiLen||10)), mm=P.minMove||0;
-      const smaOI=sma(d.oi,L);
-      osc={oi:d.oi};
-      for(let i=1;i<n;i++){
-        if(isNaN(smaOI[i]))continue;
-        const roc=(d.c[i]-d.c[i-1])/d.c[i-1]*100;
-        const oiUp=d.oi[i]>smaOI[i];
-        if(roc>mm&&oiUp)pos[i]=1; // long build-up: price + OI rising
-        else if(roc<-mm&&oiUp)pos[i]=-1; // short build-up
-        else if(!oiUp)pos[i]=0; // unwinding: stand aside
-        else pos[i]=i>0?pos[i-1]:0;
-      }
-    }
   } else if(ind==='Regime'){
     // Volatility gate: trend-follow EMA only when Choppiness < gate, else flat
     const ch=choppiness(d.h,d.l,d.c,P.chopPeriod||14);
@@ -739,7 +713,6 @@ const SCHEMA={
   VWAPBands:[{key:'sd1',min:1,max:3,def:1},{key:'sd2',min:1,max:3,def:2}],
   CVD:[{key:'lookback',min:10,max:100,def:40}],
   FVG:[{key:'maxZones',min:1,max:10,def:5},{key:'mitAge',min:10,max:200,def:60}],
-  OI:[{key:'oiLen',min:3,max:30,def:10},{key:'minMove',min:0,max:2,def:0.2}],
   Regime:[{key:'chopPeriod',min:7,max:40,def:14},{key:'gate',min:40,max:80,def:61.8},{key:'maPeriod',min:10,max:100,def:30}],
 };
 

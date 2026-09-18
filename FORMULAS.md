@@ -52,8 +52,7 @@ variable names map 1:1 to the code.
 | 21 | VWAP Bands ★ | Session VWAP ± `sd1·σ` / ± `sd2·σ`, `σ` = expanding session std of typical price |
 | 22 | CVD ★ | Tick-rule delta `±volume` (sign of `close−open`), cumulated, **reset each session**; divergence vs trailing swing low/high over `lookback` |
 | 23 | FVG ★ | Bull gap when `low[i] > high[i−2]`, zone `[high[i−2], low[i]]`; zones die on full mitigation or after `mitAge` bars (max `maxZones` live) |
-| 24 | OI build-up ★ | `roc = 1-bar % move`, `oiUp = OI > SMA(OI, oiLen)`; long build-up (`roc>+min`, OI up), short build-up, unwinding (OI down) → flat. **No OI column ⇒ leg stays flat, never trades** |
-| 25 | Regime gate ★ | Choppiness `100·log10(meanTR/range)/log10(p)`; trend EMA followed only when chop < `gate`, else flat (suppresses trend loops in ranges) |
+| 24 | Regime gate ★ | Choppiness `100·log10(meanTR/range)/log10(p)`; trend EMA followed only when chop < `gate`, else flat (suppresses trend loops in ranges) |
 
 ★ = proprietary-style (rare in retail screeners).
 
@@ -79,7 +78,6 @@ Flat (`0`) during indicator warmup; otherwise:
 | VWAPBands | close < −sd1 band | close > +sd1 band | hold previous |
 | CVD | price undercuts trailing low while CVD holds higher (bullish divergence) | price exceeds trailing high while CVD holds lower | hold previous |
 | FVG | low taps a live bull zone | high taps a live bear zone | flat (no touch) |
-| OI | long build-up (price↑ + OI↑) | short build-up (price↓ + OI↑) | flat on unwinding, else hold |
 | Regime | chop < gate AND close > EMA | chop < gate AND close < EMA | flat when chop ≥ gate |
 
 ## 5. Trade execution (`backtest`)
@@ -149,7 +147,7 @@ Flat (`0`) during indicator warmup; otherwise:
 - **Ranking** (`rankResults` + `objectiveValue`): Sharpe (default), Sortino,
   WinRate, Trade count, or Drawdown (higher = closer to zero wins); ties break on
   Net P&L. Rows with **zero trades always rank below traded rows**, so a flat
-  leg (e.g. OI without an OI column) can never top a losing board. The
+  leg (e.g. a fully gated-out Regime) can never top a losing board. The
   Best-per-Indicator tab shows each strategy's champion under the active objective.
 
 ## 8. Known limitations (by design)
@@ -160,9 +158,9 @@ Flat (`0`) during indicator warmup; otherwise:
 4. Corporate actions/splits are not adjusted — use split-adjusted data.
 5. Timestamps are browser-local; session filter compares local clock HH:MM.
 6. Backtests are historical simulations, not investment advice.
-7. OI leg requires an OI-like column (`oi`, `open interest`, `chg oi`); files
-   without one keep that leg flat. Volume is summed on resample; OI takes the
-   last value per bucket (it is a stock, not a flow).
+7. OHLCV only: the engine parses `date,open,high,low,close,volume` and nothing
+   else. Volume is summed on resample; no open-interest, delivery, or
+   quote-depth data is read or required.
 
 ## 9. Built-in validation (🛠 Developer panel → Debug & Validate)
 
@@ -176,6 +174,6 @@ Runs entirely on the LOADED live bars — zero synthetic data. Each run asserts:
   repriced tick-for-tick from their bars; next-open fills verified when ⑥ = next-open.
 - **L5 exit legs engage live**: at least one `BE` and one `ATR` exit on the file.
 - **L6 metrics finite**, drawdown within [−101, 0].
-- **L7 session coverage %**, OI-column status, active fill/exit printed.
+- **L7 session coverage %** and active fill/exit printed.
 - Every validation and grid summary is appended to an in-memory session log,
   downloadable via **⬇ Download session log (.txt)**.
