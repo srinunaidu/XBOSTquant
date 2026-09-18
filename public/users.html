@@ -4,21 +4,30 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>XBOST — User Management</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
-  body{background:#09090b;color:#e4e4e7;font-family:Inter,system-ui,sans-serif}
-  .card{background:#101014;border:1px solid #27272a;border-radius:10px}
-  input,select{background:#18181b!important;border:1px solid #3f3f46!important;color:#e4e4e7!important;border-radius:6px;font-size:13px;padding:7px 9px}
-  th{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#a1a1aa;text-align:left;padding:8px}
-  td{font-size:13px;padding:8px;border-top:1px solid #1f1f23;font-family:'JetBrains Mono',monospace}
-  .btn{background:#22ff88;color:#052e16;font-weight:700;border-radius:8px;padding:8px 14px;font-size:13px}
-  .btn-ghost{background:#27272a;color:#e4e4e7;border:1px solid #3f3f46;border-radius:8px;padding:6px 10px;font-size:12px}
+  body{background:#07070c;color:#ececf1;font-family:Inter,system-ui,sans-serif;
+    background-image:radial-gradient(900px 320px at 50% -120px, rgba(52,211,153,.10), transparent 70%);background-attachment:fixed}
+  .card{background:linear-gradient(180deg,#141419,#0e0e13);border:1px solid #232329;border-radius:14px;
+    box-shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 12px 32px -18px rgba(0,0,0,.8)}
+  input,select{background:#17171d!important;border:1px solid #2e2e36!important;color:#ececf1!important;border-radius:8px;font-size:13px;padding:8px 10px}
+  input:focus,select:focus{border-color:#34d399!important;outline:none;box-shadow:0 0 0 3px rgba(52,211,153,.15)}
+  th{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:#a1a1aa;text-align:left;padding:10px}
+  td{font-size:13px;padding:9px 10px;border-top:1px solid #1b1b22;font-family:'JetBrains Mono',monospace}
+  tbody tr{transition:background .12s}tbody tr:hover{background:#17171f}
+  .btn{background:linear-gradient(135deg,#34d399,#22ff88);color:#03251a;font-weight:800;border-radius:10px;padding:9px 16px;font-size:13px;border:1px solid rgba(255,255,255,.12)}
+  .btn:hover{filter:brightness(1.08)}
+  .btn-ghost{background:#1a1a21;color:#ececf1;border:1px solid #2e2e36;border-radius:8px;padding:7px 11px;font-size:12px}
+  .btn-ghost:hover{background:#26262e}
+  .font-disp{font-family:'Space Grotesk',Inter,sans-serif}
 </style>
 </head>
 <body class="p-4 max-w-3xl mx-auto">
   <div class="flex items-center gap-3 mb-4">
     <a href="/" class="btn-ghost" style="text-decoration:none">← Terminal</a>
-    <h1 class="font-extrabold text-lg">👥 User Management <span class="text-xs text-zinc-500 font-normal">admin only</span></h1>
+    <h1 class="font-disp font-bold text-lg tracking-tight">👥 User Management <span class="text-xs text-zinc-500 font-normal">admin only</span></h1>
   </div>
   <div class="card p-4 mb-4">
     <div class="font-bold text-sm mb-2">＋ Add user</div>

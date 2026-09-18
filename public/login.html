@@ -4,23 +4,31 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>XBOST — Login</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script>
 <style>
-  body{background:#09090b;color:#e4e4e7;font-family:Inter,system-ui,sans-serif}
-  .card{background:#101014;border:1px solid #27272a;border-radius:12px}
-  input{background:#18181b!important;border:1px solid #3f3f46!important;color:#e4e4e7!important;border-radius:8px;padding:10px 12px;width:100%;font-size:14px}
-  input:focus{border-color:#22ff88!important;outline:none}
-  .btn{background:#22ff88;color:#052e16;font-weight:700;border-radius:8px;padding:10px;font-size:14px;width:100%}
-  .btn:hover{background:#4dff9f}
+  body{background:#07070c;color:#ececf1;font-family:Inter,system-ui,sans-serif;
+    background-image:radial-gradient(900px 320px at 50% -120px, rgba(52,211,153,.12), transparent 70%);background-attachment:fixed}
+  .card{background:linear-gradient(180deg,#141419,#0e0e13);border:1px solid #232329;border-radius:16px;
+    box-shadow:0 1px 0 rgba(255,255,255,.04) inset, 0 24px 64px -24px rgba(0,0,0,.9)}
+  input{background:#17171d!important;border:1px solid #2e2e36!important;color:#ececf1!important;border-radius:10px;padding:11px 13px;width:100%;font-size:14px;transition:border-color .15s, box-shadow .15s}
+  input:focus{border-color:#34d399!important;outline:none;box-shadow:0 0 0 3px rgba(52,211,153,.15)}
+  .btn{background:linear-gradient(135deg,#34d399,#22ff88);color:#03251a;font-weight:800;border-radius:10px;padding:11px;font-size:14px;width:100%;transition:.15s;
+    box-shadow:0 8px 24px -8px rgba(52,211,153,.55), 0 1px 0 rgba(255,255,255,.25) inset;border:1px solid rgba(255,255,255,.12)}
+  .btn:hover{filter:brightness(1.08)}
+  .logo{background:linear-gradient(135deg,#6ee7b7,#34d399 45%,#059669);box-shadow:0 6px 20px -6px rgba(52,211,153,.6), 0 1px 0 rgba(255,255,255,.3) inset}
+  .font-disp{font-family:'Space Grotesk',Inter,sans-serif}
+  .grad-text{background:linear-gradient(90deg,#fff,#a7f3d0);-webkit-background-clip:text;background-clip:text;color:transparent}
 </style>
 </head>
 <body class="min-h-screen flex items-center justify-center p-4">
   <div class="card p-8 w-full max-w-sm">
     <div class="flex items-center gap-3 mb-1">
-      <div class="w-10 h-10 rounded-lg bg-gradient-to-br from-green-400 to-emerald-700 flex items-center justify-center font-black text-zinc-950 text-xl">X</div>
+      <div class="logo w-11 h-11 rounded-xl flex items-center justify-center font-black text-zinc-950 text-xl font-disp">X</div>
       <div>
-        <div class="font-extrabold tracking-tight">XBOST // QUANT TERMINAL</div>
-        <div class="text-[10px] text-zinc-500 tracking-widest uppercase">Restricted · login required</div>
+        <div class="font-disp font-bold tracking-tight text-[17px] grad-text">XBOST // QUANT TERMINAL</div>
+        <div class="text-[10px] text-zinc-500 tracking-[.18em] uppercase">Restricted · login required</div>
       </div>
     </div>
     <form id="f" class="space-y-3 mt-6">

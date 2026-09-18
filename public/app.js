@@ -150,8 +150,9 @@ $('objective').addEventListener('change', ()=>{ if(state.board.length) renderBoa
 // ---------- data loading ----------
 function setData(d, label){
   state.raw=d; applyDateFilter();
-  $('dataBadge').textContent=`${$('symbol').value} · ${(state.data.t.length/1000).toFixed(0)}k bars · ${label}`;
-  $('dataBadge').className='px-2.5 py-1 rounded-full bg-green-950 border border-green-700 text-green-300 num';
+  const sym=$('symbol').value||'UNNAMED';
+  $('dataBadge').innerHTML=`<span class="pulse"></span><span>${sym} · ${(state.data.t.length/1000).toFixed(0)}k bars · ${label}</span>`;
+  $('dataBadge').className='badge badge-live num';
   const t0=new Date(state.data.t[0]), t1=new Date(state.data.t[state.data.t.length-1]);
   $('dataInfo').textContent=`${t0.toLocaleDateString()} → ${t1.toLocaleDateString()} · ${(state.data.t.length).toLocaleString()} 1m bars`;
   $('fromDate').value=t0.toISOString().slice(0,10); $('toDate').value=t1.toISOString().slice(0,10);
@@ -196,10 +197,15 @@ async function loadRepoCSV(){
     const txt=await r.text();
     const t0=performance.now();
     const d=E.parseCSV(txt);
+    if(!d.t.length)throw new Error('empty file');
+    if(!$('symbol').value)$('symbol').value='HDFCBANK';
     $('perfBadge').classList.remove('hidden');
     $('perfBadge').textContent=`parsed ${(d.t.length/1000).toFixed(0)}k rows in ${((performance.now()-t0)/1000).toFixed(1)}s`;
     setData(d,'HDFCBANK_minute.csv · real');
-  }catch(err){ alert('Could not load repo CSV (serve over http for 50MB file). Use file upload instead.\n'+err); }
+  }catch(err){
+    $('progTxt').textContent='idle';
+    $('dataInfo').textContent='Bundled file not found on this server — upload your own 1-min CSV above.';
+  }
 }
 function tradeOpts(){
   return {
@@ -536,7 +542,7 @@ function renderKPIs(){
     ['Sharpe / Sortino',m.sharpe.toFixed(2)+' / '+m.sortino.toFixed(2),m.sharpe>1],
   ]:[['Net P&L','—'],['Win Rate','—'],['Trades','—'],['Profit Factor','—'],['Max DD','—'],['Sharpe','—']];
   $('kpiStrip').innerHTML=items.map(([l,v,good])=>
-    `<div class="card p-3"><div class="lbl">${l}</div><div class="num text-xl font-bold mt-1 ${good===true?'pos':good===false?'neg':''}">${v}</div></div>`).join('');
+    `<div class="card kpi p-3${good===false?' neg-kpi':''}"><div class="lbl">${l}</div><div class="num font-disp text-xl font-bold mt-1 ${good===true?'pos':good===false?'neg':''}">${v}</div></div>`).join('');
 }
 
 // ---------- main candle canvas ----------
@@ -607,7 +613,7 @@ function mkChart(id,cfg){
   state.charts[id]=new Chart($(id),cfg);
   return state.charts[id];
 }
-const gridColor='rgba(63,63,70,.35)', tickColor='#71717a';
+const gridColor='rgba(46,46,54,.55)', tickColor='#8b8b96';
 function renderSubCharts(){
   if(!state.detail)return;
   const {data:d,sig,bt}=state.detail;
@@ -778,8 +784,8 @@ $('btnLogDl').onclick=()=>{
     `XBOST run log · ${new Date().toString()}\n${'='.repeat(60)}\n`+state.log.join('\n')+'\n');
 };
 
-// boot: real data only — auto-load the repo CSV when served over http,
-// otherwise the user uploads a 1-min OHLCV file. No synthetic data anywhere.
+// boot: neutral — no default symbol, no auto-load. Upload a CSV (or try the
+// bundled file) to begin. No synthetic data anywhere.
 // Surface unexpected errors in the status line so failures are never silent.
 window.addEventListener('error', e=>{
   if($('btnRun')&&$('btnRun').disabled){
@@ -789,5 +795,5 @@ window.addEventListener('error', e=>{
 estimateCombos();
 updateRiskLock();
 renderKPIs();
-loadRepoCSV();
+$('dataInfo').textContent='No file loaded — upload a 1-min CSV to begin.';
 })();

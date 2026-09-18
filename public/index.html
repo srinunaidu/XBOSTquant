@@ -4,51 +4,98 @@
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>XBOST — Institutional Algo Backtesting Terminal · Nifty / BankNifty</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet"/>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 <script>
-tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', bear:'#ff3b5c' }, fontFamily:{ mono:['JetBrains Mono','ui-monospace','monospace'] } } } };
+tailwind.config = { darkMode:'class', theme:{ extend:{
+  colors:{ neon:'#34d399', mint:'#22ff88', bear:'#fb4d6d', ink:'#07070c' },
+  fontFamily:{ disp:['Space Grotesk','Inter','sans-serif'], sans:['Inter','system-ui','sans-serif'], mono:['JetBrains Mono','ui-monospace','monospace'] }
+} } };
 </script>
 <style>
-  body{background:#09090b;color:#e4e4e7;font-family:Inter,system-ui,sans-serif}
-  ::-webkit-scrollbar{width:8px;height:8px}::-webkit-scrollbar-thumb{background:#3f3f46;border-radius:4px}::-webkit-scrollbar-track{background:transparent}
-  .card{background:#101014;border:1px solid #27272a;border-radius:10px}
-  .lbl{font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#a1a1aa;font-weight:600}
-  .num{font-family:'JetBrains Mono',monospace}
-  input,select{background:#18181b!important;border:1px solid #3f3f46!important;color:#e4e4e7!important;border-radius:6px;font-size:12px;padding:4px 6px}
-  input:focus,select:focus{border-color:#22ff88!important;outline:none}
-  input[type=checkbox],input[type=radio]{accent-color:#22ff88;width:14px;height:14px}
-  th{font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#a1a1aa;font-weight:600;text-align:right;padding:8px;white-space:nowrap;cursor:pointer;user-select:none}
+  :root{ --line:#232329; --panel:#0e0e13; --panel2:#141419; --txt:#ececf1; --mut:#a1a1aa; --dim:#71717a;
+    --grn:#34d399; --grn2:#22ff88; --red:#fb4d6d; --amber:#fbbf24; --blue:#60a5fa; }
+  *{ -webkit-tap-highlight-color:transparent; }
+  body{
+    background:#07070c;color:var(--txt);font-family:Inter,system-ui,sans-serif;
+    background-image:radial-gradient(1100px 320px at 50% -120px, rgba(52,211,153,.10), transparent 70%),
+                     radial-gradient(800px 300px at 100% 0%, rgba(96,165,250,.05), transparent 70%);
+    background-attachment:fixed;
+  }
+  ::-webkit-scrollbar{width:9px;height:9px}
+  ::-webkit-scrollbar-thumb{background:#2e2e36;border-radius:6px;border:2px solid #07070c}
+  ::-webkit-scrollbar-thumb:hover{background:#3f3f46}
+  ::-webkit-scrollbar-track{background:transparent}
+  ::selection{background:rgba(52,211,153,.28)}
+  .font-disp{font-family:'Space Grotesk',Inter,sans-serif}
+  .card{background:linear-gradient(180deg,var(--panel2),var(--panel));border:1px solid var(--line);border-radius:14px;
+    box-shadow:0 1px 0 rgba(255,255,255,.03) inset, 0 12px 32px -18px rgba(0,0,0,.8)}
+  .card-hd{display:flex;align-items:center;gap:8px}
+  .card-hd .dot{width:7px;height:7px;border-radius:99px;background:linear-gradient(135deg,var(--grn),var(--grn2));box-shadow:0 0 10px rgba(52,211,153,.8)}
+  .lbl{font-size:10px;letter-spacing:.14em;text-transform:uppercase;color:var(--mut);font-weight:700}
+  .num{font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums}
+  input,select{background:#17171d!important;border:1px solid #2e2e36!important;color:var(--txt)!important;border-radius:8px;font-size:12px;padding:6px 8px;transition:border-color .15s, box-shadow .15s}
+  input:hover,select:hover{border-color:#3f3f46!important}
+  input:focus,select:focus{border-color:var(--grn)!important;outline:none;box-shadow:0 0 0 3px rgba(52,211,153,.15)}
+  input:disabled{opacity:.35}
+  input[type=checkbox],input[type=radio]{accent-color:var(--grn);width:15px;height:15px;cursor:pointer}
+  input[type=file]{padding:6px}
+  input[type=file]::file-selector-button{background:#27272a;color:#fff;border:1px solid #3f3f46;border-radius:7px;padding:5px 12px;margin-right:10px;cursor:pointer;font-weight:600;font-size:12px}
+  input[type=file]::file-selector-button:hover{background:#3f3f46}
+  th{font-size:10px;letter-spacing:.1em;text-transform:uppercase;color:var(--mut);font-weight:700;text-align:right;padding:10px 10px;white-space:nowrap;cursor:pointer;user-select:none;background:rgba(14,14,19,.92)}
   th:first-child,td:first-child{text-align:left}
-  td{font-size:12px;padding:7px 8px;text-align:right;border-top:1px solid #1f1f23;white-space:nowrap;font-family:'JetBrains Mono',monospace}
-  tbody tr{cursor:pointer}tbody tr:hover{background:#18181b}tbody tr.sel{background:#164e2a55;outline:1px solid #22ff8855}
-  .pos{color:#22ff88}.neg{color:#ff3b5c}
-  .btn{background:#22ff88;color:#052e16;font-weight:700;border-radius:8px;padding:8px 14px;font-size:13px;transition:.15s}
-  .btn:hover{background:#4dff9f}.btn:disabled{opacity:.4;cursor:not-allowed}
-  .btn-ghost{background:#27272a;color:#e4e4e7;border:1px solid #3f3f46}
-  .btn-ghost:hover{background:#3f3f46}
-  .ind-card{background:#141417;border:1px solid #27272a;border-radius:8px;padding:8px}
-  .ind-card.on{border-color:#22ff8855;background:#0f1a13}
-  .param-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:4px;margin-top:6px}
-  .param-grid label{font-size:9px;color:#71717a;text-transform:uppercase}
+  td{font-size:12px;padding:8px 10px;text-align:right;border-top:1px solid #1b1b22;white-space:nowrap;font-family:'JetBrains Mono',monospace;font-variant-numeric:tabular-nums}
+  tbody tr{cursor:pointer;transition:background .12s}
+  tbody tr:hover{background:#17171f}
+  tbody tr.sel{background:rgba(52,211,153,.10);box-shadow:inset 2px 0 0 var(--grn)}
+  .pos{color:var(--grn2)}.neg{color:var(--red)}
+  .btn{background:linear-gradient(135deg,#34d399,#22ff88);color:#03251a;font-weight:800;border-radius:10px;padding:9px 16px;font-size:13px;letter-spacing:.01em;
+    transition:.15s;box-shadow:0 6px 20px -8px rgba(52,211,153,.55), 0 1px 0 rgba(255,255,255,.25) inset;border:1px solid rgba(255,255,255,.12)}
+  .btn:hover{filter:brightness(1.08);transform:translateY(-1px)}
+  .btn:active{transform:translateY(0)}
+  .btn:disabled{opacity:.4;cursor:not-allowed;transform:none;box-shadow:none}
+  .btn-ghost{background:#1a1a21;color:var(--txt);border:1px solid #2e2e36;transition:.15s}
+  .btn-ghost:hover{background:#26262e;border-color:#3f3f46;transform:none;box-shadow:none;filter:none}
+  .ind-card{background:#121218;border:1px solid var(--line);border-radius:10px;padding:10px;transition:.15s}
+  .ind-card:hover{border-color:#34343d}
+  .ind-card.on{border-color:rgba(52,211,153,.45);background:linear-gradient(180deg,rgba(52,211,153,.08),rgba(52,211,153,.02));box-shadow:0 0 0 1px rgba(52,211,153,.12), 0 8px 24px -16px rgba(52,211,153,.5)}
+  .param-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:5px;margin-top:8px}
+  .param-grid label{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.08em}
   canvas.chart{max-height:300px}
-  #candleCanvas{width:100%;height:420px;display:block;background:#0a0a0d;border-radius:8px;cursor:crosshair}
+  #candleCanvas{width:100%;height:420px;display:block;background:radial-gradient(600px 200px at 50% 0%,rgba(52,211,153,.05),transparent),#0a0a10;border:1px solid var(--line);border-radius:12px;cursor:crosshair}
+  .badge{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:99px;font-size:11px;border:1px solid #2e2e36;background:#15151b}
+  .badge-live{border-color:rgba(52,211,153,.5);color:#a7f3d0;background:rgba(52,211,153,.08)}
+  .pulse{width:7px;height:7px;border-radius:99px;background:var(--grn2);box-shadow:0 0 8px var(--grn2);animation:pl 1.6s ease-in-out infinite}
+  @keyframes pl{0%,100%{opacity:1}50%{opacity:.35}}
+  .kpi{position:relative;overflow:hidden}
+  .kpi::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;background:linear-gradient(180deg,var(--grn),transparent);opacity:.85}
+  .kpi.neg-kpi::before{background:linear-gradient(180deg,var(--red),transparent)}
+  .hdr{position:sticky;top:0;z-index:40;border-bottom:1px solid var(--line);background:rgba(7,7,12,.86);backdrop-filter:blur(14px)}
+  .logo{background:linear-gradient(135deg,#6ee7b7,#34d399 45%,#059669);box-shadow:0 4px 16px -4px rgba(52,211,153,.6), 0 1px 0 rgba(255,255,255,.3) inset}
+  .grad-text{background:linear-gradient(90deg,#fff,#a7f3d0);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .prog{height:8px;border-radius:99px;background:#17171d;border:1px solid var(--line);overflow:hidden}
+  .prog>div{height:100%;border-radius:99px;background:linear-gradient(90deg,#059669,#34d399,#a7f3d0);transition:width .3s;box-shadow:0 0 12px rgba(52,211,153,.5)}
+  .tabbtn{transition:.15s}
+  @media (max-width:1023px){ #candleCanvas{height:320px} }
 </style>
 </head>
 <body class="min-h-screen">
 
 <!-- ══ HEADER ══ -->
-<header class="sticky top-0 z-40 border-b border-zinc-800 bg-zinc-950/95 backdrop-blur px-4 py-2.5 flex flex-wrap items-center gap-3">
+<header class="hdr px-4 py-2.5 flex flex-wrap items-center gap-3">
   <div class="flex items-center gap-2.5">
-    <div class="w-8 h-8 rounded-lg bg-gradient-to-br from-green-400 to-emerald-700 flex items-center justify-center font-black text-zinc-950 text-lg">X</div>
+    <div class="logo w-9 h-9 rounded-xl flex items-center justify-center font-black text-zinc-950 text-lg font-disp">X</div>
     <div>
-      <div class="font-extrabold tracking-tight text-[15px]">XBOST <span class="text-green-400">//</span> QUANT TERMINAL</div>
-      <div class="text-[10px] text-zinc-500 tracking-widest uppercase">Nifty · BankNifty · Equities · 1-min OHLCV Engine</div>
+      <div class="font-disp font-bold tracking-tight text-[16px] grad-text">XBOST // QUANT TERMINAL</div>
+      <div class="text-[10px] text-zinc-500 tracking-[.18em] uppercase">Nifty · BankNifty · Equities · 1-min OHLCV Engine</div>
     </div>
   </div>
   <div class="flex items-center gap-2 ml-auto text-xs">
-    <span id="dataBadge" class="px-2.5 py-1 rounded-full bg-zinc-800 border border-zinc-700 text-zinc-300 num">no data</span>
-    <span id="perfBadge" class="px-2.5 py-1 rounded-full bg-zinc-800 border border-zinc-700 text-zinc-400 num hidden"></span>
+    <span id="dataBadge" class="badge num"><span class="pulse"></span><span>no data — upload 1-min CSV</span></span>
+    <span id="perfBadge" class="badge num hidden"></span>
     <button id="btnExportTrades" class="btn-ghost btn !py-1.5 !px-3 !text-xs">⬇ Trades CSV</button>
     <button id="btnExportBoard" class="btn-ghost btn !py-1.5 !px-3 !text-xs">⬇ Board CSV</button>
     <button id="btnRun" class="btn !py-1.5">▶ RUN GRID SEARCH</button>
@@ -62,35 +109,35 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
 
   <!-- DATA -->
   <section class="card p-3">
-    <div class="lbl mb-2">① Market Data — 1-min OHLCV</div>
+    <div class="card-hd mb-2"><span class="dot"></span><div class="lbl">① Market Data — 1-min OHLCV</div></div>
     <label class="block text-[11px] text-zinc-400 mb-1">Upload CSV <span class="text-zinc-600">(date,open,high,low,close,volume)</span></label>
     <input id="fileInput" type="file" accept=".csv,.txt" class="w-full mb-2"/>
     <div class="grid grid-cols-2 gap-2 mb-2">
-      <div><label class="lbl">Symbol</label><input id="symbol" value="HDFCBANK" class="w-full mt-1"/></div>
+      <div><label class="lbl">Symbol</label><input id="symbol" value="" placeholder="e.g. NIFTY" class="w-full mt-1"/></div>
       <div><label class="lbl">Capital ₹</label><input id="capital" type="number" value="100000" class="w-full mt-1 num"/></div>
     </div>
     <div class="flex gap-2">
-      <button id="btnLoadRepo" class="btn !text-xs flex-1">📁 Load HDFCBANK.csv (real data)</button>
+      <button id="btnLoadRepo" class="btn-ghost btn !text-xs flex-1">📁 Try bundled HDFCBANK.csv</button>
     </div>
-    <div class="text-[10px] text-zinc-500 mt-1.5">Real 1-minute OHLCV only — no synthetic data is used anywhere in this terminal.</div>
+    <div class="text-[10px] text-zinc-500 mt-1.5">Symbol is set from your file name on upload. Real 1-minute OHLCV only — no synthetic data anywhere.</div>
     <div class="grid grid-cols-2 gap-2 mt-2">
       <div><label class="lbl">From</label><input id="fromDate" type="date" class="w-full mt-1"/></div>
       <div><label class="lbl">To</label><input id="toDate" type="date" class="w-full mt-1"/></div>
     </div>
     <div id="dataInfo" class="text-[11px] text-zinc-500 mt-2 num">Awaiting data…</div>
-    <div class="w-full bg-zinc-800 rounded-full h-1.5 mt-2 hidden" id="loadBarWrap"><div id="loadBar" class="bg-green-400 h-1.5 rounded-full" style="width:0%"></div></div>
+    <div class="prog mt-2 hidden" id="loadBarWrap"><div id="loadBar" style="width:0%"></div></div>
   </section>
 
   <!-- TIMEFRAMES -->
   <section class="card p-3">
-    <div class="lbl mb-2">② Timeframes — multi-check resample</div>
+    <div class="card-hd mb-2"><span class="dot"></span><div class="lbl">② Timeframes — multi-check resample</div></div>
     <div id="tfBox" class="flex flex-wrap gap-1.5"></div>
     <div class="text-[10px] text-zinc-500 mt-1.5">1-min bars are resampled on the fly (O/H/L/C/V aware).</div>
   </section>
 
   <!-- OBJECTIVE -->
   <section class="card p-3">
-    <div class="lbl mb-2">③ Primary objective / optimization target</div>
+    <div class="card-hd mb-2"><span class="dot"></span><div class="lbl">③ Primary objective / optimization target</div></div>
     <select id="objective" class="w-full">
       <option value="sharpe">🏆 Best Risk-Adjusted — Sharpe Ratio</option>
       <option value="sortino">🛡 Best Risk-Adjusted — Sortino Ratio</option>
@@ -104,7 +151,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
     </div>
     <div id="comboEst" class="text-[11px] mt-2 num text-amber-300">Combos: 0</div>
     <div class="flex items-center gap-2 mt-2">
-      <div class="w-full bg-zinc-800 rounded-full h-2"><div id="progBar" class="bg-green-400 h-2 rounded-full transition-all" style="width:0%"></div></div>
+      <div class="prog" style="flex:1"><div id="progBar" style="width:0%"></div></div>
       <span id="liveBadge" class="hidden text-[10px] font-bold px-2 py-0.5 rounded-full bg-green-500 text-zinc-950 animate-pulse whitespace-nowrap">● LIVE</span>
     </div>
     <div id="progTxt" class="text-[11px] text-zinc-400 num mt-1">idle</div>
@@ -113,7 +160,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
 
   <!-- EXECUTION -->
   <section class="card p-3">
-    <div class="lbl mb-2">④ Trade execution & intraday rules</div>
+    <div class="card-hd mb-2"><span class="dot"></span><div class="lbl">④ Trade execution & intraday rules</div></div>
     <label class="lbl">Direction</label>
     <div class="flex gap-3 text-xs my-1.5">
       <label class="flex items-center gap-1"><input type="radio" name="dir" value="Long"/> Long</label>
@@ -169,7 +216,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
   <!-- INDICATORS -->
   <section class="card p-3">
     <div class="flex items-center justify-between mb-2">
-      <div class="lbl">⑤ Indicators A–Z + param ranges</div>
+      <div class="card-hd"><span class="dot"></span><div class="lbl">⑤ Indicators A–Z + param ranges</div></div>
       <button id="btnAllInd" class="text-[10px] text-green-400 hover:underline">select defaults</button>
     </div>
     <div id="indList" class="space-y-2"></div>
@@ -177,7 +224,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
 
   <!-- EXECUTION MODEL + DEV VALIDATION -->
   <section class="card p-3">
-    <div class="lbl mb-2">⑥ Fill model (anti-lookahead)</div>
+    <div class="card-hd mb-2"><span class="dot"></span><div class="lbl">⑥ Fill model (anti-lookahead)</div></div>
     <label class="lbl">Signal fill timing</label>
     <select id="fillMode" class="w-full mt-1">
       <option value="close">Signal-bar CLOSE (causal, standard)</option>
@@ -187,7 +234,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
   </section>
 
   <section class="card p-3 border-amber-900">
-    <div class="lbl mb-2">🛠 Developer panel — live-data audit</div>
+    <div class="card-hd mb-2"><span class="dot"></span><div class="lbl">🛠 Developer panel — live-data audit</div></div>
     <button id="btnValidate" class="btn !text-xs w-full">🔬 Debug &amp; Validate on live data</button>
     <button id="btnLogDl" class="btn-ghost btn !text-xs w-full mt-2">⬇ Download session log (.txt)</button>
     <div class="text-[10px] text-zinc-500 mt-1">Audits the loaded file + engine identities to the decimal. Zero synthetic data — validation runs on your live bars.</div>
@@ -203,7 +250,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
   <!-- LEADERBOARD -->
   <section class="card p-3">
     <div class="flex flex-wrap items-center gap-2 mb-2">
-      <div class="font-bold text-sm">🏆 Master Leaderboard <span class="text-zinc-500 font-normal text-xs">— click any row to load it on the charts</span></div>
+      <div class="font-disp font-semibold text-[14px] tracking-tight">🏆 Master Leaderboard <span class="text-zinc-500 font-normal text-xs">— click any row to load it on the charts</span></div>
       <div class="flex gap-1 ml-2">
         <button id="tabAll" class="btn !py-1 !px-2.5 !text-[11px]">📋 All results</button>
         <button id="tabBest" class="btn-ghost btn !py-1 !px-2.5 !text-[11px]">🏆 Best per indicator</button>
@@ -215,7 +262,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
     <div id="boardWrap" class="overflow-auto max-h-[380px] border border-zinc-800 rounded-lg">
       <table class="w-full min-w-[1300px]">
         <thead class="bg-zinc-900 sticky top-0"><tr id="boardHead"></tr></thead>
-        <tbody id="boardBody"><tr><td class="text-zinc-500 text-center py-8">Run a grid search to populate strategies…</td></tr></tbody>
+        <tbody id="boardBody"><tr><td class="text-zinc-500 text-center py-8">Upload a 1-min CSV, then run a grid search to populate strategies…</td></tr></tbody>
       </table>
     </div>
     <div id="cmpWrap" style="display:none">
@@ -228,7 +275,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
           <tbody id="cmpBody"><tr><td class="text-zinc-500 text-center py-8">Run a grid search to compare exit profiles…</td></tr></tbody>
         </table>
       </div>
-      <div class="font-bold text-sm mb-2">📊 Champion equity overlay <span class="text-zinc-500 font-normal text-xs">— one curve per exit profile</span></div>
+      <div class="font-disp font-semibold text-[14px] tracking-tight mb-2">📊 Champion equity overlay <span class="text-zinc-500 font-normal text-xs">— one curve per exit profile</span></div>
       <canvas id="cmpChart" class="chart"></canvas>
     </div>
   </section>
@@ -236,7 +283,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
   <!-- MAIN CHART -->
   <section class="card p-3">
     <div class="flex flex-wrap items-center gap-2 mb-2">
-      <div class="font-bold text-sm">📈 Price · Overlays · Signals <span id="chartTitle" class="text-zinc-500 font-normal text-xs num"></span></div>
+      <div class="font-disp font-semibold text-[14px] tracking-tight">📈 Price · Overlays · Signals <span id="chartTitle" class="text-zinc-500 font-normal text-xs num"></span></div>
       <div class="ml-auto flex items-center gap-2 text-xs text-zinc-400">
         <label>Bars <select id="barsToShow"><option>200</option><option selected>500</option><option>1000</option><option>2000</option></select></label>
         <label class="flex items-center gap-1"><input id="showMarkers" type="checkbox" checked/> signals</label>
@@ -249,20 +296,20 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
 
   <!-- SUB CHARTS -->
   <div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
-    <section class="card p-3"><div class="font-bold text-sm mb-2">🌊 Oscillator <span id="oscTitle" class="text-zinc-500 font-normal text-xs"></span></div><canvas id="oscChart" class="chart"></canvas></section>
-    <section class="card p-3"><div class="font-bold text-sm mb-2">📊 Volume <span class="text-zinc-500 font-normal text-xs">aligned to price timeline</span></div><canvas id="volChart" class="chart"></canvas></section>
+    <section class="card p-3"><div class="font-disp font-semibold text-[14px] tracking-tight mb-2">🌊 Oscillator <span id="oscTitle" class="text-zinc-500 font-normal text-xs"></span></div><canvas id="oscChart" class="chart"></canvas></section>
+    <section class="card p-3"><div class="font-disp font-semibold text-[14px] tracking-tight mb-2">📊 Volume <span class="text-zinc-500 font-normal text-xs">aligned to price timeline</span></div><canvas id="volChart" class="chart"></canvas></section>
   </div>
 
   <!-- EQUITY -->
   <div class="grid grid-cols-1 xl:grid-cols-2 gap-3">
-    <section class="card p-3"><div class="font-bold text-sm mb-2">💰 Equity Curve <span id="eqTitle" class="text-zinc-500 font-normal text-xs num"></span></div><canvas id="eqChart" class="chart"></canvas></section>
-    <section class="card p-3"><div class="font-bold text-sm mb-2">🔻 Drawdown (underwater) <span class="text-zinc-500 font-normal text-xs">%</span></div><canvas id="ddChart" class="chart"></canvas></section>
+    <section class="card p-3"><div class="font-disp font-semibold text-[14px] tracking-tight mb-2">💰 Equity Curve <span id="eqTitle" class="text-zinc-500 font-normal text-xs num"></span></div><canvas id="eqChart" class="chart"></canvas></section>
+    <section class="card p-3"><div class="font-disp font-semibold text-[14px] tracking-tight mb-2">🔻 Drawdown (underwater) <span class="text-zinc-500 font-normal text-xs">%</span></div><canvas id="ddChart" class="chart"></canvas></section>
   </div>
 
   <!-- TRADES -->
   <section class="card p-3">
     <div class="flex items-center gap-2 mb-2">
-      <div class="font-bold text-sm">🧾 Trade Analytics & Log <span id="tradeCount" class="text-zinc-500 font-normal text-xs num"></span></div>
+      <div class="font-disp font-semibold text-[14px] tracking-tight">🧾 Trade Analytics & Log <span id="tradeCount" class="text-zinc-500 font-normal text-xs num"></span></div>
       <div class="ml-auto text-[11px] text-zinc-500 num" id="tradeSummary"></div>
     </div>
     <div class="overflow-auto max-h-[420px] border border-zinc-800 rounded-lg">
