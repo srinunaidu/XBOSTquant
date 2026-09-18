@@ -298,6 +298,8 @@ async function runGrid(){
   }
   if(runSeq!==state.runSeq) return; // superseded by a newer run
   $('progTxt').textContent=`done · ${grid.length} combos in ${((performance.now()-t0)/1000).toFixed(1)}s${refineInfo}${state.runError?` · ⚠ ${state.runError} errored`:''}`;
+  logLine(`grid done: ${grid.length} combos in ${((performance.now()-t0)/1000).toFixed(1)}s${refineInfo} objective=${objective} errors=${state.runError||0}`);
+  state.board.slice(0,3).forEach((r,i)=>logLine(`  #${i+1} ${r.timeframe}m ${r.indicator} ${fmtParams(r.params)} SL=${r.slPct} TP=${r.tpPct} ${EXIT_LBL[r.exit||'fixed']||''}${r.carry?'+C':''} WR=${r.m.winRate.toFixed(1)}% n=${r.m.totalTrades} pnl=${r.m.netPnL.toFixed(0)}`));
   $('nowRunning').textContent='';
   $('liveBadge').classList.add('hidden');
   $('btnRun').disabled=false;
@@ -702,68 +704,86 @@ $('btnExportTrades').onclick=()=>{
   const r=state.sel; dl(`xbost_trades_${r.indicator}_${r.timeframe}m_${r.exit||'fixed'}${r.carry?'_carry':''}_SL${r.slPct||0}_TP${r.tpPct||0}.csv`,s);
 };
 
-// ---------- anti-bug validation engine (DEV ONLY — synthetic in-memory bars, never state.data) ----------
-function mkBars(n, fn){
-  const t=new Float64Array(n),o=new Float64Array(n),h=new Float64Array(n),l=new Float64Array(n),c=new Float64Array(n),v=new Float64Array(n);
-  const t0=new Date('2024-01-02T09:15:00').getTime();
-  for(let i=0;i<n;i++){const b=fn(i);t[i]=t0+i*60000;o[i]=b[0];h[i]=b[1];l[i]=b[2];c[i]=b[3];v[i]=b[4]||1000;}
-  return {t,o,h,l,c,v};
+// ---------- live-data validation & run log (no synthetic data anywhere) ----------
+state.log=[];
+function logLine(s){
+  const ts=new Date().toLocaleTimeString('en-IN',{hour12:false});
+  state.log.push(`[${ts}] ${s}`);
+  if(state.log.length>2000)state.log.splice(0,state.log.length-2000);
 }
 function runValidation(){
+  // Audits the LOADED live dataset + engine: identities must hold to the decimal.
   const out=[];let pass=0,fail=0;
   const ok=(name,cond,extra)=>{if(cond){pass++;out.push('PASS '+name);}else{fail++;out.push('FAIL '+name+(extra?' :: '+extra:''));}};
-  const allOnes=n=>{const m=new Int8Array(n);m.fill(1);return m;};
+  logLine('validation started');
   try{
-    // T1 flat market: no stop/target may ever trigger; every pnl == -cost
-    const flat=mkBars(200,()=> [100,100,100,100,1000]);
-    const fsig=E.buildSignals(flat,{indicator:'EMA',params:{period:9}});
-    const fbt=E.backtest(flat,fsig.pos,{direction:'Both',sessionMask:allOnes(200),slPct:1,tpPct:2,trailPct:1,capital:100000,qty:10,lotSize:1,cost:20});
-    const badStop=fbt.trades.filter(t=>['SL','TP','TRAIL','BE','ATR'].includes(t.reason));
-    ok('T1 flat: no stop/target fills',badStop.length===0,badStop.length+' stop fills');
-    ok('T1 flat: pnl == -n*cost',Math.abs(fbt.metrics.netPnL+fbt.trades.length*20)<0.01,fbt.metrics.netPnL);
-    // T2 linear slope: single ride, pnl recomputed independently to the decimal
-    const slope=mkBars(60,i=>{const c=100+i;return [c,c+0.1,c-0.1,c,1000];});
-    const ssig=E.buildSignals(slope,{indicator:'EMA',params:{period:9}});
-    const sbt=E.backtest(slope,ssig.pos,{direction:'Long',sessionMask:allOnes(60),slPct:50,tpPct:200,capital:100000,qty:10,lotSize:1,cost:20});
-    ok('T2 slope: exactly 1 long ride',sbt.trades.length===1&&sbt.trades[0].type==='LONG',sbt.trades.length+' trades');
-    if(sbt.trades.length===1){
-      const t=sbt.trades[0];
-      const exp=(slope.c[t.exitIdx]-slope.c[t.entryIdx])*10-20;
-      ok('T2 slope: pnl to the decimal',Math.abs(t.pnl-exp)<0.01,t.pnl+' vs '+exp);
+    if(!state.data||!state.data.t.length){out.push('Load live data first (upload CSV or Load HDFCBANK.csv).');$('valOut').textContent=out.join('\n');return;}
+    const d=state.data, n=d.t.length;
+    out.push(`live data: ${$('symbol').value} · ${n.toLocaleString()} 1m bars · ${new Date(d.t[0]).toLocaleDateString()} → ${new Date(d.t[n-1]).toLocaleDateString()}`);
+    // L1 parse integrity on live bars
+    let asc=true,dup=false,nanPx=false;
+    const seen=new Set();
+    const step=Math.max(1,Math.floor(n/200000));
+    for(let i=1;i<n;i+=step){if(d.t[i]<=d.t[i-1])asc=false;}
+    for(let i=0;i<n;i+=step){const k=d.t[i];if(seen.has(k))dup=true;seen.add(k);
+      if(!isFinite(d.o[i]+d.h[i]+d.l[i]+d.c[i]))nanPx=true;}
+    ok('L1 timestamps ascending, no dups, prices finite',asc&&!dup&&!nanPx,`asc=${asc} dup=${dup} nan=${nanPx}`);
+    // L2 resample conservation 1m -> 5m on live data
+    const d5=E.resample(d,5);
+    let v1=0;for(let i=0;i<n;i++)v1+=d.v[i];
+    let v5=0;for(let i=0;i<d5.t.length;i++)v5+=d5.v[i];
+    ok('L2 resample conserves volume',Math.abs(v1-v5)<1e-6,`1m=${v1} 5m=${v5}`);
+    ok('L2 resample bar count sane',d5.t.length>0&&d5.t.length<=n&&d5.t[0]>=d.t[0]-300000&&d5.t[d5.t.length-1]<=d.t[n-1]+300000,`${d5.t.length} bars`);
+    // L3 warmup quarantine on live data (EMA21 -> first signal at bar >= 20)
+    const sig=E.buildSignals(d5,{indicator:'EMA',params:{period:21}});
+    let firstSig=-1;
+    for(let i=0;i<sig.pos.length;i++)if(sig.pos[i]!==0){firstSig=i;break;}
+    ok('L3 warmup quarantined (first signal >= bar 20)',firstSig>=20,'first='+firstSig);
+    // L4 identities on a live backtest with CURRENT sidebar settings
+    const eff=tradeOpts();
+    eff.sessionMask=eff.carry?new Int8Array(d5.c.length).fill(1):E.buildSessionMask(d5,eff.sessionStart,eff.sessionEnd);
+    const bt=E.backtest(d5,sig.pos,eff);
+    const m=bt.metrics;
+    ok('L4 cost identity (net == grossP - grossL)',Math.abs(m.netPnL-(m.grossProfit-m.grossLoss))<0.01,(m.grossProfit-m.grossLoss).toFixed(2)+' vs '+m.netPnL.toFixed(2));
+    let s=0;for(const t of bt.trades)s+=t.pnl;
+    ok('L4 equity identity (final == cap + sum pnl)',Math.abs(m.finalCapital-(eff.capital+s))<0.01);
+    let handOk=bt.trades.length>0, handMsg='';
+    for(let k=0;k<Math.min(3,bt.trades.length);k++){
+      const t=bt.trades[k];
+      const pxIn=(t.entryPx===d5.o[t.entryIdx]||t.entryPx===d5.c[t.entryIdx]);
+      const ux=(t.type==='LONG'?(t.exitPx-t.entryPx):(t.entryPx-t.exitPx))*(eff.qty*eff.lotSize)-eff.cost;
+      if(!(pxIn&&Math.abs(ux-t.pnl)<0.01)){handOk=false;handMsg='trade#'+t.id;}
     }
-    // T2b warmup quarantine: no entries inside EMA9 warmup (bars 0..7)
-    const early=sbt.trades.filter(t=>t.entryIdx<8);
-    ok('T2b warmup: no trades from NaN zone',early.length===0,early.length+' early trades');
-    // T3 50% gap-down THROUGH a 1% stop: fill must be the stop price, not the gap
-    const gap=mkBars(45,i=>{ if(i<30)return [100,100,100,100,1000]; if(i===30)return [100,100,50,51,5000]; return [51,51.1,50.9,51,1000]; });
-    const forced=new Int8Array(45);forced.fill(1); // forced long signal, no indicator involved
-    const gbt=E.backtest(gap,forced,{direction:'Both',sessionMask:allOnes(45),slPct:1,tpPct:50,capital:100000,qty:10,lotSize:1,cost:20});
-    const gsl=gbt.trades.find(t=>t.reason==='SL');
-    ok('T3 gap: SL triggered',!!gsl);
-    if(gsl){
-      ok('T3 gap: filled at stop 99.00, not gap 50',Math.abs(gsl.exitPx-99)<1e-9,gsl.exitPx);
-      ok('T3 gap: pnl = (99-100)*10-20',Math.abs(gsl.pnl-(-30))<1e-9,gsl.pnl);
-    }
-    // T4 next-open fill: entries print at open[entryIdx], never bar 0
-    const nbt=E.backtest(slope,ssig.pos,{direction:'Long',sessionMask:allOnes(60),slPct:50,tpPct:200,capital:100000,qty:10,lotSize:1,cost:20,fill:'next'});
-    const badFill=nbt.trades.filter(t=>Math.abs(t.entryPx-slope.o[t.entryIdx])>1e-9||t.entryIdx===0);
-    ok('T4 next-open: all entries at open[i+1]',nbt.trades.length>0&&badFill.length===0,nbt.trades.length+' trades, '+badFill.length+' bad');
-    // T5 denominator integrity: engineered ruin + empty-signal books stay finite
-    const ruin=mkBars(120,i=>{const c=100+i*2;return [c,c+0.2,c-0.2,c,1000];});
-    const rsig=new Int8Array(120);rsig.fill(-1); // forced shorts into a ripper
-    const rbt=E.backtest(ruin,rsig,{direction:'Both',sessionMask:allOnes(120),slPct:0.5,tpPct:5,capital:1000,qty:100,lotSize:1,cost:20});
-    const rm=rbt.metrics;
-    ok('T5 ruin: Sharpe/Sortino/DD finite',isFinite(rm.sharpe)&&isFinite(rm.sortino)&&isFinite(rm.maxDD),JSON.stringify({s:rm.sharpe,so:rm.sortino,dd:rm.maxDD}));
-    const zero=new Int8Array(60); // no signals at all
-    const zbt=E.backtest(slope,zero,{direction:'Both',sessionMask:allOnes(60),capital:100000,qty:10,lotSize:1,cost:20});
-    ok('T5b empty book: 0 trades, finite metrics',zbt.trades.length===0&&isFinite(zbt.metrics.sharpe)&&zbt.metrics.winRate===0&&zbt.metrics.profitFactor===0);
+    ok('L4 first 3 trades reprice from bars',handOk,handMsg||(bt.trades.length+' trades'));
+    if(eff.fill==='next'){
+      const bad=bt.trades.filter(t=>Math.abs(t.entryPx-d5.o[t.entryIdx])>1e-9);
+      ok('L4 next-open fills at open[]',bad.length===0,bad.length+' bad');
+    } else out.push('SKIP L4-next-open (fill mode = close; switch ⑥ to test)');
+    // L5 exit legs engage on live data
+    const be=E.backtest(d5,sig.pos,Object.assign({},eff,{exit:'breakeven',sessionMask:eff.sessionMask}));
+    const at=E.backtest(d5,sig.pos,Object.assign({},eff,{exit:'atr',sessionMask:eff.sessionMask}));
+    const hasBE=be.trades.some(t=>t.reason==='BE'), hasATR=at.trades.some(t=>t.reason==='ATR');
+    ok('L5 breakeven + chandelier legs fire live',hasBE&&hasATR,`BE=${hasBE} ATR=${hasATR}`);
+    // L6 metrics finite, DD bounded
+    ok('L6 metrics finite, DD in [-101,0]',isFinite(m.sharpe)&&isFinite(m.sortino)&&isFinite(m.maxDD)&&m.maxDD<=0&&m.maxDD>=-101,
+      `sharpe=${m.sharpe.toFixed(2)} sortino=${m.sortino.toFixed(2)} dd=${m.maxDD.toFixed(2)}`);
+    // L7 session + OI status
+    let inn=0;for(let i=0;i<eff.sessionMask.length;i++)inn+=eff.sessionMask[i];
+    out.push(`L7 session coverage ${(inn/eff.sessionMask.length*100).toFixed(1)}% · OI column ${d.hasOI?'present':'absent'} · fill=${eff.fill} · exit=${eff.exit||'fixed'}${eff.carry?' +carry':''}`);
     out.push('');
-    out.push(`VALIDATION: ${pass} passed, ${fail} failed — synthetic only, real data untouched.`);
-  }catch(err){out.push('VALIDATION FATAL: '+(err&&err.message||err));fail++;}
+    out.push(`LIVE VALIDATION: ${pass} passed, ${fail} failed — ${$('symbol').value}, real data only.`);
+    logLine(`validation: ${pass} passed, ${fail} failed`);
+  }catch(err){out.push('VALIDATION FATAL: '+(err&&err.message||err));fail++;logLine('validation FATAL: '+(err&&err.message||err));}
   $('valOut').textContent=out.join('\n');
   $('valOut').style.borderColor=fail?'#ff3b5c':'#22ff88';
+  out.forEach(l=>logLine('[val] '+l));
 }
 $('btnValidate').onclick=runValidation;
+$('btnLogDl').onclick=()=>{
+  if(!state.log.length){alert('Log is empty — run validation or a grid search first.');return;}
+  dl(`xbost_log_${$('symbol').value}_${new Date().toISOString().slice(0,10)}.txt`,
+    `XBOST run log · ${new Date().toString()}\n${'='.repeat(60)}\n`+state.log.join('\n')+'\n');
+};
 
 // boot: real data only — auto-load the repo CSV when served over http,
 // otherwise the user uploads a 1-min OHLCV file. No synthetic data anywhere.

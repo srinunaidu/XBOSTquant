@@ -148,8 +148,9 @@ Flat (`0`) during indicator warmup; otherwise:
   improving (max 4 passes, ≤600 candidates/pass). Refined rows are marked 🔁.
 - **Ranking** (`rankResults` + `objectiveValue`): Sharpe (default), Sortino,
   WinRate, Trade count, or Drawdown (higher = closer to zero wins); ties break on
-  Net P&L. The Best-per-Indicator tab shows each strategy's champion under the
-  active objective.
+  Net P&L. Rows with **zero trades always rank below traded rows**, so a flat
+  leg (e.g. OI without an OI column) can never top a losing board. The
+  Best-per-Indicator tab shows each strategy's champion under the active objective.
 
 ## 8. Known limitations (by design)
 
@@ -165,12 +166,16 @@ Flat (`0`) during indicator warmup; otherwise:
 
 ## 9. Built-in validation (🛠 Developer panel → Debug & Validate)
 
-Synthetic in-memory datasets, never touching real analysis. Each run asserts:
-- **T1 flat market**: no SL/TP/TRAIL/BE/ATR fill may occur; `net == −n·cost`.
-- **T2 linear slope**: EMA ride is exactly 1 LONG; P&L recomputed independently
-  to the decimal; **T2b**: zero entries inside the warmup bars.
-- **T3 50% gap-down through a 1% stop**: fill prints at the stop (99.00), P&L
-  exact (long 10 @100 → −30 incl. cost).
-- **T4 next-open**: every entry prints at `open[entryIdx]`, none on bar 0.
-- **T5 ruin + empty book**: Sharpe/Sortino/MaxDD stay finite; zero trades give
-  WR 0 / PF 0 with finite metrics.
+Runs entirely on the LOADED live bars — zero synthetic data. Each run asserts:
+- **L1 integrity**: timestamps strictly ascending, no duplicates, all OHLC finite.
+- **L2 resample conservation**: 1m→5m preserves total volume exactly; bar counts
+  and time bounds sane.
+- **L3 warmup quarantine**: first non-zero EMA21 signal at bar ≥ 20 (no NaN-zone trades).
+- **L4 identities with current sidebar settings**: `net == grossP − grossL` (costs
+  live inside trade P&L); `final == capital + Σ traded P&L`; first 3 trades
+  repriced tick-for-tick from their bars; next-open fills verified when ⑥ = next-open.
+- **L5 exit legs engage live**: at least one `BE` and one `ATR` exit on the file.
+- **L6 metrics finite**, drawdown within [−101, 0].
+- **L7 session coverage %**, OI-column status, active fill/exit printed.
+- Every validation and grid summary is appended to an in-memory session log,
+  downloadable via **⬇ Download session log (.txt)**.

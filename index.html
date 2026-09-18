@@ -186,9 +186,10 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
   </section>
 
   <section class="card p-3 border-amber-900">
-    <div class="lbl mb-2">🛠 Developer panel — validation only</div>
-    <button id="btnValidate" class="btn !text-xs w-full">🔬 Debug &amp; Validate engine</button>
-    <div class="text-[10px] text-zinc-500 mt-1">Runs synthetic stress datasets (flat / slope / gap) in-memory only — never touches real analysis.</div>
+    <div class="lbl mb-2">🛠 Developer panel — live-data audit</div>
+    <button id="btnValidate" class="btn !text-xs w-full">🔬 Debug &amp; Validate on live data</button>
+    <button id="btnLogDl" class="btn-ghost btn !text-xs w-full mt-2">⬇ Download session log (.txt)</button>
+    <div class="text-[10px] text-zinc-500 mt-1">Audits the loaded file + engine identities to the decimal. Zero synthetic data — validation runs on your live bars.</div>
     <pre id="valOut" class="text-[10px] num text-zinc-300 bg-zinc-950 border border-zinc-800 rounded-md p-2 mt-2 whitespace-pre-wrap max-h-64 overflow-auto">Not run yet.</pre>
   </section>
 </aside>

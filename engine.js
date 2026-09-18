@@ -837,13 +837,17 @@ function buildGrid(selected, risk, dims){
 }
 
 function rankResults(rows, objective){
-  const r=[...rows];
+  // Do-nothing rows (0 trades: flat signals, warmup-only, unavailable legs)
+  // always rank BELOW traded rows — otherwise a 0/0/0 row tops losing boards.
+  const traded=rows.filter(r=>r.m&&r.m.totalTrades>0);
+  const flat=rows.filter(r=>!(r.m&&r.m.totalTrades>0));
+  const r=[...traded];
   if(objective==='winrate')r.sort((a,b)=>b.m.winRate-a.m.winRate||b.m.netPnL-a.m.netPnL);
   else if(objective==='trades')r.sort((a,b)=>b.m.totalTrades-a.m.totalTrades||b.m.netPnL-a.m.netPnL);
   else if(objective==='drawdown')r.sort((a,b)=>b.m.maxDD-a.m.maxDD||b.m.netPnL-a.m.netPnL); // maxDD negative; higher (closer 0) first
   else if(objective==='sortino')r.sort((a,b)=>b.m.sortino-a.m.sortino);
   else r.sort((a,b)=>b.m.sharpe-a.m.sharpe||b.m.netPnL-a.m.netPnL); // default sharpe
-  return r;
+  return r.concat(flat);
 }
 
 const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,expandRange,SCHEMA,timeToMin};
