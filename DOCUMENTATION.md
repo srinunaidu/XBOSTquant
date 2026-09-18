@@ -107,12 +107,16 @@ volume sub-charts → equity + underwater drawdown (MTM) → trade log (red edge
 exited inside the max-DD window; DD window times in the equity title) →
 CSV exports (board + per-strategy trades with IST timestamps).
 
-## 6. Indicator catalogue (22, all grid-searched)
+## 6. Indicator catalogue (30, all grid-searched)
 
 Classic: EMA, SMA, HMA, DEMA, Bollinger, Keltner, RSI, MACD, VWAP, SuperTrend,
 ADX, Stochastic, Chande-Kroll, POC. Proprietary-style (★): KAMA, Fisher
 Transform, TTM Squeeze, Connors RSI. Smart-money: VWAP ±σ bands, CVD
-divergence, FVG zones, Choppiness Regime gate. Full maths in FORMULAS.md §§3–4.
+divergence, FVG zones, Choppiness Regime gate. Pure price/volume (new):
+Choppiness filter, Ehlers Cyber Cycle, VWMA, Chande MO, Aroon.
+Combinatorial presets (★P): SqueezeBreak (squeeze + volume spike + CK stops),
+TrendRegime (chop gate + SuperTrend + MACD hist), VWAPRev (VWAP fade + CMO).
+Full maths in FORMULAS.md §§3–4.
 
 ## 7. Execution model (essentials; proofs in FORMULAS.md §5)
 
@@ -135,8 +139,8 @@ final capital, gross ±. Board also shows SL %, TP %, Exit mode, Session.
 ## 9. Search engine
 
 - **Stage 1**: exhaustive Cartesian product
-  timeframes × params × SL × TP × exit-mode × day/carry (axis cap 25, grid cap
-  configurable). Runs in a Web Worker (main-thread fallback), streaming the
+  timeframes × params × SL × TP × exit-mode (fixed/breakeven/ATR/CK)
+  × day/carry (axis cap 25, grid cap configurable). Runs in a Web Worker (main-thread fallback), streaming the
   leaderboard live with per-batch current-config readout.
 - **Stage 2**: hill-climb refinement of the top-20 (every param ±1 UI step,
   incl. SL/TP, exit/carry lineage preserved) until no improvement (max 4
