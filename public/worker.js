@@ -40,6 +40,8 @@ self.onmessage = function(e) {
     if(cfg.trailPct!=null) eff.trailPct=cfg.trailPct;
     eff.exit = cfg.exit||'fixed';
     eff.carry = !!cfg.carry;
+    const xo = E.exitOptsFromParams(cfg.indicator, cfg.params||{});
+    if(xo){ eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
     const mk = (m, err) => ({ i: idx, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
       slPct: eff.slPct||0, tpPct: eff.tpPct||0, trailPct: eff.trailPct||0,
       exit: eff.exit, carry: eff.carry, refined: !!refined, m: m, err: err });

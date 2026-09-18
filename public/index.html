@@ -235,12 +235,15 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
         <label class="flex items-center gap-2 cursor-pointer"><input id="exitFixed" type="checkbox" checked/> Fixed SL / TP</label>
         <label class="flex items-center gap-2 cursor-pointer"><input id="exitBE" type="checkbox" checked/> Moving SL — breakeven + trail</label>
         <label class="flex items-center gap-2 cursor-pointer"><input id="exitATR" type="checkbox"/> ATR Chandelier trailing stop</label>
+        <label class="flex items-center gap-2 cursor-pointer"><input id="exitCK" type="checkbox"/> CK structural stop (presets)</label>
       </div>
       <div class="grid grid-cols-2 gap-1.5 mt-1.5">
         <div><label class="lbl">BE trigger %</label><input id="beTrigger" type="number" step="any" value="0.5" class="w-full mt-1 num"/></div>
         <div><label class="lbl">BE lock %</label><input id="beLock" type="number" step="any" value="0.0" class="w-full mt-1 num"/></div>
         <div><label class="lbl">ATR period</label><input id="atrP" type="number" step="1" value="14" class="w-full mt-1 num"/></div>
         <div><label class="lbl">ATR mult</label><input id="atrM" type="number" step="any" value="3.0" class="w-full mt-1 num"/></div>
+        <div><label class="lbl">CK period</label><input id="ckP" type="number" step="1" value="10" class="w-full mt-1 num"/></div>
+        <div><label class="lbl">CK mult</label><input id="ckM" type="number" step="any" value="3.0" class="w-full mt-1 num"/></div>
       </div>
       <div class="lbl mt-2 mb-1">Session handling — compare intraday vs carry</div>
       <div class="flex gap-3 text-xs">

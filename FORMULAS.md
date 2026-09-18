@@ -63,6 +63,14 @@ The parser sniffs each file and adapts; no fixed template is assumed:
 | 22 | CVD ★ | Tick-rule delta `±volume` (sign of `close−open`), cumulated, **reset each session**; divergence vs trailing swing low/high over `lookback` |
 | 23 | FVG ★ | Bull gap when `low[i] > high[i−2]`, zone `[high[i−2], low[i]]`; zones die on full mitigation or after `mitAge` bars (max `maxZones` live) |
 | 24 | Regime gate ★ | Choppiness `100·log10(meanTR/range)/log10(p)`; trend EMA followed only when chop < `gate`, else flat (suppresses trend loops in ranges) |
+| 25 | Choppiness filter | Same gate as Regime with independent `chopPeriod/gate/maPeriod` — standalone consolidation filter |
+| 26 | Cyber Cycle ★ | Ehlers 2-pole Butterworth (`alpha`): smoothed high-pass recursion; zero-cross system for cyclical turns |
+| 27 | VWMA | `Σ(price·vol)/Σvol` over `period`; price-vs-VWMA trend |
+| 28 | CMO | `100·(Σup−Σdn)/(Σup+Σdn)` over `period`; RSI-style `oversold/overbought` holds |
+| 29 | Aroon | `Up/Down = 100·(p−barsSince high/low)/p`; oscillator vs ±`level` with hold band |
+| 30 | ★P SqueezeBreak | Squeeze release + volume spike (`vol > volMult·SMA20`) entries; **Chande-Kroll structural stops** (`period/ckMult` via exit bridge); TP stays live |
+| 31 | ★P TrendRegime | Trades only when `chop < gate` AND SuperTrend bias AND MACD-hist sign agree; muted (flat) otherwise |
+| 32 | ★P VWAPRev | Fades only the 1σ→2σ stretch (`sd1`–`sd2` band) when CMO shows exhaustion; holds otherwise |
 
 ★ = proprietary-style (rare in retail screeners).
 
@@ -89,6 +97,30 @@ Flat (`0`) during indicator warmup; otherwise:
 | CVD | price undercuts trailing low while CVD holds higher (bullish divergence) | price exceeds trailing high while CVD holds lower | hold previous |
 | FVG | low taps a live bull zone | high taps a live bear zone | flat (no touch) |
 | Regime | chop < gate AND close > EMA | chop < gate AND close < EMA | flat when chop ≥ gate |
+| Chop | chop < gate AND close > EMA | chop < gate AND close < EMA | flat when chop ≥ gate |
+| Cyber | cycle > 0 | cycle < 0 | — |
+| VWMA | close > VWMA | close < VWMA | — |
+| CMO | CMO < oversold | CMO > overbought | hold previous |
+| Aroon | osc > level | osc < −level | hold inside band |
+| SqueezeBreak | squeeze release + volume spike, mom > 0 | release + spike, mom < 0 | hold last fire direction |
+| TrendRegime | gate open + ST long + hist > 0 | gate open + ST short + hist < 0 | flat (muted) |
+| VWAPRev | below −sd1 (above −sd2) + CMO exhausted | above +sd1 (below +sd2) + CMO exhausted | hold previous |
+
+## 5. Trade execution (`backtest`) — hardened guards
+
+- **G1 same-bar collision**: each bar precomputes `slTouch`/`tpTouch` from its
+  High/Low; if both are touched the fill is strictly the stop (`SL`/`BE`),
+  never the target — no optimistic TP-first bias. Verified by unit test.
+- **G2 fill integrity**: signal trades fill at `close[i]` (`fill=close`) or
+  exactly `open[i+1]` (`fill=next`); resting stops always fill intrabar at stop
+  levels. Indicators only ever read bars `≤ i`.
+- **G3 cash identity**: `finalCapital` is recomputed independently from the
+  trade list; `strict` mode (default) **throws** on any discrepancy. Cost
+  accounting is itemised: `totalCosts = n·cost`, `grossPreCost = net + costs`.
+- **G4 ruin halt**: the moment live equity `≤ 0`, the tail is filled flat and
+  the loop **breaks** (dead parameter sets cost O(1), not O(1M bars)).
+- **G5 warmup quarantine**: `NaN` indicator outputs force target `0`; the L3
+  audit asserts zero entries inside warmup.
 
 ## 5. Trade execution (`backtest`)
 
@@ -123,6 +155,10 @@ Flat (`0`) during indicator warmup; otherwise:
   - `atr` (Chandelier): replaces the fixed SL with
     `longStop = highestHigh_since_entry − atrMult·ATR(atrP)` (mirror for shorts);
     exits print `ATR`. TP stays active; fixed SL and trailing are off.
+- **Exit mode `ck`** (Chande-Kroll structural stop, searched dimension): replaces
+  the fixed SL with `longStop = highestHigh − ckMult·ATR` trailing from entry
+  (mirror for shorts, exits print `CK`); TP stays live. Preset legs carry their
+  own `ckPeriod/ckMult` through `exitOptsFromParams`.
 - **Session / carry** (`carry`, searched dimension): intraday (`carry=false`) uses
   the session mask (flat outside hours, no overnight); carry (`carry=true`)
   ignores the mask and holds positions across days. SL/TP/stops still apply.

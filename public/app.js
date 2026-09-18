@@ -52,6 +52,13 @@ const IND_META = [
   {n:'VWAPBands',d:'★ VWAP ±1–3σ deviation bands',on:true},{n:'CVD',d:'★ Cumulative Volume Delta divergence',on:true},
   {n:'FVG',d:'★ Fair Value Gap / imbalance taps',on:true},
   {n:'Regime',d:'★ Choppiness gate for trend loops',on:true},
+  {cat:'C · Pure price/volume oscillators (new)'},
+  {n:'Chop',d:'★ Choppiness consolidation filter',on:true},{n:'Cyber',d:'★ Ehlers cycle turning points',on:true},
+  {n:'VWMA',d:'★ Volume-weighted MA trend',on:true},{n:'CMO',d:'★ Chande momentum exhaustion',on:true},
+  {n:'Aroon',d:'★ Time-between-highs trend',on:true},
+  {cat:'D · Combinatorial presets (multi-leg)'},
+  {n:'SqueezeBreak',d:'★P Squeeze + volume + CK stops',on:true},{n:'TrendRegime',d:'★P Chop gate + ST + MACD',on:true},
+  {n:'VWAPRev',d:'★P VWAP fade + CMO trigger',on:true},
 ];
 // Max-coverage default ranges: [min, max, step] — ~115 configs per timeframe
 const DEFAULT_RANGES = {
@@ -74,6 +81,14 @@ const DEFAULT_RANGES = {
   CVD:{lookback:[20,60,20]},
   FVG:{maxZones:[3,7,2], mitAge:[20,60,20]},
   Regime:{chopPeriod:[10,20,5], gate:[55,65,5], maPeriod:[20,40,10]},
+  Chop:{chopPeriod:[10,20,10], gate:[55,65,5], maPeriod:[20,40,20]},
+  Cyber:{alpha:[0.05,0.2,0.05]},
+  VWMA:{period:[10,30,10]},
+  CMO:{period:[9,21,6], oversold:[-50,-30,20], overbought:[30,50,20]},
+  Aroon:{period:[14,28,14], level:[0,25,25]},
+  SqueezeBreak:{period:[14,21,7], bbMult:[2,2.5,0.5], kcMult:[1.5,2,0.5], volMult:[1.5,2.5,1], ckMult:[2,3,1]},
+  TrendRegime:{chopPeriod:[10,20,10], gate:[50,60,10], stMult:[2,3,1], macdFast:[8,12,4]},
+  VWAPRev:{sd1:[1,2,1], sd2:[2,3,1], cmoPeriod:[5,9,4], cmoOS:[-50,-30,20], cmoOB:[30,50,20]},
 };
 const indList=$('indList');
 function buildIndCards(){
@@ -248,6 +263,7 @@ function tradeOpts(){
     cost:+$('costPer').value||0,
     beTrigger:+$('beTrigger').value||0, beLock:+$('beLock').value||0,
     atrTrailPeriod:+$('atrP').value||14, atrTrailMult:+$('atrM').value||3,
+    ckPeriod:+$('ckP').value||10, ckMult:+$('ckM').value||3,
     fill:$('fillMode').value||'close', entry:$('entryMode').value||'trigger'
   };
 }
@@ -256,13 +272,14 @@ function getExitDims(){
   if($('exitFixed').checked)exits.push('fixed');
   if($('exitBE').checked)exits.push('breakeven');
   if($('exitATR').checked)exits.push('atr');
+  if($('exitCK').checked)exits.push('ck');
   const sess=(document.querySelector('input[name=sess]:checked')||{}).value||'intraday';
   const carry=sess==='carry'?[true]:sess==='both'?[false,true]:[false];
   return {exits:exits.length?exits:['fixed'], carry};
 }
-['exitFixed','exitBE','exitATR'].forEach(id=>$(id).addEventListener('change',estimateCombos));
+['exitFixed','exitBE','exitATR','exitCK'].forEach(id=>$(id).addEventListener('change',estimateCombos));
 document.querySelectorAll('input[name=sess]').forEach(r=>r.addEventListener('change',estimateCombos));
-const EXIT_LBL={fixed:'FIX',breakeven:'BE',atr:'ATR'};
+const EXIT_LBL={fixed:'FIX',breakeven:'BE',atr:'ATR',ck:'CK'};
 
 // ---------- grid search ----------
 $('btnRun').onclick=runGrid;
@@ -378,6 +395,8 @@ async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
     if(cfg.tpPct!=null)eff.tpPct=cfg.tpPct;
     if(cfg.trailPct!=null)eff.trailPct=cfg.trailPct;
     eff.exit=cfg.exit||'fixed'; eff.carry=!!cfg.carry;
+    const xof=E.exitOptsFromParams(cfg.indicator,cfg.params||{});
+    if(xof){eff.ckPeriod=xof.ckPeriod;eff.ckMult=xof.ckMult;}
     const sig=E.buildSignals(d,cfg), bt=E.backtest(d,sig.pos,eff);
     return {i:idx,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0,trailPct:eff.trailPct||0,exit:eff.exit,carry:eff.carry,refined:!!refined,m:bt.metrics};
   }
@@ -467,6 +486,8 @@ function runDetailFor(r){
   if(r.tpPct!=null)eff.tpPct=r.tpPct;
   if(r.trailPct!=null)eff.trailPct=r.trailPct;
   eff.exit=r.exit||'fixed'; eff.carry=!!r.carry;
+  const xod=E.exitOptsFromParams(r.indicator,r.params||{});
+  if(xod){eff.ckPeriod=xod.ckPeriod;eff.ckMult=xod.ckMult;}
   eff.sessionMask=eff.carry?new Int8Array(d.c.length).fill(1):E.buildSessionMask(d, eff.sessionStart, eff.sessionEnd);
   const bt=E.backtest(d,sig.pos,eff);
   return {cfg:r,data:d,sig,bt};
@@ -661,6 +682,9 @@ function renderSubCharts(){
   else if(sig.osc.fisher){series=sig.osc.fisher.slice(s0);oscName='Fisher Transform';}
   else if(sig.osc.sqzMom){series=sig.osc.sqzMom.slice(s0);oscName='Squeeze momentum';}
   else if(sig.osc.macdHist){series=sig.osc.macdHist.slice(s0);oscName='MACD hist';}
+  else if(sig.osc.cyber){series=sig.osc.cyber.slice(s0);oscName='Ehlers Cyber Cycle';}
+  else if(sig.osc.cmo){series=sig.osc.cmo.slice(s0);oscName='Chande MO';}
+  else if(sig.osc.aroon){series=sig.osc.aroon.slice(s0);oscName='Aroon Oscillator';}
   else if(sig.osc.adx){series=sig.osc.adx.slice(s0);oscName='ADX';}
   else if(sig.osc.stochK){series=sig.osc.stochK.slice(s0);oscName='Stoch %K';}
   else if(sig.osc.cvd){series=Array.from(sig.osc.cvd.slice(s0));oscName='Cumulative Volume Delta';}

@@ -101,3 +101,67 @@ test('grid + rank + refine helpers behave', () => {
   })), 'sharpe');
   assert.ok(ranked[0].m.sharpe >= ranked[1].m.sharpe);
 });
+
+test('next-open fills print at open[i+1]', () => {
+  const d = bars(60, i => { const c = 100 + i; return [c, c + 0.1, c - 0.1, c, 1000]; });
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 9 } });
+  const bt = E.backtest(d, sig.pos, { direction: 'Long', sessionMask: new Int8Array(60).fill(1), slPct: 50, tpPct: 200, capital: 100000, qty: 10, lotSize: 1, cost: 0, fill: 'next' });
+  assert.ok(bt.trades.length > 0);
+  for (const t of bt.trades) {
+    assert.ok(t.entryIdx > 0);
+    assert.ok(Math.abs(t.entryPx - d.o[t.entryIdx]) < 1e-9);
+  }
+});
+
+test('same-bar SL+TP collision resolves to SL', () => {
+  const d = bars(30, i => i < 10 ? [100, 100.1, 99.9, 100, 1000] : [100, 102, 98, 101, 1000]);
+  const forced = new Int8Array(30).fill(1);
+  const bt = E.backtest(d, forced, { direction: 'Long', sessionMask: new Int8Array(30).fill(1), slPct: 1, tpPct: 1, capital: 100000, qty: 10, lotSize: 1, cost: 0 });
+  const stops = bt.trades.filter(t => t.reason === 'SL');
+  assert.ok(stops.length > 0, 'expected SL-wins-tie exits');
+  assert.ok(!bt.trades.some(t => t.reason === 'TP' && t.exitIdx === stops[0].exitIdx));
+});
+
+test('cash identity holds with costs itemised', () => {
+  const d = bars(80, i => { const c = 100 + 5 * Math.sin(i / 5); return [c, c + 0.3, c - 0.3, c, 1000]; });
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 9 } });
+  const bt = E.backtest(d, sig.pos, { direction: 'Both', sessionMask: new Int8Array(80).fill(1), slPct: 2, tpPct: 3, capital: 50000, qty: 5, lotSize: 1, cost: 7 });
+  const m = bt.metrics;
+  assert.equal(m.totalCosts, bt.trades.length * 7);
+  assert.ok(Math.abs(m.finalCapital - (50000 + m.netPnL)) < 1e-6);
+  assert.ok(Math.abs((m.grossPreCost - m.totalCosts) - m.netPnL) < 1e-6);
+});
+
+test('ruin halts: flat tail, no post-ruin entries', () => {
+  const d = bars(120, i => { const c = 100 + i; return [c, c + 0.1, c - 0.1, c, 1000]; });
+  const forced = new Int8Array(120).fill(-1);
+  const bt = E.backtest(d, forced, { direction: 'Both', sessionMask: new Int8Array(120).fill(1), slPct: 0.5, tpPct: 50, capital: 2000, qty: 100, lotSize: 1, cost: 20 });
+  let runEq = 2000, ruinAt = -1;
+  for (const t of bt.trades) { runEq += t.pnl; if (runEq <= 0 && ruinAt < 0) ruinAt = t.exitIdx; }
+  if (ruinAt >= 0) {
+    assert.ok(!bt.trades.some(t => t.entryIdx > ruinAt));
+    for (let i = ruinAt; i < 120; i++) assert.equal(bt.equity[i], runEq);
+  }
+});
+
+test('new indicators + presets run with warmup quarantine', () => {
+  const d = bars(150, i => { const c = 100 + 6 * Math.sin(i / 7) + i * 0.03; return [c, c + 0.4, c - 0.4, c, 2000]; });
+  const legs = [
+    ['Chop', { chopPeriod: 14, gate: 61.8, maPeriod: 30 }],
+    ['Cyber', { alpha: 0.07 }], ['VWMA', { period: 20 }],
+    ['CMO', { period: 9, oversold: -50, overbought: 50 }],
+    ['Aroon', { period: 25, level: 0 }],
+    ['SqueezeBreak', { period: 20, bbMult: 2, kcMult: 1.5, volMult: 2, ckMult: 3 }],
+    ['TrendRegime', { chopPeriod: 14, gate: 55, stMult: 3, macdFast: 12 }],
+    ['VWAPRev', { sd1: 1.5, sd2: 2, cmoPeriod: 5, cmoOS: -50, cmoOB: 50 }],
+  ];
+  for (const [ind, params] of legs) {
+    const sig = E.buildSignals(d, { indicator: ind, params });
+    assert.ok(sig.pos.length === 150);
+    const o = { direction: 'Both', sessionMask: new Int8Array(150).fill(1), slPct: 2, tpPct: 4, capital: 100000, qty: 10, lotSize: 1, cost: 0 };
+    if (ind === 'SqueezeBreak') { o.exit = 'ck'; const xo = E.exitOptsFromParams(ind, params); o.ckPeriod = xo.ckPeriod; o.ckMult = xo.ckMult; }
+    const bt = E.backtest(d, sig.pos, o);
+    assert.ok(bt.trades.every(t => t.entryIdx >= 0 && t.exitIdx > t.entryIdx));
+    assert.ok(isFinite(bt.metrics.sharpe) && isFinite(bt.metrics.maxDD));
+  }
+});
