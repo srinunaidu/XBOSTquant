@@ -2,40 +2,119 @@
 (function (root) {
 'use strict';
 
+function emptyData(){return {t:new Float64Array(0),o:new Float64Array(0),h:new Float64Array(0),l:new Float64Array(0),c:new Float64Array(0),v:new Float64Array(0),symbol:null,layout:'empty'};}
+
+function parseDateFlex(s){
+  // accepts: epoch ms/s, ISO, 'YYYY-MM-DD HH:MM:SS', YYYYMMDD, DD-MM-YYYY etc.
+  if(s==null)return NaN;
+  s=String(s).trim();
+  if(/^\d{13,}$/.test(s))return +s; // epoch ms
+  if(/^\d{10}$/.test(s)&&+s>946684800&&+s<4102444800)return +s*1000; // epoch s (also matches YYYYMMDD range? no: YYYYMMDD 20150101 < 946684800? 20150101 < 946684800 yes! safe)
+  if(/^\d{8}$/.test(s)){ // YYYYMMDD
+    const y=+s.slice(0,4),m=+s.slice(4,6),d=+s.slice(6,8);
+    if(m>=1&&m<=12&&d>=1&&d<=31)return new Date(y,m-1,d).getTime();
+    return NaN;
+  }
+  const p=Date.parse(s.replace(' ', 'T'));
+  return isNaN(p)?NaN:p;
+}
+function parseTimeFlex(s){
+  const m=/^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(String(s||'').trim());
+  if(!m)return null;
+  return {h:+m[1],min:+m[2],s:+(m[3]||0)};
+}
+
+// Intelligent multi-format OHLCV ingest. Handles, among others:
+//   date,open,high,low,close,volume                      (headered)
+//   SYMBOL,YYYYMMDD,HH:MM,O,H,L,C,VOLUME,OI              (headerless futures)
+//   datetime,open,high,low,close,volume                  (combined stamp)
+// Extra columns (symbol, expiry, OI, …) are detected and ignored — OHLCV only.
 function parseCSV(text) {
   const lines = text.split(/\r?\n/);
-  let header = null, di=-1, oi=-1, hi=-1, li=-1, ci=-1, vi=-1;
-  const T=[],O=[],H=[],L=[],C=[],V=[];
+  const grid=[];
   for (let i=0;i<lines.length;i++) {
     const ln = lines[i].trim();
-    if (!ln) continue;
-    if (!header) {
-      const h = ln.toLowerCase().split(',').map(s=>s.trim().replace(/["']/g,''));
-      header = h;
-      di=h.findIndex(x=>/date|time|datetime|timestamp/.test(x));
-      oi=h.findIndex(x=>x==='open'); hi=h.findIndex(x=>x==='high');
-      li=h.findIndex(x=>x==='low'); ci=h.findIndex(x=>x==='close');
-      vi=h.findIndex(x=>/vol/.test(x));
-      if (oi<0||hi<0||li<0||ci<0) { // assume positional w/o header
-        header=null; di=0;oi=1;hi=2;li=3;ci=4;vi=5;
-      } else continue;
+    if (ln) grid.push(ln.split(',').map(s=>s.trim().replace(/^["']|["']$/g,'')));
+  }
+  if (!grid.length) return emptyData();
+  // ---- header sniff: >=2 known words and mostly non-numeric ----
+  const first = grid[0];
+  const known = first.filter(c=>/^(symbol|scrip|instrument|ticker|date|datetime|timestamp|time|day|expiry|open|high|low|close|settle|ltp|volume|vol|qty|quantity|oi|openinterest|open_interest|chginoi)$/i.test(c)).length;
+  const numeric = first.filter(c=>c!==''&&isFinite(+c)).length;
+  let header=null, start=0, layout='positional';
+  if (known>=2 && numeric<first.length/2){ header=first.map(s=>s.toLowerCase()); start=1; layout='header'; }
+  const HF=(re)=>header?header.findIndex(x=>re.test(x)):-1;
+  let symI=-1, dtI=-1, dateI=-1, timeI=-1, oI=-1, hI=-1, lI=-1, cI=-1, vI=-1;
+  if (header) {
+    symI=HF(/^(symbol|scrip|instrument|ticker)$/);
+    dtI=HF(/^(datetime|timestamp)$/);
+    dateI=dtI>=0?-1:HF(/^(date|day)$/);
+    timeI=dtI>=0?-1:HF(/^(time)$/);
+    // guard: a lone 'time' column holding full stamps (e.g. '2024-01-01 09:15')
+    oI=HF(/^open$/); hI=HF(/^high$/); lI=HF(/^low$/); cI=HF(/^(close|settle|ltp)$/);
+    vI=HF(/^(volume|vol|qty|quantity|traded)$/);
+    if (oI<0||hI<0||lI<0||cI<0) return emptyData(); // not OHLCV at all
+  } else {
+    // ---- positional inference from the first data rows ----
+    const probe=grid.slice(0,Math.min(50,grid.length));
+    const nCols=Math.max(...probe.map(r=>r.length));
+    const colKind=[];
+    for(let c=0;c<nCols;c++){
+      let str=0,dtm=0,date8=0,tm=0,num=0,tot=0;
+      for(const r of probe){
+        const v=r[c]; if(v==null||v==='')continue; tot++;
+        if(/^\d{1,2}:\d{2}(:\d{2})?$/.test(v)){tm++;continue;}
+        if(/^\d{8}$/.test(v)&&parseDateFlex(v)&&parseDateFlex(v)>0){date8++;continue;}
+        if(/[-/:]/.test(v)&&isFinite(parseDateFlex(v))){dtm++;continue;}
+        if(isFinite(+v)){num++;continue;}
+        str++;
+      }
+      colKind.push(tot?(str/tot>0.5?'STR':dtm/tot>0.5?'DT':date8/tot>0.5?'D8':tm/tot>0.5?'TM':num/tot>0.5?'NUM':'MIX'):'EMPTY');
     }
-    // fast split (no quoted commas expected in OHLCV)
-    const p = ln.split(',');
-    if (p.length < 5) continue;
-    let t;
-    if (di>=0 && isNaN(Date.parse(p[di]))===false && /[-/:]/.test(p[di])) t = Date.parse(p[di].replace(' ', 'T'));
-    else t = +p[di];
-    const o=+p[oi],h2=+p[hi],l2=+p[li],c2=+p[ci],v=+(p[vi]||0);
+    symI=colKind.findIndex(k=>k==='STR');
+    dtI=colKind.findIndex(k=>k==='DT');
+    if(dtI<0){ dateI=colKind.findIndex(k=>k==='D8'); timeI=colKind.findIndex(k=>k==='TM'); }
+    // OHLCV = NUM columns after the stamp columns; volume = next NUM after close
+    const nums=[];
+    for(let c=0;c<nCols;c++)if(colKind[c]==='NUM')nums.push(c);
+    const ordered=nums.filter(c=>c>Math.max(symI,dtI,dateI,timeI,-1));
+    const use=ordered.length>=5?ordered:nums.slice(-5);
+    if(use.length<4)return emptyData();
+    oI=use[0];hI=use[1];lI=use[2];cI=use[3];vI=use.length>4?use[4]:-1;
+  }
+  const T=[],O=[],H=[],L=[],C=[],V=[];
+  const symCount={};
+  for (let i=start;i<grid.length;i++) {
+    const p = grid[i];
+    if (p.length < 4) continue;
+    let t=NaN;
+    if (dtI>=0) t=parseDateFlex(p[dtI]);
+    else if (dateI>=0){
+      const base=parseDateFlex(p[dateI]);
+      if(timeI>=0){const tm=parseTimeFlex(p[timeI]); t=isNaN(base)||!tm?NaN:new Date(new Date(base).getFullYear(),new Date(base).getMonth(),new Date(base).getDate(),tm.h,tm.min,tm.s).getTime();}
+      else t=base;
+    }
+    else if (timeI>=0){
+      // lone time column: only usable if it carries a full stamp (has a date part)
+      t=/[-/]/.test(p[timeI]||'')?parseDateFlex(p[timeI]):NaN;
+    }
+    else t=+p[0]; // last resort: epoch in first column
+    const o=+(p[oI]??NaN),h2=+(p[hI]??NaN),l2=+(p[lI]??NaN),c2=+(p[cI]??NaN),v=+(p[vI]??0);
     if (!isFinite(o)||!isFinite(h2)||!isFinite(l2)||!isFinite(c2)||!isFinite(t)) continue;
+    if(symI>=0&&p[symI]){const s=String(p[symI]).split(/[_.\-\s]+/)[0].toUpperCase().slice(0,20);symCount[s]=(symCount[s]||0)+1;}
     T.push(t);O.push(o);H.push(h2);L.push(l2);C.push(c2);V.push(v||0);
   }
   // sort by time
   const n=T.length, idx=new Array(n);
   for(let i=0;i<n;i++) idx[i]=i;
   idx.sort((a,b)=>T[a]-T[b]);
-  const out={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n)};
+  const out={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n),symbol:null,layout};
   for(let i=0;i<n;i++){const j=idx[i];out.t[i]=T[j];out.o[i]=O[j];out.h[i]=H[j];out.l[i]=L[j];out.c[i]=C[j];out.v[i]=V[j];}
+  let best=null,bn=0;
+  for(const k of Object.keys(symCount))if(symCount[k]>bn){bn=symCount[k];best=k;}
+  if(best)out.symbol=best;
+  out.layout=(header?('header['+header.slice(0,9).join(',')+']'):'positional')
+    +(symI>=0?'+SYM':'')+(dtI>=0?'+DT':(dateI>=0?'+D':'')+(timeI>=0?'+T':''));
   return out;
 }
 

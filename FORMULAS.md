@@ -6,14 +6,24 @@ variable names map 1:1 to the code.
 
 ---
 
-## 1. Data ingestion (`parseCSV`)
+## 1. Data ingestion (`parseCSV`) — format auto-detect
 
-- Expected columns: `date,open,high,low,close,volume` (header names matched
-  case-insensitively; falls back to positional `0..5`).
-- Timestamp: `Date.parse(date.replace(' ', 'T'))` → **browser-local time**.
-  `2015-02-02 09:15:00` is treated as 09:15 in whatever timezone the browser runs in.
-- Rows with any non-finite OHLC/timestamp are dropped; remaining bars are
-  **sorted ascending by time**. No synthetic data exists anywhere in the pipeline.
+The parser sniffs each file and adapts; no fixed template is assumed:
+
+- **Headered files** (`date,open,high,low,close,volume`, also `datetime`,
+  `settle/ltp`, `vol/qty`, `symbol/scrip` variants, any case): columns mapped
+  by name. A lone `time` column holding full stamps is parsed as datetime.
+- **Headerless positional files** (e.g. `SYMBOL,YYYYMMDD,HH:MM,O,H,L,C,VOLUME,OI`
+  futures dumps): column roles inferred from the first 50 rows — leading text
+  column = symbol, `YYYYMMDD` = date, `HH:MM[:SS]` = time, next 4 numerics =
+  O/H/L/C, next numeric = volume. Anything else (expiry, OI, …) is ignored.
+- **Timestamps**: epoch ms/s, ISO, `YYYY-MM-DD HH:MM:SS`, `YYYYMMDD`+`HH:MM`
+  pairs — all normalised to browser-local ms. Bare `HH:MM` without a date is
+  rejected. Unparseable rows are dropped; the rest are **sorted ascending**.
+- **Symbol**: most frequent symbol-column value with `_F1`/`_FUT`-style suffixes
+  stripped (`BANKNIFTY_F1` → `BANKNIFTY`); falls back to the file-name token.
+  The detected layout string (e.g. `positional+SYM+D+T`) is shown under the data
+  panel for confirmation. No synthetic data exists anywhere in the pipeline.
 
 ## 2. Resampling (`resample`, timeframe `tf` minutes)
 

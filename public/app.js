@@ -174,7 +174,7 @@ function setData(d, label){
   $('dataBadge').innerHTML=`<span class="pulse"></span><span>${sym} · ${(state.data.t.length/1000).toFixed(0)}k bars · ${label}</span>`;
   $('dataBadge').className='badge badge-live num';
   const t0=new Date(state.data.t[0]), t1=new Date(state.data.t[state.data.t.length-1]);
-  $('dataInfo').textContent=`${t0.toLocaleDateString()} → ${t1.toLocaleDateString()} · ${(state.data.t.length).toLocaleString()} 1m bars`;
+  $('dataInfo').textContent=`${t0.toLocaleDateString()} → ${t1.toLocaleDateString()} · ${(state.data.t.length).toLocaleString()} 1m bars · fmt: ${state.raw.layout||'auto'}`;
   $('fromDate').value=t0.toISOString().slice(0,10); $('toDate').value=t1.toISOString().slice(0,10);
   estimateCombos();
 }
@@ -192,10 +192,6 @@ $('toDate').addEventListener('change',()=>{if(state.raw){applyDateFilter();$('da
 
 $('fileInput').addEventListener('change', e=>{
   const f=e.target.files[0]; if(!f)return;
-  // symbol from file name: HDFCBANK_minute.csv -> HDFCBANK
-  const base=f.name.replace(/\.[^.]+$/,'');
-  const sym=(base.split(/[_.\-\s]+/)[0]||base).toUpperCase().slice(0,20);
-  if(sym)$('symbol').value=sym;
   const rd=new FileReader();
   $('loadBarWrap').classList.remove('hidden');
   rd.onprogress=ev=>{ if(ev.lengthComputable)$('loadBar').style.width=(ev.loaded/ev.total*100)+'%'; };
@@ -205,6 +201,13 @@ $('fileInput').addEventListener('change', e=>{
       const d=E.parseCSV(rd.result);
       if(!d.t.length)throw new Error('no valid OHLCV rows found');
       clearAlert();
+      // symbol: data column wins (BANKNIFTY_F1 -> BANKNIFTY), else file name
+      if(d.symbol)$('symbol').value=d.symbol;
+      else{
+        const base=f.name.replace(/\.[^.]+$/,'');
+        const sym=(base.split(/[_.\-\s]+/)[0]||base).toUpperCase().slice(0,20);
+        if(sym)$('symbol').value=sym;
+      }
       $('perfBadge').classList.remove('hidden');
       $('perfBadge').textContent=`parsed ${(d.t.length/1000).toFixed(0)}k rows in ${((performance.now()-t0)/1000).toFixed(1)}s`;
       setData(d, f.name+' · real'); $('loadBar').style.width='100%';
