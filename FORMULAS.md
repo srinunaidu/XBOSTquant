@@ -90,7 +90,8 @@ Flat (`0`) during indicator warmup; otherwise:
 - **Costs**: `pnl = ±(exit − entry) · units − costPerTrade` (₹/trade, covers
   brokerage + taxes + slippage proxy). `%P&L` is quoted **pre-cost**.
 - **Ruin guard**: live equity tracked per close; once `equity ≤ 0` no new positions
-  are opened (max drawdown therefore never exceeds −100%).
+  are opened. Max drawdown is therefore bounded at ≈ −100% (the single trade
+  that triggers ruin may overshoot by at most that trade's loss).
 
 ## 6. Performance metrics
 
