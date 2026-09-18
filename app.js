@@ -275,7 +275,7 @@ async function runAsync(grid,opts,objective,topN,onBatch){
     if(cfg.tpPct!=null)eff.tpPct=cfg.tpPct;
     if(cfg.trailPct!=null)eff.trailPct=cfg.trailPct;
     const sig=E.buildSignals(d,cfg), bt=E.backtest(d,sig.pos,eff);
-    res.push({i,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0,trailPct:eff.trailPct||0,m:bt.m});
+    res.push({i,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0,trailPct:eff.trailPct||0,m:bt.metrics});
     if(i%10===0||i===grid.length-1){ onBatch(i+1,grid.length,E.rankResults(res,objective).slice(0,topN),{indicator:cfg.indicator,timeframe:cfg.timeframe,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0}); await new Promise(r=>setTimeout(r,0)); }
   }
   return E.rankResults(res,objective).slice(0,topN);

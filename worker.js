@@ -42,7 +42,7 @@ self.onmessage = function(e) {
       eff.sessionMask = mask;
       const sig = E.buildSignals(d, cfg);
       const bt = E.backtest(d, sig.pos, eff);
-      results.push(mk(bt.m));
+      results.push(mk(bt.metrics));
     } catch(err){
       errCount++;
       results.push(mk({netPnL:0,winRate:0,totalTrades:0,profitFactor:0,maxDD:0,sharpe:-99,sortino:-99,expectancy:0,finalCapital:tradeOpts.capital||100000,tradesPerDay:0,days:0}, String(err)));
