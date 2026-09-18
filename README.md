@@ -34,3 +34,19 @@ docker run -p 8901:8901 -v $(pwd)/HDFCBANK_minute.csv:/app/public/HDFCBANK_minut
 `.github/workflows/ci.yml` runs on push/PR: engine unit tests (`npm test`),
 live auth smoke (login guard → login → terminal → user CRUD), then a Docker
 build check.
+
+## Deploy on Railway (public URL for others)
+
+1. Railway → **New Project → Deploy from GitHub repo** → pick `XBOSTquant`.
+   (`railway.toml` in the repo sets build + start + health check.)
+2. **Variables** tab — add:
+   - `ADMIN_USER=admin`
+   - `ADMIN_PASS=<strong-secret>` (first boot creates this admin)
+   - `SESSION_SECRET=<long-random-string>` (keeps logins alive across restarts)
+3. **Volumes** (keeps accounts after redeploys — without this `users.db`
+   resets): add volume, mount path `/app/data`, plus variable
+   `DB_PATH=/app/data/users.db`.
+4. **Settings → Networking → Generate Domain** → share that URL.
+   Your friend opens it, you create their account in 👥 Users, done.
+5. Data: the 51MB CSV is not in git — upload it in the sidebar each session
+   (parsed in-browser), or place it at `public/HDFCBANK_minute.csv`.
