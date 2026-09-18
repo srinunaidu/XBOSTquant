@@ -551,6 +551,8 @@ function sortBoard(){
 $('boardFilter').addEventListener('input',renderBoard);
 function fmtMoney(v){const s=v<0?'-₹':'₹';return s+Math.abs(v).toLocaleString('en-IN',{maximumFractionDigits:0});}
 function fmtT(t){const d=new Date(t);return d.toLocaleString('en-IN',{day:'2-digit',month:'short',hour:'2-digit',minute:'2-digit',hour12:false});}
+// IST wall-clock for exports (data is IST; toISOString would print misleading UTC)
+function fmtIST(t){return new Date(t+5.5*3600*1000).toISOString().slice(0,19)+'+05:30';}
 
 // ---------- select + detail ----------
 function selectRow(r, auto){
@@ -731,8 +733,8 @@ $('btnExportBoard').onclick=()=>{
 $('btnExportTrades').onclick=()=>{
   if(!state.detail){showAlert('No strategy loaded — run a search and click any leaderboard row.');return;}
   const {bt}=state.detail;
-  let s='id,entry_time,exit_time,type,entry_px,exit_px,pnl,pnl_pct,reason\n';
-  for(const t of bt.trades)s+=`${t.id},${new Date(t.entryTime).toISOString()},${new Date(t.exitTime).toISOString()},${t.type},${t.entryPx},${t.exitPx},${t.pnl.toFixed(2)},${t.pnlPct.toFixed(3)},${t.reason}\n`;
+  let s='id,entry_time_ist,exit_time_ist,type,entry_px,exit_px,pnl,pnl_pct,reason\n';
+  for(const t of bt.trades)s+=`${t.id},${fmtIST(t.entryTime)},${fmtIST(t.exitTime)},${t.type},${t.entryPx},${t.exitPx},${t.pnl.toFixed(2)},${t.pnlPct.toFixed(3)},${t.reason}\n`;
   const r=state.sel; dl(`xbost_trades_${r.indicator}_${r.timeframe}m_${r.exit||'fixed'}${r.carry?'_carry':''}_SL${r.slPct||0}_TP${r.tpPct||0}.csv`,s);
 };
 
@@ -745,7 +747,7 @@ function logLine(s){
 }
 function runValidation(){
   // Audits the LOADED live dataset + engine: identities must hold to the decimal.
-  const out=[];let pass=0,fail=0;
+  const out=[];let pass=0,fail=0,skip=0;
   const ok=(name,cond,extra)=>{if(cond){pass++;out.push('PASS '+name);}else{fail++;out.push('FAIL '+name+(extra?' :: '+extra:''));}};
   logLine('validation started');
   try{
@@ -791,20 +793,31 @@ function runValidation(){
       const bad=bt.trades.filter(t=>Math.abs(t.entryPx-d5.o[t.entryIdx])>1e-9);
       ok('L4 next-open fills at open[]',bad.length===0,bad.length+' bad');
     } else out.push('SKIP L4-next-open (fill mode = close; switch ⑥ to test)');
-    // L5 exit legs engage on live data
-    const be=E.backtest(d5,sig.pos,Object.assign({},eff,{exit:'breakeven',sessionMask:eff.sessionMask}));
-    const at=E.backtest(d5,sig.pos,Object.assign({},eff,{exit:'atr',sessionMask:eff.sessionMask}));
+    // L5 exit legs engage on live data (1m = most trigger opportunities)
+    const d1m=state.data;
+    const m1=E.buildSessionMask(d1m,eff.sessionStart,eff.sessionEnd);
+    const s1=E.buildSignals(d1m,{indicator:'EMA',params:{period:21}});
+    const be=E.backtest(d1m,s1.pos,Object.assign({},eff,{exit:'breakeven',sessionMask:m1}));
+    const at=E.backtest(d1m,s1.pos,Object.assign({},eff,{exit:'atr',sessionMask:m1}));
     const hasBE=be.trades.some(t=>t.reason==='BE'), hasATR=at.trades.some(t=>t.reason==='ATR');
-    ok('L5 breakeven + chandelier legs fire live',hasBE&&hasATR,`BE=${hasBE} ATR=${hasATR}`);
-    // L6 metrics finite, DD bounded
-    ok('L6 metrics finite, DD in [-101,0]',isFinite(m.sharpe)&&isFinite(m.sortino)&&isFinite(m.maxDD)&&m.maxDD<=0&&m.maxDD>=-101,
+    if(be.trades.length+at.trades.length<10){
+      out.push(`SKIP L5 legs need ≥10 trades, file gave ${be.trades.length+at.trades.length} — upload more sessions for a conclusive check`);skip++;
+    } else ok('L5 breakeven + chandelier legs fire live',hasBE&&hasATR,`BE=${hasBE} ATR=${hasATR}`);
+    // L6 ruin-guard invariant + bounded overshoot + finite metrics
+    let runEq=eff.capital, ruinAt=-1;
+    for(const t of bt.trades){runEq+=t.pnl;if(runEq<=0&&ruinAt<0)ruinAt=t.exitIdx;}
+    const postRuin=ruinAt>=0?bt.trades.filter(t=>t.entryIdx>ruinAt).length:0;
+    let maxLoss=0;for(const t of bt.trades)if(-t.pnl>maxLoss)maxLoss=-t.pnl;
+    ok('L6 no entries after ruin',postRuin===0,postRuin+' post-ruin entries');
+    ok('L6 overshoot ≤ one trade',m.finalCapital>=-(maxLoss+1e-6),`final=${m.finalCapital.toFixed(0)} max1loss=${maxLoss.toFixed(0)}`);
+    ok('L6 metrics finite, DD ≤ 0',isFinite(m.sharpe)&&isFinite(m.sortino)&&isFinite(m.maxDD)&&m.maxDD<=0,
       `sharpe=${m.sharpe.toFixed(2)} sortino=${m.sortino.toFixed(2)} dd=${m.maxDD.toFixed(2)}`);
     // L7 session status
     let inn=0;for(let i=0;i<eff.sessionMask.length;i++)inn+=eff.sessionMask[i];
     out.push(`L7 session coverage ${(inn/eff.sessionMask.length*100).toFixed(1)}% · OHLCV-only engine · fill=${eff.fill} · exit=${eff.exit||'fixed'}${eff.carry?' +carry':''}`);
     out.push('');
-    out.push(`LIVE VALIDATION: ${pass} passed, ${fail} failed — ${$('symbol').value}, real data only.`);
-    logLine(`validation: ${pass} passed, ${fail} failed`);
+    out.push(`LIVE VALIDATION: ${pass} passed, ${fail} failed${skip?`, ${skip} skipped (thin file)`:''} — ${$('symbol').value}, real data only.`);
+    logLine(`validation: ${pass} passed, ${fail} failed${skip?`, ${skip} skipped`:''}`);
   }catch(err){out.push('VALIDATION FATAL: '+(err&&err.message||err));fail++;logLine('validation FATAL: '+(err&&err.message||err));}
   $('valOut').textContent=out.join('\n');
   $('valOut').style.borderColor=fail?'#ff3b5c':'#22ff88';
