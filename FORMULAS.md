@@ -99,6 +99,12 @@ Flat (`0`) during indicator warmup; otherwise:
   its fill point: indicators read bars `≤ i`, signals on `[i]` fill at `close[i]`
   or `open[i+1]`.
   Size = `qty × lotSize` shares. Direction filter: Long / Short / Both.
+- **Entry gating** (`entry`):
+  - `trigger` (default): a position opens ONLY on a fresh signal edge
+    (target `0/∓1 → ±1`, or first computable bar) and never on an exit bar —
+    after any exit the engine stands aside until the next new trigger. No
+    flip-chains: an opposite signal closes to flat and is not re-entered.
+  - `always`: classic always-in-the-market; flips re-enter immediately.
 - **Warmup quarantine**: indicator outputs are `NaN` until warmed; signal targets
   stay `0` there, so no position can open on uncomputed values (asserted in T2b).
 - **Session filter** (`buildSessionMask`, cached once per timeframe): bars outside
@@ -134,7 +140,11 @@ Flat (`0`) during indicator warmup; otherwise:
 - `Net P&L = finalCapital − capital`; `WinRate = 100·wins/trades`;
   `ProfitFactor = grossProfit/grossLoss` (`99.99` if no losers but profit, `0` if flat);
   `Expectancy = net/trades`.
-- `MaxDD %`: deepest trough of the account curve vs running peak (ruin-guarded).
+- `MaxDD %`: deepest trough of the **mark-to-market** equity curve
+  (open-position heat included every bar) vs running peak (ruin-guarded).
+  Attributed with peak→trough timestamps; trade-log rows exiting inside that
+  window carry a red edge so the drawdown's makers are visible — a cumulative
+  slide needs no single culprit trade.
 - `Sharpe / Sortino`: computed on **daily strategy returns**
   `r_d = ΣdayPnl / startingCapital` (all bar-days included, no-trade days = 0).
   Two deliberate choices: (1) the denominator is constant initial capital, never

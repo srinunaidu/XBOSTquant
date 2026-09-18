@@ -58,6 +58,33 @@ test('gap through stop fills at the stop price', () => {
   assert.ok(Math.abs(sl.exitPx - 99) < 1e-9);
 });
 
+test('trigger entries fire only on fresh edges, no flip chains', () => {
+  const d = bars(120, i => { const c = 100 + 8 * Math.sin(i / 6) + i * 0.05; return [c, c + 0.2, c - 0.2, c, 1000]; });
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 9 } });
+  const base = { direction: 'Both', slPct: 5, tpPct: 20, capital: 100000, qty: 10, lotSize: 1, cost: 0 };
+  const mask = E.buildSessionMask(d, null, null);
+  const ba = E.backtest(d, sig.pos, Object.assign({ sessionMask: mask }, base));
+  const bt = E.backtest(d, sig.pos, Object.assign({ sessionMask: mask, entry: 'trigger' }, base));
+  assert.ok(bt.trades.length > 0 && bt.trades.length <= ba.trades.length);
+  for (const t of bt.trades) {
+    assert.ok(sig.pos[t.entryIdx] !== sig.pos[t.entryIdx - 1], 'entry must be a fresh edge');
+  }
+  for (let k = 1; k < bt.trades.length; k++) {
+    const chained = bt.trades[k].entryIdx === bt.trades[k - 1].exitIdx;
+    if (chained) assert.ok(sig.pos[bt.trades[k].entryIdx] !== sig.pos[bt.trades[k].entryIdx - 1], 'no same-signal re-entry');
+  }
+});
+
+test('MTM equity + DD attribution are consistent', () => {
+  const d = bars(120, i => { const c = 100 + 8 * Math.sin(i / 6) - i * 0.02; return [c, c + 0.2, c - 0.2, c, 1000]; });
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 9 } });
+  const bt = E.backtest(d, sig.pos, { direction: 'Both', sessionMask: E.buildSessionMask(d, null, null), slPct: 5, tpPct: 20, capital: 100000, qty: 10, lotSize: 1, cost: 0 });
+  const m = bt.metrics;
+  assert.equal(bt.equity.length, d.t.length);
+  assert.ok(isFinite(m.ddPeakTime) && isFinite(m.ddTroughTime) && m.ddPeakTime <= m.ddTroughTime);
+  assert.ok(m.maxDD <= 0);
+});
+
 test('grid + rank + refine helpers behave', () => {
   const grid = E.buildGrid(
     [{ indicator: 'EMA', ranges: { period: { min: 9, max: 15, step: 6 } }, timeframes: [5] }],

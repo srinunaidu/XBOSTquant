@@ -53,6 +53,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
   tbody tr{cursor:pointer;transition:background .12s}
   tbody tr:hover{background:#17171f}
   tbody tr.sel{background:rgba(52,211,153,.10);box-shadow:inset 2px 0 0 var(--grn)}
+  tbody tr.in-dd td:first-child{box-shadow:inset 2px 0 0 var(--red)}
   .pos{color:var(--grn2)}.neg{color:var(--red)}
   .btn{background:linear-gradient(135deg,#34d399,#22ff88);color:#03251a;font-weight:800;border-radius:10px;padding:9px 16px;font-size:13px;letter-spacing:.01em;
     transition:.15s;box-shadow:0 6px 20px -8px rgba(52,211,153,.55), 0 1px 0 rgba(255,255,255,.25) inset;border:1px solid rgba(255,255,255,.12)}
@@ -213,6 +214,11 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
       <label class="flex items-center gap-1"><input type="radio" name="dir" value="Short"/> Short</label>
       <label class="flex items-center gap-1"><input type="radio" name="dir" value="Both" checked/> Both</label>
     </div>
+    <label class="lbl">Entries</label>
+    <select id="entryMode" class="w-full mt-1 mb-1">
+      <option value="trigger">Signal trigger only (no auto re-entry)</option>
+      <option value="always">Always in market (flip re-entry)</option>
+    </select>
     <div class="grid grid-cols-2 gap-2">
       <div><label class="lbl">Session start</label><input id="sessStart" type="time" value="09:15" class="w-full mt-1 num"/></div>
       <div><label class="lbl">Session end</label><input id="sessEnd" type="time" value="15:15" class="w-full mt-1 num"/></div>
@@ -355,7 +361,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
   <!-- TRADES -->
   <section class="card p-3">
     <div class="flex items-center gap-2 mb-2">
-      <div class="font-disp font-semibold text-[14px] tracking-tight">🧾 Trade Analytics & Log <span id="tradeCount" class="text-zinc-500 font-normal text-xs num"></span></div>
+      <div class="font-disp font-semibold text-[14px] tracking-tight">🧾 Trade Analytics & Log <span id="tradeCount" class="text-zinc-500 font-normal text-xs num"></span> <span class="text-zinc-600 font-normal text-[10px]">· red edge = exited inside max-DD window</span></div>
       <div class="ml-auto text-[11px] text-zinc-500 num" id="tradeSummary"></div>
     </div>
     <div class="overflow-auto max-h-[420px] border border-zinc-800 rounded-lg">

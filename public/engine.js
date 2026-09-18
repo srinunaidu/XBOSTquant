@@ -639,6 +639,7 @@ function backtest(d, sigPos, opts){
   }
   let curQty=0;
   let liveEq=capital0, ruined=false; // ruin guard: account blown -> no new entries
+  const eqMtm=new Float64Array(n).fill(capital0); // mark-to-market equity incl. open heat
   // dynamic exit plumbing
   const exitMode=opts.exit||'fixed'; // fixed | breakeven | atr
   const beTrig=((opts.beTrigger!=null?opts.beTrigger:((opts.slPct||0)))/100); // profit to lock breakeven (default 1R)
@@ -653,6 +654,11 @@ function backtest(d, sigPos, opts){
   // stop orders (SL/TP/trailing) always fill intrabar at their stop levels.
   const fillNext=(opts.fill==='next');
   let pendTgt=null; // signal decision from bar i-1, executed at open[i]
+  // Entry gating: 'always' = classic always-in-the-market (flip re-entry);
+  // 'trigger' = enter ONLY on a fresh signal edge, and never on an exit bar —
+  // after any exit the engine stands aside until the next new trigger.
+  const trigOnly=(opts.entry==='trigger');
+  let prevAct=99, lastExitBar=-1;
   for(let i=1;i<n;i++){
     const px=d.c[i], ox=d.o[i];
     const decTgt=desiredTarget(i);
@@ -660,6 +666,8 @@ function backtest(d, sigPos, opts){
     pendTgt=decTgt;
     const noSig=fillNext&&actTgt===null;
     const fillPx=fillNext?ox:px;
+    const edge=!noSig&&actTgt!==0&&actTgt!==prevAct;
+    prevAct=actTgt;
     // manage open position: SL / target / trailing / signal flip / session exit
     if(position!==0){
       const ret=position===1?(px-entryPx)/entryPx:(entryPx-px)/entryPx;
@@ -709,37 +717,43 @@ function backtest(d, sigPos, opts){
         liveEq+=pnl;
         if(liveEq<=0)ruined=true; // blown up: manage nothing more, open nothing new
         // immediate re-entry on flip (mask already enforced via tgt)
-        if(flip&&(!useMask||useMask[i])&&!ruined){
+        if(!trigOnly&&flip&&(!useMask||useMask[i])&&!ruined){
           position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;
           hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
         }
+        lastExitBar=i;
+        eqMtm[i]=liveEq+(position!==0?(position===1?(px-entryPx):(entryPx-px))*curQty:0);
         continue;
       }
     } else {
-      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&!ruined){
+      const allowEntry=!trigOnly||(edge&&i>lastExitBar);
+      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&!ruined&&allowEntry){
         position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;
         hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
       }
     }
+    if(position!==0)eqMtm[i]=liveEq+(position===1?(px-entryPx):(entryPx-px))*curQty;
+    else eqMtm[i]=liveEq;
   }
-  // equity
-  const eq=new Float64Array(n).fill(capital0);
-  let run=capital0;
-  let ti=0;
-  // map trades to exit index for equity steps
-  const byExit={};
-  for(const t of trades){(byExit[t.exitIdx]=byExit[t.exitIdx]||[]).push(t);}
-  for(let i=0;i<n;i++){if(byExit[i])for(const t of byExit[i])run+=t.pnl;eq[i]=run;}
+  // equity = mark-to-market curve (built in-loop, includes open-position heat)
+  const eq=eqMtm;
+  let run=liveEq;
   // metrics
   let wins=0,grossP=0,grossL=0;
   for(const t of trades){if(t.pnl>0){wins++;grossP+=t.pnl;}else grossL+=-t.pnl;}
   const wr=trades.length?wins/trades.length*100:0;
   const pf=grossL>0?grossP/grossL:(grossP>0?99.99:0);
   const net=run-capital0;
-  // max drawdown on the account curve (ruin guard keeps this >= -100%)
-  let peakE=capital0,maxDD=0;
+  // max drawdown on MTM equity + peak/trough attribution (which trades made it)
+  let peakE=capital0,maxDD=0,peakIdx=0,troughIdx=0;
   const dd=new Float64Array(n);
-  for(let i=0;i<n;i++){if(eq[i]>peakE)peakE=eq[i];const ddi=peakE>0?(eq[i]-peakE)/peakE*100:0;dd[i]=ddi;if(ddi<maxDD)maxDD=ddi;}
+  for(let i=0;i<n;i++){
+    if(eq[i]>peakE){peakE=eq[i];}
+    const ddi=peakE>0?(eq[i]-peakE)/peakE*100:0;dd[i]=ddi;
+    if(ddi<maxDD){maxDD=ddi;troughIdx=i;}
+  }
+  peakIdx=0;
+  for(let i=0;i<=troughIdx;i++)if(eq[i]>=eq[peakIdx])peakIdx=i;
   // Sharpe/Sortino on DAILY strategy returns: dayPnl / starting capital.
   // Two deliberate choices: (1) denominator is constant initial capital, never
   // live equity — once equity goes negative, equity-based returns invert sign
@@ -760,7 +774,7 @@ function backtest(d, sigPos, opts){
   const ddn=dret.filter(x=>x<0);const dsdn=sd(ddn,mean(ddn));
   const sortino=dsdn>0?dm/dsdn*Math.sqrt(252):(dm>0?99.99:0);
   const expectancy=trades.length?net/trades.length:0;
-  return {trades,equity:eq,dd,metrics:{netPnL:net,winRate:wr,totalTrades:trades.length,profitFactor:pf,maxDD:maxDD,sharpe,sortino,expectancy,finalCapital:run,grossProfit:grossP,grossLoss:grossL,tradesPerDay,days}};
+  return {trades,equity:eq,dd,metrics:{netPnL:net,winRate:wr,totalTrades:trades.length,profitFactor:pf,maxDD:maxDD,sharpe,sortino,expectancy,finalCapital:run,grossProfit:grossP,grossLoss:grossL,tradesPerDay,days,ddPeakTime:d.t[peakIdx],ddTroughTime:d.t[troughIdx]}};
 }
 
 function expandRange(min,max,step){

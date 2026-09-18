@@ -248,7 +248,7 @@ function tradeOpts(){
     cost:+$('costPer').value||0,
     beTrigger:+$('beTrigger').value||0, beLock:+$('beLock').value||0,
     atrTrailPeriod:+$('atrP').value||14, atrTrailMult:+$('atrM').value||3,
-    fill:$('fillMode').value||'close'
+    fill:$('fillMode').value||'close', entry:$('entryMode').value||'trigger'
   };
 }
 function getExitDims(){
@@ -679,7 +679,7 @@ function renderSubCharts(){
   const stride=Math.max(1,Math.floor(d.t.length/2000));
   const el=[],eql=[],ddl=[];
   for(let i=0;i<d.t.length;i+=stride){el.push(new Date(d.t[i]).toLocaleDateString('en-IN',{day:'2-digit',month:'short'}));eql.push(+bt.equity[i].toFixed(0));ddl.push(+bt.dd[i].toFixed(2));}
-  $('eqTitle').textContent=`· final ${fmtMoney(bt.metrics.finalCapital)}`;
+  $('eqTitle').textContent=`· final ${fmtMoney(bt.metrics.finalCapital)}${bt.metrics.maxDD<0?` · DD ${bt.metrics.maxDD.toFixed(2)}% ${fmtT(bt.metrics.ddPeakTime)} → ${fmtT(bt.metrics.ddTroughTime)}`:''}`;
   mkChart('eqChart',{type:'line',data:{labels:el,datasets:[{label:'Equity ₹',data:eql,borderColor:'#22ff88',backgroundColor:'rgba(34,255,136,.08)',fill:true,borderWidth:1.5,pointRadius:0,tension:0.15}]},
     options:{responsive:true,plugins:{legend:{display:false}},scales:{x:{display:false},y:{grid:{color:gridColor},ticks:{color:tickColor,font:{size:10}}}}}});
   mkChart('ddChart',{type:'line',data:{labels:el,datasets:[{label:'DD %',data:ddl,borderColor:'#ff3b5c',backgroundColor:'rgba(255,59,92,.10)',fill:true,borderWidth:1.2,pointRadius:0,tension:0.15}]},
@@ -696,9 +696,11 @@ function renderTrades(){
   let run=(+$('capital').value||100000);
   const frag=document.createDocumentFragment();
   const show=bt.trades.slice(-500).reverse();
+  const inDD=t=>(m.maxDD<0&&t.exitTime>=m.ddPeakTime&&t.exitTime<=m.ddTroughTime);
   for(const t of show){
     run+=0; // running capital shown as final-relative; compute prefix
     const tr=document.createElement('tr');
+    if(inDD(t))tr.classList.add('in-dd');
     const cells=[t.id,fmtT(t.entryTime),fmtT(t.exitTime),t.type,t.entryPx.toFixed(2),t.exitPx.toFixed(2),
       (t.pnl>=0?'+':'')+t.pnl.toFixed(0),t.pnlPct.toFixed(2)+'%',t.reason,''];
     cells.forEach((v,ci)=>{
