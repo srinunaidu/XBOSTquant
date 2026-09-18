@@ -49,6 +49,11 @@ variable names map 1:1 to the code.
 | 18 | Fisher(p) ★ | Median price `hl2`; `v = clamp(2·((hl2−ll)/(hh−ll) − 0.5), ±0.999)` over trailing `p`; `F = 0.5·ln((1+v)/(1−v)) + 0.5·F_prev` |
 | 19 | TTM Squeeze ★ | Squeeze ON when `BB(lo,up)` strictly inside `KC(lo,up)`; momentum = `close − SMA(hl2, kcP)`; FIRE on release bar |
 | 20 | Connors RSI ★ | `CRSI = (RSI(rsiP) + RSI(up/down-streak, streakP) + PercentRank(ROC, rankP)) / 3`, PercentRank = % of last `rankP` ROCs below today's ROC × 100 |
+| 21 | VWAP Bands ★ | Session VWAP ± `sd1·σ` / ± `sd2·σ`, `σ` = expanding session std of typical price |
+| 22 | CVD ★ | Tick-rule delta `±volume` (sign of `close−open`), cumulated, **reset each session**; divergence vs trailing swing low/high over `lookback` |
+| 23 | FVG ★ | Bull gap when `low[i] > high[i−2]`, zone `[high[i−2], low[i]]`; zones die on full mitigation or after `mitAge` bars (max `maxZones` live) |
+| 24 | OI build-up ★ | `roc = 1-bar % move`, `oiUp = OI > SMA(OI, oiLen)`; long build-up (`roc>+min`, OI up), short build-up, unwinding (OI down) → flat. **No OI column ⇒ leg stays flat, never trades** |
+| 25 | Regime gate ★ | Choppiness `100·log10(meanTR/range)/log10(p)`; trend EMA followed only when chop < `gate`, else flat (suppresses trend loops in ranges) |
 
 ★ = proprietary-style (rare in retail screeners).
 
@@ -71,11 +76,23 @@ Flat (`0`) during indicator warmup; otherwise:
 | POC | close > POC | close < POC | — |
 | Fisher | F > 0 | F < 0 | — |
 | Squeeze | squeeze releases with mom > 0 | squeeze releases with mom < 0 | hold last release direction |
+| VWAPBands | close < −sd1 band | close > +sd1 band | hold previous |
+| CVD | price undercuts trailing low while CVD holds higher (bullish divergence) | price exceeds trailing high while CVD holds lower | hold previous |
+| FVG | low taps a live bull zone | high taps a live bear zone | flat (no touch) |
+| OI | long build-up (price↑ + OI↑) | short build-up (price↓ + OI↑) | flat on unwinding, else hold |
+| Regime | chop < gate AND close > EMA | chop < gate AND close < EMA | flat when chop ≥ gate |
 
 ## 5. Trade execution (`backtest`)
 
-- **Entry**: market order at the **close of the signal bar** (no lookahead).
+- **Entry**: market order at the **close of the signal bar** (`fill=close`, default,
+  causal) or at the **next bar's open** (`fill=next`, stricter) — selectable in
+  ⑥ Fill model. Resting stops always fill intrabar at stop levels; the final bar
+  always closes at its close (no next open exists). No bar ever uses data past
+  its fill point: indicators read bars `≤ i`, signals on `[i]` fill at `close[i]`
+  or `open[i+1]`.
   Size = `qty × lotSize` shares. Direction filter: Long / Short / Both.
+- **Warmup quarantine**: indicator outputs are `NaN` until warmed; signal targets
+  stay `0` there, so no position can open on uncomputed values (asserted in T2b).
 - **Session filter** (`buildSessionMask`, cached once per timeframe): bars outside
   `[sessionStart, sessionEnd]` force target `0` → positions are closed and none opened
   (intraday, no overnight).
@@ -142,3 +159,18 @@ Flat (`0`) during indicator warmup; otherwise:
 4. Corporate actions/splits are not adjusted — use split-adjusted data.
 5. Timestamps are browser-local; session filter compares local clock HH:MM.
 6. Backtests are historical simulations, not investment advice.
+7. OI leg requires an OI-like column (`oi`, `open interest`, `chg oi`); files
+   without one keep that leg flat. Volume is summed on resample; OI takes the
+   last value per bucket (it is a stock, not a flow).
+
+## 9. Built-in validation (🛠 Developer panel → Debug & Validate)
+
+Synthetic in-memory datasets, never touching real analysis. Each run asserts:
+- **T1 flat market**: no SL/TP/TRAIL/BE/ATR fill may occur; `net == −n·cost`.
+- **T2 linear slope**: EMA ride is exactly 1 LONG; P&L recomputed independently
+  to the decimal; **T2b**: zero entries inside the warmup bars.
+- **T3 50% gap-down through a 1% stop**: fill prints at the stop (99.00), P&L
+  exact (long 10 @100 → −30 incl. cost).
+- **T4 next-open**: every entry prints at `open[entryIdx]`, none on bar 0.
+- **T5 ruin + empty book**: Sharpe/Sortino/MaxDD stay finite; zero trades give
+  WR 0 / PF 0 with finite metrics.

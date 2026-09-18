@@ -173,6 +173,24 @@ tailwind.config = { darkMode:'class', theme:{ extend:{ colors:{ neon:'#22ff88', 
     </div>
     <div id="indList" class="space-y-2"></div>
   </section>
+
+  <!-- EXECUTION MODEL + DEV VALIDATION -->
+  <section class="card p-3">
+    <div class="lbl mb-2">⑥ Fill model (anti-lookahead)</div>
+    <label class="lbl">Signal fill timing</label>
+    <select id="fillMode" class="w-full mt-1">
+      <option value="close">Signal-bar CLOSE (causal, standard)</option>
+      <option value="next">NEXT bar OPEN (stricter, no touch)</option>
+    </select>
+    <div class="text-[10px] text-zinc-500 mt-1">Stops fill intrabar at stop levels in both modes. See FORMULAS.md §5.</div>
+  </section>
+
+  <section class="card p-3 border-amber-900">
+    <div class="lbl mb-2">🛠 Developer panel — validation only</div>
+    <button id="btnValidate" class="btn !text-xs w-full">🔬 Debug &amp; Validate engine</button>
+    <div class="text-[10px] text-zinc-500 mt-1">Runs synthetic stress datasets (flat / slope / gap) in-memory only — never touches real analysis.</div>
+    <pre id="valOut" class="text-[10px] num text-zinc-300 bg-zinc-950 border border-zinc-800 rounded-md p-2 mt-2 whitespace-pre-wrap max-h-64 overflow-auto">Not run yet.</pre>
+  </section>
 </aside>
 
 <!-- ══ MAIN ══ -->

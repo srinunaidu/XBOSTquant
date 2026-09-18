@@ -4,8 +4,8 @@
 
 function parseCSV(text) {
   const lines = text.split(/\r?\n/);
-  let header = null, di=-1, oi=-1, hi=-1, li=-1, ci=-1, vi=-1;
-  const T=[],O=[],H=[],L=[],C=[],V=[];
+  let header = null, di=-1, oi=-1, hi=-1, li=-1, ci=-1, vi=-1, oii=-1;
+  const T=[],O=[],H=[],L=[],C=[],V=[],OI=[];
   for (let i=0;i<lines.length;i++) {
     const ln = lines[i].trim();
     if (!ln) continue;
@@ -16,8 +16,9 @@ function parseCSV(text) {
       oi=h.findIndex(x=>x==='open'); hi=h.findIndex(x=>x==='high');
       li=h.findIndex(x=>x==='low'); ci=h.findIndex(x=>x==='close');
       vi=h.findIndex(x=>/vol/.test(x));
+      oii=h.findIndex(x=>/open.?interest|^oi$|chg.?oi|oi.?chg|coi/.test(x));
       if (oi<0||hi<0||li<0||ci<0) { // assume positional w/o header
-        header=null; di=0;oi=1;hi=2;li=3;ci=4;vi=5;
+        header=null; di=0;oi=1;hi=2;li=3;ci=4;vi=5;oii=-1;
       } else continue;
     }
     // fast split (no quoted commas expected in OHLCV)
@@ -29,13 +30,18 @@ function parseCSV(text) {
     const o=+p[oi],h2=+p[hi],l2=+p[li],c2=+p[ci],v=+(p[vi]||0);
     if (!isFinite(o)||!isFinite(h2)||!isFinite(l2)||!isFinite(c2)||!isFinite(t)) continue;
     T.push(t);O.push(o);H.push(h2);L.push(l2);C.push(c2);V.push(v||0);
+    OI.push(oii>=0?+p[oii]||0:NaN);
   }
   // sort by time
   const n=T.length, idx=new Array(n);
   for(let i=0;i<n;i++) idx[i]=i;
   idx.sort((a,b)=>T[a]-T[b]);
-  const out={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n)};
+  const out={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n),oi:null,hasOI:false};
   for(let i=0;i<n;i++){const j=idx[i];out.t[i]=T[j];out.o[i]=O[j];out.h[i]=H[j];out.l[i]=L[j];out.c[i]=C[j];out.v[i]=V[j];}
+  // OI column present and non-trivial? (all-NaN/zeros => treat as absent)
+  let oiSum=0, oiN=0;
+  for(let i=0;i<n;i++){const j=idx[i];if(isFinite(OI[j])&&OI[j]!==0){oiSum+=Math.abs(OI[j]);oiN++;}}
+  if(oiN>n*0.5){out.oi=new Float64Array(n);for(let i=0;i<n;i++)out.oi[i]=OI[idx[i]]||0;out.hasOI=true;}
   return out;
 }
 
@@ -44,22 +50,26 @@ function resample(d, tfMin) {
   if (tfMin===1) return d;
   const n=d.t.length, ms=tfMin*60000;
   // align buckets to 09:15 IST session grid: bucket = floor((t - sessionStart)/ms)? simpler: floor(t/ms)
-  const T=[],O=[],H=[],L=[],C=[],V=[];
-  let bt=-1,bo=0,bh=-Infinity,bl=Infinity,bc=0,bv=0;
+  const T=[],O=[],H=[],L=[],C=[],V=[],OI=[];
+  const hasOI=!!(d.oi&&d.hasOI);
+  let bt=-1,bo=0,bh=-Infinity,bl=Infinity,bc=0,bv=0,boi=0;
   for(let i=0;i<n;i++){
     const b=Math.floor(d.t[i]/ms);
     if(b!==bt){
-      if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);}
-      bt=b;bo=d.o[i];bh=d.h[i];bl=d.l[i];bc=d.c[i];bv=d.v[i];
+      if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);if(hasOI)OI.push(boi);}
+      bt=b;bo=d.o[i];bh=d.h[i];bl=d.l[i];bc=d.c[i];bv=d.v[i];boi=hasOI?d.oi[i]:0;
     } else {
       if(d.h[i]>bh)bh=d.h[i];
       if(d.l[i]<bl)bl=d.l[i];
       bc=d.c[i];bv+=d.v[i];
+      if(hasOI)boi=d.oi[i]; // OI is a stock: last value wins
     }
   }
-  if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);}
+  if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);if(hasOI)OI.push(boi);}
   const m=T.length;
-  return {t:Float64Array.from(T),o:Float64Array.from(O),h:Float64Array.from(H),l:Float64Array.from(L),c:Float64Array.from(C),v:Float64Array.from(V)};
+  const out={t:Float64Array.from(T),o:Float64Array.from(O),h:Float64Array.from(H),l:Float64Array.from(L),c:Float64Array.from(C),v:Float64Array.from(V),oi:null,hasOI:false};
+  if(hasOI){out.oi=Float64Array.from(OI);out.hasOI=true;}
+  return out;
 }
 
 // ---------- indicators (Float64Array in/out, NaN for warmup) ----------
@@ -333,6 +343,83 @@ function connorsRSI(c, rsiP, streakP, rankP){
   return out;
 }
 
+// ---------- institutional order flow & smart money ----------
+function vwapBands(d, sd1, sd2){
+  // Session VWAP ± sd1·σ / ± sd2·σ, σ = expanding session std of typical price
+  const n=d.c.length, vwap=new Float64Array(n).fill(NaN);
+  const up1=new Float64Array(n).fill(NaN), lo1=new Float64Array(n).fill(NaN);
+  const up2=new Float64Array(n).fill(NaN), lo2=new Float64Array(n).fill(NaN);
+  let pv=0,vv=0,day='',sn=0,sm=0,sm2=0;
+  const fmt=t=>new Date(t).toDateString();
+  for(let i=0;i<n;i++){
+    const dd=fmt(d.t[i]);
+    if(dd!==day){day=dd;pv=0;vv=0;sn=0;sm=0;sm2=0;}
+    const tp=(d.h[i]+d.l[i]+d.c[i])/3;
+    pv+=tp*d.v[i];vv+=d.v[i];
+    sn++;sm+=tp;sm2+=tp*tp;
+    if(vv<=0)continue;
+    const vw=pv/vv, va=Math.max(0,sm2/sn-(sm/sn)*(sm/sn)), sd=Math.sqrt(va);
+    vwap[i]=vw;up1[i]=vw+sd1*sd;lo1[i]=vw-sd1*sd;up2[i]=vw+sd2*sd;lo2[i]=vw-sd2*sd;
+  }
+  return {vwap,up1,lo1,up2,lo2};
+}
+function cvdSeries(d){
+  // Cumulative Volume Delta (tick-rule proxy), reset each session
+  const n=d.c.length,out=new Float64Array(n).fill(NaN);
+  let cum=0,day='';
+  const fmt=t=>new Date(t).toDateString();
+  for(let i=0;i<n;i++){
+    const dd=fmt(d.t[i]);
+    if(dd!==day){day=dd;cum=0;}
+    cum+=(d.c[i]>=d.o[i]?1:-1)*(d.v[i]||0);
+    out[i]=cum;
+  }
+  return out;
+}
+function fvgZones(d, maxZones, mitAge){
+  // Fair Value Gaps: bull gap when low[i] > high[i-2]; zone=[high[i-2], low[i]].
+  // Returns per-bar bias: +1 inside live bull zone, -1 inside live bear zone.
+  const n=d.c.length, bias=new Int8Array(n), bullN=new Int8Array(n);
+  maxZones=Math.max(1,Math.round(maxZones));mitAge=Math.max(5,Math.round(mitAge));
+  const zones=[]; // {dir:1|-1, top, bot, born}
+  for(let i=0;i<n;i++){
+    if(i>=2){
+      if(d.l[i]>d.h[i-2])zones.push({dir:1,top:d.l[i],bot:d.h[i-2],born:i});
+      else if(d.h[i]<d.l[i-2])zones.push({dir:-1,top:d.l[i-2],bot:d.h[i],born:i});
+      while(zones.length>maxZones)zones.shift();
+    }
+    let b=0;
+    for(let z=zones.length-1;z>=0;z--){
+      const zn=zones[z];
+      if(i-zn.born>mitAge){zones.splice(z,1);continue;}
+      if(zn.dir===1&&d.c[i]<zn.bot){zones.splice(z,1);continue;} // fully mitigated
+      if(zn.dir===-1&&d.c[i]>zn.top){zones.splice(z,1);continue;}
+      if(b===0){
+        if(zn.dir===1&&d.l[i]<=zn.top&&d.l[i]>=zn.bot)b=1; // tap into bull zone
+        else if(zn.dir===-1&&d.h[i]>=zn.bot&&d.h[i]<=zn.top)b=-1;
+      }
+    }
+    bias[i]=b;bullN[i]=zones.length;
+  }
+  return {bias,zoneCount:bullN};
+}
+function choppiness(h,l,c,p){
+  // Choppiness Index: 100·log10(ΣATR(n) / (maxH−minL)) / log10(n); >~61.8 = range
+  const n=c.length,out=new Float64Array(n).fill(NaN);
+  p=Math.max(2,Math.round(p));
+  for(let i=0;i<n;i++){
+    if(i<p)continue;
+    let hh=-Infinity,ll=Infinity,atrSum=0;
+    for(let j=i-p+1;j<=i;j++){
+      if(h[j]>hh)hh=h[j];if(l[j]<ll)ll=l[j];
+      atrSum+=j===0?h[j]-l[j]:Math.max(h[j]-l[j],Math.abs(h[j]-c[j-1]),Math.abs(l[j]-c[j-1]));
+    }
+    const rng=hh-ll;
+    out[i]=rng>0?100*Math.log10((atrSum/p)/rng)/Math.log10(p):50;
+  }
+  return out;
+}
+
 // ---------- signals ----------
 function buildSignals(d, cfg){
   // cfg: {indicator, params:{}}
@@ -410,6 +497,57 @@ function buildSignals(d, cfg){
     const os=P.oversold??30, ob=P.overbought??70;
     osc={crsi:cr};
     for(let i=0;i<n;i++){if(isNaN(cr[i]))continue;if(cr[i]<os)pos[i]=1;else if(cr[i]>ob)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;}
+  } else if(ind==='VWAPBands'){
+    const vb=vwapBands(d,P.sd1??1,P.sd2??2);
+    overlay={vwap:vb.vwap,up:vb.up1,lo:vb.lo1};
+    osc={vwapUp2:vb.up2,vwapLo2:vb.lo2};
+    for(let i=0;i<n;i++){if(isNaN(vb.up1[i]))continue;if(d.c[i]<vb.lo1[i])pos[i]=1;else if(d.c[i]>vb.up1[i])pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;}
+  } else if(ind==='CVD'){
+    const L=Math.max(5,Math.round(P.lookback||40));
+    const cv=cvdSeries(d);
+    osc={cvd:cv};
+    // divergence scanner: price undercuts trailing low while CVD holds above its value there
+    for(let i=0;i<n;i++){
+      if(isNaN(cv[i])||i<L)continue;
+      let mi=i-1;
+      for(let j=Math.max(1,i-L+1);j<i;j++)if(d.c[j]<d.c[mi])mi=j;
+      if(d.c[i]<d.c[mi]&&cv[i]>cv[mi])pos[i]=1;
+      else {
+        let mx=i-1;
+        for(let j=Math.max(1,i-L+1);j<i;j++)if(d.c[j]>d.c[mx])mx=j;
+        if(d.c[i]>d.c[mx]&&cv[i]<cv[mx])pos[i]=-1;
+        else pos[i]=i>0?pos[i-1]:0;
+      }
+    }
+  } else if(ind==='FVG'){
+    const fz=fvgZones(d,P.maxZones||5,P.mitAge||60);
+    osc={fvgBias:Array.from(fz.bias)};
+    for(let i=0;i<n;i++)pos[i]=fz.bias[i]; // +1 tap bull zone, -1 tap bear zone, else flat
+  } else if(ind==='OI'){
+    // Derivative build-up: needs OI column; without it the leg is flat (never trades)
+    if(d.oi&&d.hasOI){
+      const L=Math.max(2,Math.round(P.oiLen||10)), mm=P.minMove||0;
+      const smaOI=sma(d.oi,L);
+      osc={oi:d.oi};
+      for(let i=1;i<n;i++){
+        if(isNaN(smaOI[i]))continue;
+        const roc=(d.c[i]-d.c[i-1])/d.c[i-1]*100;
+        const oiUp=d.oi[i]>smaOI[i];
+        if(roc>mm&&oiUp)pos[i]=1; // long build-up: price + OI rising
+        else if(roc<-mm&&oiUp)pos[i]=-1; // short build-up
+        else if(!oiUp)pos[i]=0; // unwinding: stand aside
+        else pos[i]=i>0?pos[i-1]:0;
+      }
+    }
+  } else if(ind==='Regime'){
+    // Volatility gate: trend-follow EMA only when Choppiness < gate, else flat
+    const ch=choppiness(d.h,d.l,d.c,P.chopPeriod||14);
+    const e=ema(d.c,P.maPeriod||30), gate=P.gate??61.8;
+    osc={chop:ch};overlay={adxMa:e};
+    for(let i=0;i<n;i++){
+      if(isNaN(ch[i])||isNaN(e[i]))continue;
+      pos[i]=ch[i]<gate?(d.c[i]>e[i]?1:-1):0;
+    }
   }
   return {pos,overlay,osc};
 }
@@ -457,8 +595,18 @@ function backtest(d, sigPos, opts){
   if(exitMode==='atr')atrArr=atr(d.h,d.l,d.c,Math.max(2,Math.round(opts.atrTrailPeriod||14)));
   let hiEntry=0, loEntry=0, beDone=false;
   const useMask=opts.carry?null:mask; // carry overnight => ignore session flattening
+  // Explicit fill timing (anti-lookahead): 'close' fills signal trades at the
+  // signal bar's close; 'next' executes them at the NEXT bar's open. Resting
+  // stop orders (SL/TP/trailing) always fill intrabar at their stop levels.
+  const fillNext=(opts.fill==='next');
+  let pendTgt=null; // signal decision from bar i-1, executed at open[i]
   for(let i=1;i<n;i++){
-    const px=d.c[i];
+    const px=d.c[i], ox=d.o[i];
+    const decTgt=desiredTarget(i);
+    const actTgt=fillNext?pendTgt:decTgt;
+    pendTgt=decTgt;
+    const noSig=fillNext&&actTgt===null;
+    const fillPx=fillNext?ox:px;
     // manage open position: SL / target / trailing / signal flip / session exit
     if(position!==0){
       const ret=position===1?(px-entryPx)/entryPx:(entryPx-px)/entryPx;
@@ -487,12 +635,12 @@ function backtest(d, sigPos, opts){
         if(position===1){const tp2=trailPeak*(1-trailPct);if(d.l[i]<=tp2&&ret>0){stopHit=true;reason='TRAIL';}}
         else{const tp2=trough*(1+trailPct);if(d.h[i]>=tp2&&ret>0){stopHit=true;reason='TRAIL';}}
       }
-      const tgt=desiredTarget(i);
-      const flip=(tgt!==0&&tgt!==position);
-      const flatSignal=(tgt===0);
+      const tgt=actTgt;
+      const flip=!noSig&&tgt!==0&&tgt!==position;
+      const flatSignal=!noSig&&tgt===0;
       const lastBar=(i===n-1);
       if(stopHit||flip||flatSignal||lastBar){
-        let exitPx=px;
+        let exitPx=(fillNext&&!stopHit&&!lastBar)?ox:px;
         if(stopHit){
           if(reason==='SL')exitPx=position===1?entryPx*(1-slPct):entryPx*(1+slPct);
           else if(reason==='BE')exitPx=position===1?entryPx*(1+beLock):entryPx*(1-beLock);
@@ -507,17 +655,16 @@ function backtest(d, sigPos, opts){
         position=0;curQty=0;
         liveEq+=pnl;
         if(liveEq<=0)ruined=true; // blown up: manage nothing more, open nothing new
-        // immediate re-entry on flip (enter at same close; mask already enforced via tgt)
+        // immediate re-entry on flip (mask already enforced via tgt)
         if(flip&&(!useMask||useMask[i])&&!ruined){
-          position=tgt;entryPx=px;entryIdx=i;trailPeak=px;trough=px;curQty=units;
+          position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;
           hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
         }
         continue;
       }
     } else {
-      const tgt=desiredTarget(i);
-      if(tgt!==0&&(!useMask||useMask[i])&&!ruined){
-        position=tgt;entryPx=px;entryIdx=i;trailPeak=px;trough=px;curQty=qty*lotSize;
+      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&!ruined){
+        position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;
         hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
       }
     }
@@ -589,6 +736,11 @@ const SCHEMA={
   Fisher:[{key:'period',min:5,max:30,def:10}],
   Squeeze:[{key:'bbPeriod',min:10,max:30,def:20},{key:'bbMult',min:1,max:3,def:2},{key:'kcPeriod',min:10,max:30,def:20},{key:'kcMult',min:1,max:3,def:1.5}],
   CRSI:[{key:'rsiPeriod',min:2,max:7,def:3},{key:'streakPeriod',min:2,max:7,def:2},{key:'rankPeriod',min:20,max:200,def:100},{key:'oversold',min:5,max:40,def:30},{key:'overbought',min:60,max:95,def:70}],
+  VWAPBands:[{key:'sd1',min:1,max:3,def:1},{key:'sd2',min:1,max:3,def:2}],
+  CVD:[{key:'lookback',min:10,max:100,def:40}],
+  FVG:[{key:'maxZones',min:1,max:10,def:5},{key:'mitAge',min:10,max:200,def:60}],
+  OI:[{key:'oiLen',min:3,max:30,def:10},{key:'minMove',min:0,max:2,def:0.2}],
+  Regime:[{key:'chopPeriod',min:7,max:40,def:14},{key:'gate',min:40,max:80,def:61.8},{key:'maPeriod',min:10,max:100,def:30}],
 };
 
 function cartesian(arrays){
@@ -694,7 +846,7 @@ function rankResults(rows, objective){
   return r;
 }
 
-const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

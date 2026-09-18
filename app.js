@@ -18,6 +18,7 @@ tfBox.addEventListener('change', estimateCombos);
 
 // ---------- sidebar: indicators ----------
 const IND_META = [
+  {cat:'A · Classic trend, momentum & volatility'},
   {n:'EMA',d:'Trend · price vs EMA',on:true},{n:'SMA',d:'Trend · price vs SMA',on:true},
   {n:'HMA',d:'Hull MA trend',on:true},{n:'DEMA',d:'Double EMA trend',on:true},
   {n:'Bollinger',d:'Mean-reversion bands',on:true},{n:'Keltner',d:'ATR channel breakout',on:true},
@@ -27,6 +28,10 @@ const IND_META = [
   {n:'ChandeKroll',d:'Chande-Kroll stops',on:true},{n:'POC',d:'Volume Profile POC',on:true},
   {n:'KAMA',d:'★ Kaufman adaptive MA',on:true},{n:'Fisher',d:'★ Fisher Transform turns',on:true},
   {n:'Squeeze',d:'★ TTM squeeze release',on:true},{n:'CRSI',d:'★ Connors RSI mean-rev',on:true},
+  {cat:'B · Institutional Order Flow & Smart Money'},
+  {n:'VWAPBands',d:'★ VWAP ±1–3σ deviation bands',on:true},{n:'CVD',d:'★ Cumulative Volume Delta divergence',on:true},
+  {n:'FVG',d:'★ Fair Value Gap / imbalance taps',on:true},{n:'OI',d:'★ OI derivative build-up filter',on:true,oi:true},
+  {n:'Regime',d:'★ Choppiness gate for trend loops',on:true},
 ];
 // Max-coverage default ranges: [min, max, step] — ~115 configs per timeframe
 const DEFAULT_RANGES = {
@@ -45,11 +50,23 @@ const DEFAULT_RANGES = {
   Fisher:{period:[9,17,4]},
   Squeeze:{bbPeriod:[14,21,7], bbMult:[2,2.5,0.5], kcPeriod:[14,21,7], kcMult:[1.5,2,0.5]},
   CRSI:{rsiPeriod:[2,4,1], streakPeriod:[2,3,1], rankPeriod:[50,100,50], oversold:[10,20,10], overbought:[80,90,10]},
+  VWAPBands:{sd1:[1,2,1], sd2:[2,3,1]},
+  CVD:{lookback:[20,60,20]},
+  FVG:{maxZones:[3,7,2], mitAge:[20,60,20]},
+  OI:{oiLen:[5,15,5], minMove:[0.1,0.5,0.2]},
+  Regime:{chopPeriod:[10,20,5], gate:[55,65,5], maPeriod:[20,40,10]},
 };
 const indList=$('indList');
 function buildIndCards(){
   indList.innerHTML='';
   IND_META.forEach(m=>{
+    if(m.cat){ // category header row
+      const h=document.createElement('div');
+      h.className='lbl !text-green-400 pt-1';
+      h.textContent=m.cat;
+      indList.appendChild(h);
+      return;
+    }
     const schema=E.SCHEMA[m.n]||[];
     const card=document.createElement('div');
     card.className='ind-card'+(m.on?' on':'');
@@ -61,9 +78,9 @@ function buildIndCards(){
       <div><label>max</label><input type="number" step="any" data-k="${p.key}" data-b="max" value="${preset[1]}" class="w-full num"/></div>
       <div><label>step</label><input type="number" step="any" data-k="${p.key}" data-b="step" value="${preset[2]}" class="w-full num"/></div>`;
     });
-    // sensible demo ranges
     card.innerHTML=`<label class="flex items-center gap-2 text-[13px] font-semibold cursor-pointer">
       <input type="checkbox" data-role="en" ${m.on?'checked':''}/> ${m.n} <span class="text-[10px] text-zinc-500 font-normal">${m.d}</span></label>
+      ${m.oi?`<div id="oiNote" class="text-[10px] text-amber-300 mt-1">○ no OI column in this file — OI leg stays flat</div>`:''}
       ${schema.length?`<div class="param-grid">${params}</div>`:`<div class="text-[10px] text-zinc-500 mt-1">No parameters — single config per timeframe.</div>`}`;
     indList.appendChild(card);
   });
@@ -149,13 +166,21 @@ function applyDateFilter(){
   const lo=f?new Date(f+'T00:00:00').getTime():-Infinity, hi=t?new Date(t+'T23:59:59').getTime():Infinity;
   const idx=[]; for(let i=0;i<d.t.length;i++) if(d.t[i]>=lo&&d.t[i]<=hi) idx.push(i);
   const pick=(a)=>Float64Array.from(idx.map(i=>a[i]));
-  state.data={t:pick(d.t),o:pick(d.o),h:pick(d.h),l:pick(d.l),c:pick(d.c),v:pick(d.v)};
+  const hasOI=!!(d.oi&&d.hasOI);
+  state.data={t:pick(d.t),o:pick(d.o),h:pick(d.h),l:pick(d.l),c:pick(d.c),v:pick(d.v),
+    oi:hasOI?pick(d.oi):null, hasOI};
+  const oiNote=$('oiNote');
+  if(oiNote)oiNote.textContent=hasOI?'● OI column detected — build-up filter active':'○ no OI column in this file — OI leg stays flat';
 }
 $('fromDate').addEventListener('change',()=>{if(state.raw){applyDateFilter();$('dataInfo').textContent=`Filtered: ${state.data.t.length.toLocaleString()} bars`;}});
 $('toDate').addEventListener('change',()=>{if(state.raw){applyDateFilter();$('dataInfo').textContent=`Filtered: ${state.data.t.length.toLocaleString()} bars`;}});
 
 $('fileInput').addEventListener('change', e=>{
   const f=e.target.files[0]; if(!f)return;
+  // symbol from file name: HDFCBANK_minute.csv -> HDFCBANK
+  const base=f.name.replace(/\.[^.]+$/,'');
+  const sym=(base.split(/[_.\-\s]+/)[0]||base).toUpperCase().slice(0,20);
+  if(sym)$('symbol').value=sym;
   const rd=new FileReader();
   $('loadBarWrap').classList.remove('hidden');
   rd.onprogress=ev=>{ if(ev.lengthComputable)$('loadBar').style.width=(ev.loaded/ev.total*100)+'%'; };
@@ -191,7 +216,8 @@ function tradeOpts(){
     capital:+$('capital').value||100000, qty:+$('qty').value||1, lotSize:+$('lotSize').value||1,
     cost:+$('costPer').value||0,
     beTrigger:+$('beTrigger').value||0, beLock:+$('beLock').value||0,
-    atrTrailPeriod:+$('atrP').value||14, atrTrailMult:+$('atrM').value||3
+    atrTrailPeriod:+$('atrP').value||14, atrTrailMult:+$('atrM').value||3,
+    fill:$('fillMode').value||'close'
   };
 }
 function getExitDims(){
@@ -600,6 +626,10 @@ function renderSubCharts(){
   else if(sig.osc.macdHist){series=sig.osc.macdHist.slice(s0);oscName='MACD hist';}
   else if(sig.osc.adx){series=sig.osc.adx.slice(s0);oscName='ADX';}
   else if(sig.osc.stochK){series=sig.osc.stochK.slice(s0);oscName='Stoch %K';}
+  else if(sig.osc.cvd){series=Array.from(sig.osc.cvd.slice(s0));oscName='Cumulative Volume Delta';}
+  else if(sig.osc.chop){series=sig.osc.chop.slice(s0);oscName='Choppiness Index';}
+  else if(sig.osc.oi){series=sig.osc.oi.slice(s0);oscName='Open Interest';}
+  else if(sig.osc.fvgBias){series=Array.from(sig.osc.fvgBias.slice(s0));oscName='FVG bias';}
   else{series=E.rsi(d.c,14).slice(s0);oscName='RSI (ref)';}
   $('oscTitle').textContent='· '+oscName;
   const ds=Array.from(series,v=>isFinite(v)?+v.toFixed(2):null);
@@ -669,8 +699,71 @@ $('btnExportTrades').onclick=()=>{
   const {bt}=state.detail;
   let s='id,entry_time,exit_time,type,entry_px,exit_px,pnl,pnl_pct,reason\n';
   for(const t of bt.trades)s+=`${t.id},${new Date(t.entryTime).toISOString()},${new Date(t.exitTime).toISOString()},${t.type},${t.entryPx},${t.exitPx},${t.pnl.toFixed(2)},${t.pnlPct.toFixed(3)},${t.reason}\n`;
-  const r=state.sel; dl(`xbost_trades_${r.indicator}_${r.timeframe}m_SL${r.slPct||0}_TP${r.tpPct||0}.csv`,s);
+  const r=state.sel; dl(`xbost_trades_${r.indicator}_${r.timeframe}m_${r.exit||'fixed'}${r.carry?'_carry':''}_SL${r.slPct||0}_TP${r.tpPct||0}.csv`,s);
 };
+
+// ---------- anti-bug validation engine (DEV ONLY — synthetic in-memory bars, never state.data) ----------
+function mkBars(n, fn){
+  const t=new Float64Array(n),o=new Float64Array(n),h=new Float64Array(n),l=new Float64Array(n),c=new Float64Array(n),v=new Float64Array(n);
+  const t0=new Date('2024-01-02T09:15:00').getTime();
+  for(let i=0;i<n;i++){const b=fn(i);t[i]=t0+i*60000;o[i]=b[0];h[i]=b[1];l[i]=b[2];c[i]=b[3];v[i]=b[4]||1000;}
+  return {t,o,h,l,c,v};
+}
+function runValidation(){
+  const out=[];let pass=0,fail=0;
+  const ok=(name,cond,extra)=>{if(cond){pass++;out.push('PASS '+name);}else{fail++;out.push('FAIL '+name+(extra?' :: '+extra:''));}};
+  const allOnes=n=>{const m=new Int8Array(n);m.fill(1);return m;};
+  try{
+    // T1 flat market: no stop/target may ever trigger; every pnl == -cost
+    const flat=mkBars(200,()=> [100,100,100,100,1000]);
+    const fsig=E.buildSignals(flat,{indicator:'EMA',params:{period:9}});
+    const fbt=E.backtest(flat,fsig.pos,{direction:'Both',sessionMask:allOnes(200),slPct:1,tpPct:2,trailPct:1,capital:100000,qty:10,lotSize:1,cost:20});
+    const badStop=fbt.trades.filter(t=>['SL','TP','TRAIL','BE','ATR'].includes(t.reason));
+    ok('T1 flat: no stop/target fills',badStop.length===0,badStop.length+' stop fills');
+    ok('T1 flat: pnl == -n*cost',Math.abs(fbt.metrics.netPnL+fbt.trades.length*20)<0.01,fbt.metrics.netPnL);
+    // T2 linear slope: single ride, pnl recomputed independently to the decimal
+    const slope=mkBars(60,i=>{const c=100+i;return [c,c+0.1,c-0.1,c,1000];});
+    const ssig=E.buildSignals(slope,{indicator:'EMA',params:{period:9}});
+    const sbt=E.backtest(slope,ssig.pos,{direction:'Long',sessionMask:allOnes(60),slPct:50,tpPct:200,capital:100000,qty:10,lotSize:1,cost:20});
+    ok('T2 slope: exactly 1 long ride',sbt.trades.length===1&&sbt.trades[0].type==='LONG',sbt.trades.length+' trades');
+    if(sbt.trades.length===1){
+      const t=sbt.trades[0];
+      const exp=(slope.c[t.exitIdx]-slope.c[t.entryIdx])*10-20;
+      ok('T2 slope: pnl to the decimal',Math.abs(t.pnl-exp)<0.01,t.pnl+' vs '+exp);
+    }
+    // T2b warmup quarantine: no entries inside EMA9 warmup (bars 0..7)
+    const early=sbt.trades.filter(t=>t.entryIdx<8);
+    ok('T2b warmup: no trades from NaN zone',early.length===0,early.length+' early trades');
+    // T3 50% gap-down THROUGH a 1% stop: fill must be the stop price, not the gap
+    const gap=mkBars(45,i=>{ if(i<30)return [100,100,100,100,1000]; if(i===30)return [100,100,50,51,5000]; return [51,51.1,50.9,51,1000]; });
+    const forced=new Int8Array(45);forced.fill(1); // forced long signal, no indicator involved
+    const gbt=E.backtest(gap,forced,{direction:'Both',sessionMask:allOnes(45),slPct:1,tpPct:50,capital:100000,qty:10,lotSize:1,cost:20});
+    const gsl=gbt.trades.find(t=>t.reason==='SL');
+    ok('T3 gap: SL triggered',!!gsl);
+    if(gsl){
+      ok('T3 gap: filled at stop 99.00, not gap 50',Math.abs(gsl.exitPx-99)<1e-9,gsl.exitPx);
+      ok('T3 gap: pnl = (99-100)*10-20',Math.abs(gsl.pnl-(-30))<1e-9,gsl.pnl);
+    }
+    // T4 next-open fill: entries print at open[entryIdx], never bar 0
+    const nbt=E.backtest(slope,ssig.pos,{direction:'Long',sessionMask:allOnes(60),slPct:50,tpPct:200,capital:100000,qty:10,lotSize:1,cost:20,fill:'next'});
+    const badFill=nbt.trades.filter(t=>Math.abs(t.entryPx-slope.o[t.entryIdx])>1e-9||t.entryIdx===0);
+    ok('T4 next-open: all entries at open[i+1]',nbt.trades.length>0&&badFill.length===0,nbt.trades.length+' trades, '+badFill.length+' bad');
+    // T5 denominator integrity: engineered ruin + empty-signal books stay finite
+    const ruin=mkBars(120,i=>{const c=100+i*2;return [c,c+0.2,c-0.2,c,1000];});
+    const rsig=new Int8Array(120);rsig.fill(-1); // forced shorts into a ripper
+    const rbt=E.backtest(ruin,rsig,{direction:'Both',sessionMask:allOnes(120),slPct:0.5,tpPct:5,capital:1000,qty:100,lotSize:1,cost:20});
+    const rm=rbt.metrics;
+    ok('T5 ruin: Sharpe/Sortino/DD finite',isFinite(rm.sharpe)&&isFinite(rm.sortino)&&isFinite(rm.maxDD),JSON.stringify({s:rm.sharpe,so:rm.sortino,dd:rm.maxDD}));
+    const zero=new Int8Array(60); // no signals at all
+    const zbt=E.backtest(slope,zero,{direction:'Both',sessionMask:allOnes(60),capital:100000,qty:10,lotSize:1,cost:20});
+    ok('T5b empty book: 0 trades, finite metrics',zbt.trades.length===0&&isFinite(zbt.metrics.sharpe)&&zbt.metrics.winRate===0&&zbt.metrics.profitFactor===0);
+    out.push('');
+    out.push(`VALIDATION: ${pass} passed, ${fail} failed — synthetic only, real data untouched.`);
+  }catch(err){out.push('VALIDATION FATAL: '+(err&&err.message||err));fail++;}
+  $('valOut').textContent=out.join('\n');
+  $('valOut').style.borderColor=fail?'#ff3b5c':'#22ff88';
+}
+$('btnValidate').onclick=runValidation;
 
 // boot: real data only — auto-load the repo CSV when served over http,
 // otherwise the user uploads a 1-min OHLCV file. No synthetic data anywhere.
