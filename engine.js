@@ -447,6 +447,7 @@ function backtest(d, sigPos, opts){
     return s;
   }
   let curQty=0;
+  let liveEq=capital0, ruined=false; // ruin guard: account blown -> no new entries
   for(let i=1;i<n;i++){
     const px=d.c[i];
     // manage open position: SL / target / trailing / signal flip / session exit
@@ -486,15 +487,17 @@ function backtest(d, sigPos, opts){
         const pnlPct=position===1?(exitPx-entryPx)/entryPx*100:(entryPx-exitPx)/entryPx*100;
         trades.push({id:trades.length+1,entryIdx,exitIdx:i,entryTime:d.t[entryIdx],exitTime:d.t[i],entryPx,exitPx,type:position===1?'LONG':'SHORT',pnl,pnlPct,reason:stopHit?reason:(flip?'FLIP':(flatSignal?'SESSION/FLAT':'END'))});
         position=0;curQty=0;
+        liveEq+=pnl;
+        if(liveEq<=0)ruined=true; // blown up: manage nothing more, open nothing new
         // immediate re-entry on flip (enter at same close; mask already enforced via tgt)
-        if(flip&&mask[i]){
+        if(flip&&mask[i]&&!ruined){
           position=tgt;entryPx=px;entryIdx=i;trailPeak=px;trough=px;curQty=units;
         }
         continue;
       }
     } else {
       const tgt=desiredTarget(i);
-      if(tgt!==0&&mask[i]){
+      if(tgt!==0&&mask[i]&&!ruined){
         position=tgt;entryPx=px;entryIdx=i;trailPeak=px;trough=px;curQty=qty*lotSize;
       }
     }
@@ -513,23 +516,30 @@ function backtest(d, sigPos, opts){
   const wr=trades.length?wins/trades.length*100:0;
   const pf=grossL>0?grossP/grossL:(grossP>0?99.99:0);
   const net=run-capital0;
-  // max drawdown
+  // max drawdown on the account curve (ruin guard keeps this >= -100%)
   let peakE=capital0,maxDD=0;
   const dd=new Float64Array(n);
   for(let i=0;i<n;i++){if(eq[i]>peakE)peakE=eq[i];const ddi=peakE>0?(eq[i]-peakE)/peakE*100:0;dd[i]=ddi;if(ddi<maxDD)maxDD=ddi;}
-  // sharpe/sortino on per-trade returns (approx) + daily equity returns
-  const rets=[];
-  for(let i=1;i<n;i++){if(eq[i-1]>0)rets.push((eq[i]-eq[i-1])/eq[i-1]);}
-  function mean(a){if(!a.length)return 0;let s=0;for(const x of a)s+=x;return s/a.length;}
-  function sd(a,m){if(a.length<2)return 0;let s=0;for(const x of a)s+=(x-m)*(x-m);return Math.sqrt(s/(a.length-1));}
-  const m=mean(rets),s=sd(rets,m);
-  const sharpe=s>0?m/s*Math.sqrt(252*375):0;
-  const dn=rets.filter(x=>x<0);const sdn=sd(dn,mean(dn));
-  const sortino=sdn>0?m/sdn*Math.sqrt(252*375):0;
-  const expectancy=trades.length?net/trades.length:0;
+  // Sharpe/Sortino on DAILY strategy returns: dayPnl / starting capital.
+  // Two deliberate choices: (1) denominator is constant initial capital, never
+  // live equity — once equity goes negative, equity-based returns invert sign
+  // ((-200+100)/-100 = +100%) and fabricate ratios; (2) daily aggregation keeps
+  // magnitudes comparable (per-trade annualisation explodes for 100+/day scalps).
+  const dayPnl={};
+  for(const t of trades){const dy=Math.floor(t.exitTime/86400000);dayPnl[dy]=(dayPnl[dy]||0)+t.pnl;}
   let days=0,lastDay=-1;
   for(let i=0;i<n;i++){const dy=Math.floor(d.t[i]/86400000);if(dy!==lastDay){lastDay=dy;days++;}}
   const tradesPerDay=days>0?trades.length/days:trades.length;
+  const dret=[];
+  { const seen={};
+    for(let i=0;i<n;i++){const dy=Math.floor(d.t[i]/86400000);if(!seen[dy]){seen[dy]=1;dret.push((dayPnl[dy]||0)/Math.max(1e-9,capital0));}} }
+  function mean(a){if(!a.length)return 0;let s=0;for(const x of a)s+=x;return s/a.length;}
+  function sd(a,m){if(a.length<2)return 0;let s=0;for(const x of a)s+=(x-m)*(x-m);return Math.sqrt(s/(a.length-1));}
+  const dm=mean(dret),dsd=sd(dret,dm);
+  const sharpe=dsd>0?dm/dsd*Math.sqrt(252):0;
+  const ddn=dret.filter(x=>x<0);const dsdn=sd(ddn,mean(ddn));
+  const sortino=dsdn>0?dm/dsdn*Math.sqrt(252):(dm>0?99.99:0);
+  const expectancy=trades.length?net/trades.length:0;
   return {trades,equity:eq,dd,metrics:{netPnL:net,winRate:wr,totalTrades:trades.length,profitFactor:pf,maxDD:maxDD,sharpe,sortino,expectancy,finalCapital:run,grossProfit:grossP,grossLoss:grossL,tradesPerDay,days}};
 }
 

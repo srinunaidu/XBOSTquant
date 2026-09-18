@@ -109,6 +109,15 @@ function getRiskGrid(){
 }
 ['optRisk','slMin','slMax','slStep','tpMin','tpMax','tpStep'].forEach(id=>$(id).addEventListener('change',estimateCombos));
 ['optRisk','slMin','slMax','slStep','tpMin','tpMax','tpStep'].forEach(id=>$(id).addEventListener('input',estimateCombos));
+function updateRiskLock(){
+  const on=$('optRisk').checked;
+  ['slPct','tpPct'].forEach(id=>{ $(id).disabled=on; $(id).style.opacity=on?0.35:1; });
+  $('riskLockNote').textContent=on
+    ? '● GRID ACTIVE — every SL × TP below is backtested per combo; winners appear in the board\'s SL % / TP % columns. Fallback inputs above are ignored.'
+    : '○ GRID OFF — the single fallback SL/TP values above apply to every combo.';
+  $('riskLockNote').className='text-[10px] mt-1 '+(on?'text-green-300':'text-amber-300');
+}
+$('optRisk').addEventListener('change',updateRiskLock);
 function estimateCombos(){
   const {sels}=getSelection();
   try{
@@ -546,7 +555,7 @@ function renderTrades(){
   if(!state.detail){tb.innerHTML='<tr><td class="text-zinc-500 text-center py-8">No strategy loaded.</td></tr>';return;}
   const {bt}=state.detail, m=bt.metrics;
   $('tradeCount').textContent=`· ${bt.trades.length} closed trades`;
-  $('tradeSummary').textContent=`avg ${fmtMoney(m.expectancy)} / trade · ${(m.tradesPerDay||0).toFixed(1)} trades/day · gross +${fmtMoney(m.grossProfit)} / -${fmtMoney(m.grossLoss)}`;
+  $('tradeSummary').textContent=`avg ${fmtMoney(m.expectancy)} / trade · ${(m.tradesPerDay||0).toFixed(1)} trades/day · costs ${fmtMoney(-(bt.trades.length*(+$('costPer').value||0)))} · gross +${fmtMoney(m.grossProfit)} / -${fmtMoney(m.grossLoss)}`;
   let run=(+$('capital').value||100000);
   const frag=document.createDocumentFragment();
   const show=bt.trades.slice(-500).reverse();
@@ -601,6 +610,7 @@ window.addEventListener('error', e=>{
   }
 });
 estimateCombos();
+updateRiskLock();
 renderKPIs();
 loadRepoCSV();
 })();
