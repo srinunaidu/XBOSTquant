@@ -99,7 +99,7 @@ export default function Leaderboard() {
             theme={darkTheme}
             rowData={rows}
             columnDefs={COLS as any}
-            rowSelection="single"
+            rowSelection={{ mode: 'singleRow' }}
             onRowClicked={e => selectRow((e.data as any)._r)}
             getRowId={p => String((p.data as any)._r.i) + (p.data as any)._r.indicator}
             animateRows={false}

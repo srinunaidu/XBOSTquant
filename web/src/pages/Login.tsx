@@ -1,21 +1,19 @@
 import { useState } from 'react';
 import { login } from '../lib/api';
-import { useStore } from '../lib/store';
 
 export default function Login() {
   const [u, setU] = useState('');
   const [p, setP] = useState('');
   const [err, setErr] = useState<string | null>(null);
-  const set = useStore(s => s.set);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
     setErr(null);
     const r = await login(u, p);
-    if (r.ok && r.user) {
-      set({ user: r.user });
-      location.hash = '#/';
-    } else setErr(r.error || 'Login failed');
+    // Full reload (not hash nav): /engine.js 401'd anonymously at first paint,
+    // so the quant engine must be (re)loaded with the fresh session cookie.
+    if (r.ok && r.user) location.href = '/';
+    else setErr(r.error || 'Login failed');
   };
 
   return (

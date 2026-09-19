@@ -49,7 +49,15 @@ export interface Engine {
   SCHEMA: Record<string, { key: string; min: number; max: number; def: number }[]>;
 }
 
-const E = (window as unknown as { XBOST_ENGINE?: Engine }).XBOST_ENGINE;
-if (!E) throw new Error('XBOST_ENGINE failed to load (engine.js script tag missing?)');
-const engine: Engine = E;
+// Lazy proxy: /engine.js is auth-guarded (401 logged out), so the bundle must
+// boot WITHOUT it — the Login page needs no quant code. The engine resolves
+// on first actual use (post-login), when the script serves 200.
+const engine: Engine = new Proxy({} as Engine, {
+  get(_t, prop) {
+    const E = (window as unknown as { XBOST_ENGINE?: Engine }).XBOST_ENGINE;
+    if (!E) throw new Error('XBOST_ENGINE not loaded — sign in first (engine.js is auth-guarded).');
+    const v = (E as unknown as Record<string | symbol, unknown>)[prop];
+    return typeof v === 'function' ? (v as Function).bind(E) : v;
+  },
+});
 export default engine;
