@@ -139,14 +139,25 @@ app.patch('/api/users/:id', requireAdmin, (req, res) => {
 });
 
 // ---- gate: login page + APIs public, everything else needs a session ----
+// Dist (React SPA) mode: NO redirects anywhere — fragment URLs loop through
+// proxies that strip them. Unauthenticated navigations get the app shell
+// (HTTP 200) and the client router renders Login; the JS bundle itself is
+// public so the form can boot, while engine/worker/data stay guarded.
 const LEGACY = PUBLIC_DIR.endsWith('public');
 const PUBLIC_PATHS = new Set(LEGACY ? ['/login.html'] : []);
-const LOGIN_TARGET = LEGACY ? '/login.html' : '/#/login';
+const SHELL_PATHS = new Set(['/', '/index.html', '/login.html', '/users.html']);
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
   if (PUBLIC_PATHS.has(req.path)) return next();
+  if (!LEGACY && req.path.startsWith('/assets/')) return next();
   if (req.session && req.session.user) return next();
-  if (['/', '/index.html', '/login.html', '/users.html'].includes(req.path)) return res.redirect(LOGIN_TARGET);
+  if (LEGACY) {
+    if (req.path === '/' || req.path === '/index.html') return res.redirect('/login.html');
+    return res.status(401).json({ error: 'unauthorized' });
+  }
+  if (req.method === 'GET' && SHELL_PATHS.has(req.path)) {
+    return res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+  }
   return res.status(401).json({ error: 'unauthorized' });
 });
 app.use(express.static(PUBLIC_DIR, { index: 'index.html', dotfiles: 'ignore' }));

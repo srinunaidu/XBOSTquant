@@ -40,11 +40,16 @@ jobs:
       - run: |
           node server.js & echo $! > server.pid
           for i in $(seq 1 30); do curl -sf http://localhost:8901/ -o /dev/null && break || sleep 1; done
-      - name: login hash-route redirects when logged out
-        run: test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/login.html)" = "302"
-      - name: terminal is guarded
+      - name: app shell served with zero redirects
         run: |
-          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/)" = "302"
+          test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/)" = "200"
+          test "$(curl -s -o /dev/null -w '%{num_redirects}' http://localhost:8901/)" = "0"
+          curl -sf http://localhost:8901/ | grep -q 'id="root"'
+      - name: bundle public, engine guarded
+        run: |
+          JS=$(curl -s http://localhost:8901/ | grep -o '/assets/index[^"]*\.js' | head -1)
+          test -n "$JS"
+          curl -sf http://localhost:8901$JS -o /dev/null
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/engine.js)" = "401"
       - name: react bundle + worker served after login
         run: |
