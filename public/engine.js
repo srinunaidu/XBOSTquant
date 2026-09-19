@@ -859,8 +859,22 @@ function trainRegimeML(d, isFrac, K, iters, maxTrain){
   const nS=Math.ceil(isN/stride);
   const Xs=new Float64Array(nS*p), ys=new Int8Array(nS);
   for(let s=0;s<nS;s++){const i=s*stride;ys[s]=y[i];for(let k=0;k<p;k++)Xs[s*p+k]=X[i*p+k];}
+  // Standardize on the training rows (deterministic): unscaled features with
+  // ~10x scale spreads stall full-batch GD near uniform (= mass fallback).
+  const mu=new Float64Array(p), sd=new Float64Array(p);
+  for(let k=0;k<p;k++){let s=0;for(let s2=0;s2<nS;s2++)s+=Xs[s2*p+k];mu[k]=s/Math.max(1,nS);}
+  for(let k=0;k<p;k++){
+    if(k===p-1){sd[k]=1;continue;} // bias stays 1
+    let v=0;for(let s2=0;s2<nS;s2++){const d=Xs[s2*p+k]-mu[k];v+=d*d;}
+    sd[k]=Math.sqrt(v/Math.max(1,nS))||1;
+  }
+  for(let s2=0;s2<nS;s2++)for(let k=0;k<p-1;k++)Xs[s2*p+k]=(Xs[s2*p+k]-mu[k])/sd[k];
   const W=trainSoftmax(Xs,ys,nS,p,4,iters,0.5,0.001);
-  const pred=predictSoftmax(X,W,n,p,4);
+  // predict with the SAME scaling
+  const XsF=new Float64Array(n*p);
+  for(let i=0;i<n;i++)for(let k=0;k<p-1;k++)XsF[i*p+k]=(X[i*p+k]-mu[k])/sd[k];
+  for(let i=0;i<n;i++)XsF[i*p+p-1]=1;
+  const pred=predictSoftmax(XsF,W,n,p,4);
   let hit=0;for(let i=0;i<isN;i++)if(pred[i]===y[i])hit++;
   return {W:Array.from(W), p, trainAcc:isN?hit/isN:0, pred:Array.from(pred), n, stride};
 }
@@ -918,7 +932,7 @@ function dayRuleLabels(d, rule){
 function trainDayML(d, K){
   K=K||0; // reserved (forward offset in sessions; 0 = next session)
   const segs=daySegments(d);
-  const D=segs.length, F=9;
+  const D=segs.length, F=13; // 8 session features + 4-dim one-hot previous label + bias
   const pre={ch:choppiness(d.h,d.l,d.c,14),ax:adx(d.h,d.l,d.c,14),at:atr(d.h,d.l,d.c,14),ef:ema(d.c,20),es:ema(d.c,50)};
   const rule=regimeSeries(d,{});
   const labels=dayRuleLabels(d,rule);
@@ -926,16 +940,36 @@ function trainDayML(d, K){
   const X=new Float64Array(Math.max(0,n)*F), y=new Int8Array(Math.max(0,n));
   for(let i=1;i<D;i++){
     const f=dayFeatures(d,segs[i-1].s,segs[i-1].e,pre);
-    for(let k=0;k<F-1;k++)X[(i-1)*F+k]=isFinite(f[k])?f[k]:0;
+    for(let k=0;k<8;k++)X[(i-1)*F+k]=isFinite(f[k])?f[k]:0;
+    const pl=i-2>=0?labels[i-1]:-1; // previous session's rule label (causal)
+    for(let c=0;c<4;c++)X[(i-1)*F+8+c]=(pl===c)?1:0;
     X[(i-1)*F+F-1]=1;
     y[i-1]=labels[i];
   }
-  const W=n>0?trainSoftmax(X,y,n,F,4,300,0.5,0.001):new Float64Array(4*F);
+  // Standardize on training rows (deterministic): unscaled spreads stall GD.
+  const mu=new Float64Array(F), sd=new Float64Array(F);
+  for(let k=0;k<F;k++){let s=0;for(let s2=0;s2<n;s2++)s+=X[s2*F+k];mu[k]=n>0?s/n:0;}
+  for(let k=0;k<F;k++){
+    if(k===F-1||k>=8){sd[k]=1;continue;} // bias + one-hots stay as-is
+    let v=0;for(let s2=0;s2<n;s2++){const dd=X[s2*F+k]-mu[k];v+=dd*dd;}
+    sd[k]=Math.sqrt(v/Math.max(1,n))||1;
+  }
+  for(let s2=0;s2<n;s2++)for(let k=0;k<8;k++)X[s2*F+k]=(X[s2*F+k]-mu[k])/sd[k];
+  const W=n>0?trainSoftmax(X,y,n,F,4,500,0.5,0.001):new Float64Array(4*F);
+  const MU=Array.from(mu), SD=Array.from(sd);
+  function featScaled(i){ // session i's feature row, same scaling (i>=1)
+    const f=dayFeatures(d,segs[i-1].s,segs[i-1].e,pre);
+    const fv=[];
+    for(let k=0;k<8;k++){const v=isFinite(f[k])?f[k]:0;fv.push((v-MU[k])/SD[k]);}
+    const pl=i-2>=0?labels[i-1]:-1;
+    for(let c=0;c<4;c++)fv.push(pl===c?1:0);
+    fv.push(1);
+    return fv;
+  }
   // predict every session (session 0 has no prior -> mark unknown)
   const pred=new Int8Array(D).fill(-1), conf=new Float64Array(D);
   for(let i=1;i<D;i++){
-    const f=dayFeatures(d,segs[i-1].s,segs[i-1].e,pre);
-    const fv=f.concat([1]);
+    const fv=featScaled(i);
     let bc=0,bs=-1e18;const sc=[];
     for(let c=0;c<4;c++){let s=0;for(let k=0;k<F;k++)s+=W[c*F+k]*fv[k];sc.push(s);if(s>bs){bs=s;bc=c;}}
     let den=0;for(let c=0;c<4;c++)den+=Math.exp(sc[c]-bs);
@@ -987,8 +1021,8 @@ function dayRouting(d, o){
     }
     const m=trainDayML(d);
     let hi=0;for(let i=1;i<m.conf.length;i++)if(m.conf[i]>=confGate)hi++;
-    notices.push('ML day-model: train-acc '+(100*m.trainAcc).toFixed(1)+'%, '+hi+'/'+(segs.length-1)+' confident days ≥ '+Math.round(confGate*100)+'% (rest fallback, counted)');
-    return {dayReg:{segs:segs.map(s=>({s:s.s,e:s.e,label:s.label})),pred:m.pred,conf:m.conf}, mlAcc:m.trainAcc, notices, fallbackDays:0, ok:true};
+    notices.push('ML day-model: train-acc '+(100*m.acc).toFixed(1)+'%, '+hi+'/'+(segs.length-1)+' confident days ≥ '+Math.round(confGate*100)+'% (rest fallback, counted)');
+    return {dayReg:{segs:segs.map(s=>({s:s.s,e:s.e,label:s.label})),pred:m.pred,conf:m.conf}, mlAcc:m.acc, notices, fallbackDays:0, ok:true};
   }
   const rule=regimeSeries(d,{});
   const labels=dayRuleLabels(d,rule);

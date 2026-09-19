@@ -241,7 +241,12 @@ Flat (`0`) during indicator warmup; otherwise:
   unrouted and are COUNTED as fallback days in the log. Nothing is ever silent.
 - **Rule regimes**: trend-up/down (ADX ≥ 20 + EMA20/50), else range-high/low-vol
   (trailing 100-bar volatility rank). Per-bar mode remains as an Advanced toggle.
-- **ML classifier**: day-level multinomial softmax (8 prior-session features →
+- **ML classifier**: day-level multinomial softmax (8 prior-session features +
+  previous-day one-hot + bias = 13 dims → next session's majority regime),
+  features standardized on train rows, 500 GD iters, deterministic zero-init.
+  Reports honest train accuracy (no NaN field bugs); <20 sessions or low
+  confidence (<60% default) falls back LOUDLY — to genuine rule labels or
+  unrouted days, always counted in the log.
   next session's majority regime), deterministic zero-init, strided training.
 - **Router** (`ROUTER` + masks): trend legs in T+/T−, mean-reversion in RH/RL,
   breakout in T/RH, gates everywhere; enforced as `tradeMask`.
