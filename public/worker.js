@@ -22,16 +22,31 @@ self.onmessage = function(e) {
   const batch = 25;
   const results = [];
   let errCount = 0;
+  const errSamples = []; // first errors, shipped to the debug log
   // cache resampled bars + session masks per timeframe (built ONCE, reused by all combos)
-  // maskIn flattens outside session (intraday); maskCarry holds overnight
-  const cache = {};
+  // maskIn flattens outside session (intraday); maskCarry holds overnight.
+  // Single-TF cache only (grid runs TF-major, so memory stays bounded).
+  let tfCache = null;
   function getTF(tf){
-    if(!cache[tf]){
+    if(!tfCache || tfCache.tf !== tf){
       const d=E.resample(d1m, tf);
-      cache[tf]={d, maskIn:E.buildSessionMask(d, tradeOpts.sessionStart, tradeOpts.sessionEnd),
+      tfCache={tf, d, maskIn:E.buildSessionMask(d, tradeOpts.sessionStart, tradeOpts.sessionEnd),
         maskCarry:new Int8Array(d.c.length).fill(1)};
     }
-    return cache[tf];
+    return tfCache;
+  }
+  // SIGNAL CACHE: indicators for one (tf, indicator, params) set are computed
+  // ONCE and reused across all SL/TP/exit/carry variants (the expensive part).
+  // Grid arrives sorted TF-major with identical signals adjacent, so one live
+  // entry suffices — memory stays O(1).
+  let sigCache = { key: null, sig: null };
+  function getSig(cfg){
+    const k = cfg.timeframe + '|' + cfg.indicator + '|' + JSON.stringify(cfg.params);
+    if(sigCache.key !== k){
+      const dd = getTF(cfg.timeframe);
+      sigCache = { key: k, sig: E.buildSignals(dd.d, cfg) };
+    }
+    return sigCache.sig;
   }
   function testCfg(cfg, idx, refined){
     const eff = Object.assign({}, tradeOpts);
@@ -48,11 +63,12 @@ self.onmessage = function(e) {
     try {
       const dd = getTF(cfg.timeframe);
       eff.sessionMask = eff.carry ? dd.maskCarry : dd.maskIn;
-      const sig = E.buildSignals(dd.d, cfg);
+      const sig = getSig(cfg); // cached: computed once per (tf, indicator, params)
       const bt = E.backtest(dd.d, sig.pos, eff);
       return mk(bt.metrics);
     } catch(err){
       errCount++;
+      if(errSamples.length < 10) errSamples.push(cfg.indicator + ' ' + cfg.timeframe + 'm ' + JSON.stringify(cfg.params) + ' :: ' + String(err && err.message || err).slice(0, 160));
       return mk({netPnL:0,winRate:0,totalTrades:0,profitFactor:0,maxDD:0,sharpe:-99,sortino:-99,expectancy:0,finalCapital:tradeOpts.capital||100000,tradesPerDay:0,days:0}, String(err));
     }
   }
@@ -105,5 +121,5 @@ self.onmessage = function(e) {
   }
   const ranked = E.rankResults(results, objective);
   self.postMessage({ type:'done', done:total + refined, total: total + refined, top:ranked.slice(0, topN),
-    all:ranked.slice(0, topN), errCount:errCount, refined:refined, passes:pass });
+    all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass });
 };

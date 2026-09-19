@@ -283,6 +283,12 @@ const EXIT_LBL={fixed:'FIX',breakeven:'BE',atr:'ATR',ck:'CK'};
 
 // ---------- grid search ----------
 $('btnRun').onclick=runGrid;
+$('btnStop').onclick=()=>{
+  if(state.worker){try{state.worker.terminate();}catch(e){}state.worker=null;}
+  if(state._runReject){const r=state._runReject;state._runReject=null;r(new Error('stopped by user'));}
+  state.stopped=true;
+  state.runSeq=(state.runSeq||0)+1; // invalidates fallback loop + late worker messages
+};
 async function runGrid(){
   if(!state.data){showAlert('No market data — upload a 1-min CSV (sidebar ①) before running a search.');return;}
   const {sels}=getSelection();
@@ -296,10 +302,16 @@ async function runGrid(){
   const cap=+$('maxCombos').value||60000;
   if(grid.length>cap){ if(!confirm(`Grid = ${grid.length} combos > cap ${cap}. Truncate to first ${cap}?`))return; grid=grid.slice(0,cap); }
   if(!grid.length){showAlert('Empty grid — a parameter range produced zero values. Check min/max/step in ⑤.');return;}
+  // TF-major + signal-adjacent order: feeds the single-entry signal cache
+  // (indicators computed once per parameter set) and keeps progress linear.
+  grid.forEach(c=>{c._sk=c.timeframe+'|'+c.indicator+'|'+JSON.stringify(c.params);});
+  grid.sort((a,b)=>a._sk<b._sk?-1:1);
   const objective=$('objective').value, topN=+$('topN').value||500;
   const opts=tradeOpts();
   clearAlert();
   $('btnRun').disabled=true;
+  $('btnStop').classList.remove('hidden');
+  state.stopped=false;
   $('liveBadge').classList.remove('hidden');
   $('progBar').style.width='0%';
   $('progTxt').textContent=`0 / ${grid.length}`;
@@ -311,10 +323,18 @@ async function runGrid(){
   let lastRender=0;
   const onBatch=(done,total,top,current,stage,pass)=>{
     if(runSeq!==state.runSeq)return;
+    if(stage==='refine'&&!state._refineAt)state._refineAt=performance.now();
+    if(typeof done==='number')state._done=done;
     const pct=typeof done==='number'&&typeof total==='number'?(done/total*100).toFixed(1):'—';
     if(typeof done==='number'&&typeof total==='number')$('progBar').style.width=Math.min(100,done/total*100)+'%';
-    const perSec=(typeof done==='number'?done:0)/Math.max(0.5,(performance.now()-t0)/1000);
-    $('progTxt').textContent=`${done} / ${total}${stage==='refine'?` · 🔁 refine pass ${pass||''}`:''} (${pct}%) · ${perSec.toFixed(0)}/s · leaderboard streaming live ↓`;
+    const el=(performance.now()-t0)/1000;
+    const perSec=(typeof done==='number'?done:0)/Math.max(0.5,el);
+    let eta='';
+    if(stage!=='refine'&&typeof done==='number'&&typeof total==='number'&&done>5&&perSec>0){
+      const s=Math.round((total-done)/perSec);
+      eta=` · ETA ${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
+    }
+    $('progTxt').textContent=`${done} / ${total}${stage==='refine'?` · 🔁 refine pass ${pass||''}`:''} (${pct}%) · ${perSec.toFixed(0)}/s${eta} · live ↓`;
     if(current) $('nowRunning').textContent=`${stage==='refine'?'🔁 refining best:':'⚙ now running:'} ${current.indicator} ${current.timeframe}m · ${fmtParams(current.params)}${current.slPct!=null?` · SL ${current.slPct}% TP ${current.tpPct}%`:''}${current.exit?` · ${EXIT_LBL[current.exit]||current.exit}${current.carry?'+carry':''}`:''}`;
     if(state.runError) $('nowRunning').textContent+=` · ⚠ ${state.runError} combos errored`;
     state.board=top;
@@ -322,17 +342,25 @@ async function runGrid(){
     if(now-lastRender>700||done===total){lastRender=now;renderBoard();}
     if(top.length && !state.detail) selectRow(top[0], true); // populate charts with first live leader
   };
-  let top=[], refineInfo='';
+  let top=[], refineInfo='', errSamples=[], runMode='worker', stopped=false;
+  state._refineAt=null; state._done=0;
+  logLine(`run start: ${$('symbol').value||'?'} ${(state.data.t.length/1000).toFixed(0)}k bars ${new Date(state.data.t[0]).toLocaleDateString()}→${new Date(state.data.t[state.data.t.length-1]).toLocaleDateString()} objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length>1?'day+carry':(dims.carry[0]?'carry':'day')} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}`);
   try{
     const out=await runWithWorker(grid,opts,objective,topN,onBatch,paramSteps,risk);
     top=out.top; refineInfo=out.refined?` · 🔁 +${out.refined} refined (${out.passes} passes)`:'';
+    errSamples=out.errSamples||[];
     if(runSeq===state.runSeq) state.board=top;
   }catch(err){
+    if(state.stopped){ /* user stopped: skip fallback, finalize partial below */ }
+    else{
     console.warn('worker failed, fallback async',err);
+    logLine(`worker unavailable (${err&&err.message||err}) — main-thread fallback`);
     if(runSeq===state.runSeq) $('nowRunning').textContent=`⚠ worker unavailable (${err&&err.message||err}) — running on main thread…`;
+    runMode='fallback';
     try{
-      const out=await runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk);
+      const out=await runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk,runSeq);
       top=out.top; refineInfo=out.refined?` · 🔁 +${out.refined} refined (${out.passes} passes)`:'';
+      stopped=!!out.stopped;
       if(runSeq===state.runSeq) state.board=top;
     }catch(err2){
       console.error(err2);
@@ -340,15 +368,31 @@ async function runGrid(){
         $('progTxt').textContent=`❌ ERROR: ${(err2&&err2.message)||err2}`;
         $('nowRunning').textContent='Open DevTools console (F12) for the stack trace.';
         showAlert(`Grid search failed: ${(err2&&err2.message)||err2} — see console (F12). Your data and settings are untouched.`);
+        logLine(`run ERROR: ${(err2&&err2.message)||err2}`);
         $('liveBadge').classList.add('hidden');
         $('btnRun').disabled=false;
+        $('btnStop').classList.add('hidden');
+        state.worker=null;
       }
       return;
     }
+    }
   }
-  if(runSeq!==state.runSeq) return; // superseded by a newer run
-  $('progTxt').textContent=`done · ${grid.length} combos in ${((performance.now()-t0)/1000).toFixed(1)}s${refineInfo}${state.runError?` · ⚠ ${state.runError} errored`:''}`;
-  logLine(`grid done: ${grid.length} combos in ${((performance.now()-t0)/1000).toFixed(1)}s${refineInfo} objective=${objective} errors=${state.runError||0}`);
+  if(state.stopped)stopped=true;
+  $('btnStop').classList.add('hidden');
+  state.worker=null;
+  if(runSeq!==state.runSeq&&!stopped) return; // superseded by a newer run
+  const tEnd=performance.now(), secs=((tEnd-t0)/1000);
+  const gridSecs=state._refineAt?((state._refineAt-t0)/1000):secs;
+  if(stopped){
+    $('progTxt').textContent=`■ stopped by user — partial board kept (${state.board.length} rows, ${state._done||0} combos tested)`;
+    logLine(`run STOPPED by user after ${secs.toFixed(1)}s (${state._done||0} combos) — partial board kept`);
+    showAlert(`Search stopped — showing partial results (${state.board.length} rows). Press RUN to restart clean.`);
+  } else {
+    $('progTxt').textContent=`done · ${grid.length} combos in ${secs.toFixed(1)}s${refineInfo}${state.runError?` · ⚠ ${state.runError} errored`:''}`;
+    logLine(`run done (${runMode}): ${grid.length} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${state._refineAt?` + refine ${(secs-gridSecs).toFixed(1)}s`:''}] ${(grid.length/Math.max(secs,0.01)).toFixed(0)}/s objective=${objective} errors=${state.runError||0}${refineInfo}`);
+    errSamples.forEach(e=>logLine(`  combo error: ${e}`));
+  }
   state.board.slice(0,3).forEach((r,i)=>logLine(`  #${i+1} ${r.timeframe}m ${r.indicator} ${fmtParams(r.params)} SL=${r.slPct} TP=${r.tpPct} ${EXIT_LBL[r.exit||'fixed']||''}${r.carry?'+C':''} WR=${r.m.winRate.toFixed(1)}% n=${r.m.totalTrades} pnl=${r.m.netPnL.toFixed(0)}`));
   $('nowRunning').textContent='';
   $('liveBadge').classList.add('hidden');
@@ -363,13 +407,14 @@ function runWithWorker(grid,opts,objective,topN,onBatch,paramSteps,risk){
     state.worker=w;
     const d=state.data;
     const payload={t:d.t,o:d.o,h:d.h,l:d.l,c:d.c,v:d.v};
-    const timer=setTimeout(()=>{try{w.terminate();}catch(e){}reject(new Error('worker timeout'));},1000*60*30);
+    const timer=setTimeout(()=>{try{w.terminate();}catch(e){}state._runReject=null;reject(new Error('worker timeout'));},1000*60*30);
+    state._runReject=reject;
     w.onmessage=e=>{
       const m=e.data;
       if(m.type==='progress'){ if(m.errCount) state.runError=m.errCount; onBatch(m.done,m.total,m.top,m.current,m.stage,m.pass); }
-      else if(m.type==='done'){clearTimeout(timer);w.terminate(); if(m.errCount) state.runError=m.errCount; resolve({top:m.top, refined:m.refined||0, passes:m.passes||0});}
+      else if(m.type==='done'){clearTimeout(timer);w.terminate();state._runReject=null; if(m.errCount) state.runError=m.errCount; resolve({top:m.top, refined:m.refined||0, passes:m.passes||0, errSamples:m.errSamples||[]});}
     };
-    w.onerror=e=>{clearTimeout(timer);try{w.terminate();}catch(_){}reject(e.message||e);};
+    w.onerror=e=>{clearTimeout(timer);try{w.terminate();}catch(_){}state._runReject=null;reject(e.message||e);};
     // structured-clone copies (originals stay intact for re-runs / charting)
     w.postMessage({type:'run',t:payload.t,o:payload.o,h:payload.h,l:payload.l,c:payload.c,v:payload.v,grid,tradeOpts:opts,objective,topN,
       paramSteps:paramSteps||{}, slStep:risk&&risk.sl?stepsOf(risk.sl):0, tpStep:risk&&risk.tp?stepsOf(risk.tp):0});
@@ -379,14 +424,16 @@ function stepsOf(arr){ // infer uniform step from an expanded value list
   if(!arr||arr.length<2)return 0;
   return Math.abs(arr[1]-arr[0]);
 }
-async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
-  const cache={}; const res=[];
+async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk,runSeq){
+  const res=[];
+  // single-TF cache + single-signal cache (grid is TF-major / signal-adjacent)
+  let tfCache=null, sigCache={key:null,sig:null};
   const getTF=tf=>{
-    if(!cache[tf]){
+    if(!tfCache||tfCache.tf!==tf){
       const d=E.resample(state.data,tf);
-      cache[tf]={d, maskIn:E.buildSessionMask(d, opts.sessionStart, opts.sessionEnd), maskCarry:new Int8Array(d.c.length).fill(1)};
+      tfCache={tf,d,maskIn:E.buildSessionMask(d, opts.sessionStart, opts.sessionEnd),maskCarry:new Int8Array(d.c.length).fill(1)};
     }
-    return cache[tf];
+    return tfCache;
   };
   function testCfg(cfg, idx, refined){
     const tfc=getTF(cfg.timeframe), d=tfc.d;
@@ -397,12 +444,21 @@ async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
     eff.exit=cfg.exit||'fixed'; eff.carry=!!cfg.carry;
     const xof=E.exitOptsFromParams(cfg.indicator,cfg.params||{});
     if(xof){eff.ckPeriod=xof.ckPeriod;eff.ckMult=xof.ckMult;}
-    const sig=E.buildSignals(d,cfg), bt=E.backtest(d,sig.pos,eff);
+    const sk=cfg.timeframe+'|'+cfg.indicator+'|'+JSON.stringify(cfg.params);
+    if(sigCache.key!==sk){sigCache={key:sk,sig:E.buildSignals(d,cfg)};}
+    const bt=E.backtest(d,sigCache.sig.pos,eff);
     return {i:idx,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:eff.slPct||0,tpPct:eff.tpPct||0,trailPct:eff.trailPct||0,exit:eff.exit,carry:eff.carry,refined:!!refined,m:bt.metrics};
   }
+  const partial=()=>({top:E.rankResults(res,objective).slice(0,topN),refined:0,passes:0,stopped:true});
   for(let i=0;i<grid.length;i++){
+    if(state.runSeq!==runSeq)return partial();
     const cfg=grid[i];
-    res.push(testCfg(cfg, i, false));
+    try{ res.push(testCfg(cfg, i, false)); }
+    catch(err){
+      state.runError=(state.runError||0)+1;
+      res.push({i,timeframe:cfg.timeframe,indicator:cfg.indicator,params:cfg.params,slPct:cfg.slPct||0,tpPct:cfg.tpPct||0,trailPct:0,exit:cfg.exit||'fixed',carry:!!cfg.carry,refined:false,
+        m:{netPnL:0,winRate:0,totalTrades:0,profitFactor:0,maxDD:0,sharpe:-99,sortino:-99,expectancy:0,finalCapital:opts.capital||100000,tradesPerDay:0,days:0},err:String(err&&err.message||err)});
+    }
     if(i%10===0||i===grid.length-1){ onBatch(i+1,grid.length,E.rankResults(res,objective).slice(0,topN),{indicator:cfg.indicator,timeframe:cfg.timeframe,params:cfg.params,slPct:cfg.slPct||opts.slPct||0,tpPct:cfg.tpPct||opts.tpPct||0},'grid'); await new Promise(r=>setTimeout(r,0)); }
   }
   // hill-climb refinement (mirrors worker stage 2)
@@ -412,6 +468,7 @@ async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
   let best=E.objectiveValue(pool[0].m,objective);
   let pass=0, refined=0, improved=true;
   while(improved&&pass<4){
+    if(state.runSeq!==runSeq)return {top:E.rankResults(res,objective).slice(0,topN),refined,passes:pass,stopped:true};
     improved=false;pass++;
     const cands=[];
     for(const row of pool){
@@ -423,7 +480,10 @@ async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
     }
     if(!cands.length)break;
     for(let j=0;j<cands.length;j++){
-      res.push(testCfg(cands[j],grid.length+refined,true));refined++;
+      if(state.runSeq!==runSeq)return {top:E.rankResults(res,objective).slice(0,topN),refined,passes:pass,stopped:true};
+      try{ res.push(testCfg(cands[j],grid.length+refined,true)); }
+      catch(err){ state.runError=(state.runError||0)+1; }
+      refined++;
       if(j%25===0||j===cands.length-1){
         onBatch(grid.length+refined,grid.length+'+refine',E.rankResults(res,objective).slice(0,topN),
           {indicator:cands[j].indicator,timeframe:cands[j].timeframe,params:cands[j].params,slPct:cands[j].slPct||0,tpPct:cands[j].tpPct||0},'refine',pass);
@@ -434,7 +494,7 @@ async function runAsync(grid,opts,objective,topN,onBatch,paramSteps,risk){
     const nowBest=E.objectiveValue(pool[0].m,objective);
     if(nowBest>best+1e-9){best=nowBest;improved=true;}
   }
-  return {top:E.rankResults(res,objective).slice(0,topN), refined, passes:pass};
+  return {top:E.rankResults(res,objective).slice(0,topN), refined, passes:pass, stopped:false};
 }
 
 // ---------- leaderboard ----------

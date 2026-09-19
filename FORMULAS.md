@@ -192,6 +192,19 @@ Flat (`0`) during indicator warmup; otherwise:
   (`99.99` if mean > 0 with no losing days, else `0`).
 - `Trades/Day = trades / distinct UTC calendar days in the tested bars`.
 
+## 7. Search (fast by construction)
+
+- **Signal cache**: indicators for one (timeframe, indicator, params) set are
+  computed ONCE and reused across all SL/TP/exit/carry variants (grid runs
+  TF-major with identical signals adjacent; single live entry, O(1) memory).
+  Bit-identical to per-combo computation (verified: 0 mismatches / 2000 metric
+  reads), ~3× faster and more on wide risk grids.
+- **Stop button**: terminates the worker, or aborts the fallback loop at the
+  next batch — the streamed partial board is kept and labelled
+  (`■ stopped … N combos tested`). Progress shows live rate + ETA.
+- **Debug log**: every run records settings snapshot, per-stage timings,
+  combos/sec, top-3, and the first combo errors; downloadable as `.txt`.
+
 ## 7. Search
 
 - **Stage 1 (grid)**: Cartesian product of timeframes × indicator params × SL × TP
