@@ -226,7 +226,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
       <div><label class="lbl">Stop-loss % <span class="text-zinc-500">(fallback)</span></label><input id="slPct" type="number" step="0.1" value="0.8" class="w-full mt-1 num"/></div>
       <div><label class="lbl">Target % <span class="text-zinc-500">(fallback)</span></label><input id="tpPct" type="number" step="0.1" value="1.6" class="w-full mt-1 num"/></div>
       <div><label class="lbl">Trailing %</label><input id="trailPct" type="number" step="0.1" value="0.5" class="w-full mt-1 num"/></div>
-      <div><label class="lbl">Cost / trade ₹</label><input id="costPer" type="number" step="1" value="20" class="w-full mt-1 num"/></div>
+      <div><label class="lbl">Cost / trade ₹ (0 = gross edge)</label><input id="costPer" type="number" step="1" value="0" class="w-full mt-1 num"/></div>
       <div><label class="lbl">Qty (× lot)</label><input id="qty" type="number" value="50" class="w-full mt-1 num"/></div>
       <div><label class="lbl">Lot size</label><input id="lotSize" type="number" value="1" class="w-full mt-1 num"/></div>
     </div>
