@@ -60,6 +60,10 @@ type State = {
   alert: string | null;
   _refineAt: number | null;
   _done: number;
+  regimeOn: boolean;
+  regimeSource: string;
+  wfOn: boolean;
+  wfSplit: number;
   detail: Detail;
   view: 'all' | 'best' | 'cmp';
   boardFilter: string;
@@ -105,6 +109,10 @@ export const useStore = create<State>((set) => ({
   alert: null,
   _refineAt: null,
   _done: 0,
+  regimeOn: true,
+  regimeSource: 'rules',
+  wfOn: false,
+  wfSplit: 70,
   detail: null,
   view: 'all',
   boardFilter: '',

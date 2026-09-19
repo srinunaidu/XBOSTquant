@@ -26,14 +26,26 @@ self.onmessage = function(e) {
   // cache resampled bars + session masks per timeframe (built ONCE, reused by all combos)
   // maskIn flattens outside session (intraday); maskCarry holds overnight.
   // Single-TF cache only (grid runs TF-major, so memory stays bounded).
+  // Also caches rule-regimes per TF; ML weights/preds train lazily once per TF.
   let tfCache = null;
+  const mlInfo = [];
   function getTF(tf){
     if(!tfCache || tfCache.tf !== tf){
       const d=E.resample(d1m, tf);
       tfCache={tf, d, maskIn:E.buildSessionMask(d, tradeOpts.sessionStart, tradeOpts.sessionEnd),
-        maskCarry:new Int8Array(d.c.length).fill(1)};
+        maskCarry:new Int8Array(d.c.length).fill(1), reg:E.regimeSeries(d, {}), ml:null};
     }
     return tfCache;
+  }
+  function getML(tf){
+    const tfc=getTF(tf);
+    if(!tfc.ml){
+      const t0=Date.now();
+      const r=E.trainRegimeML(tfc.d, 0.7, 15, 200);
+      tfc.ml={pred:r.pred, trainAcc:r.trainAcc};
+      mlInfo.push({tf, trainAcc:+r.trainAcc.toFixed(3), ms:Date.now()-t0});
+    }
+    return tfc.ml;
   }
   // SIGNAL CACHE: indicators for one (tf, indicator, params) set are computed
   // ONCE and reused across all SL/TP/exit/carry variants (the expensive part).
@@ -57,6 +69,11 @@ self.onmessage = function(e) {
     eff.carry = !!cfg.carry;
     const xo = E.exitOptsFromParams(cfg.indicator, cfg.params||{});
     if(xo){ eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
+    if(tradeOpts.regimeOn){
+      const dd0 = getTF(cfg.timeframe);
+      const regs = tradeOpts.regimeSource==='ml' ? getML(cfg.timeframe).pred : dd0.reg;
+      eff.tradeMask = E.regimeMask(Array.isArray(regs)?Int8Array.from(regs):regs, cfg.indicator);
+    }
     const mk = (m, err) => ({ i: idx, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
       slPct: eff.slPct||0, tpPct: eff.tpPct||0, trailPct: eff.trailPct||0,
       exit: eff.exit, carry: eff.carry, refined: !!refined, m: m, err: err });
@@ -121,5 +138,5 @@ self.onmessage = function(e) {
   }
   const ranked = E.rankResults(results, objective);
   self.postMessage({ type:'done', done:total + refined, total: total + refined, top:ranked.slice(0, topN),
-    all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass });
+    all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo });
 };

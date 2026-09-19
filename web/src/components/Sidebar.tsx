@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import engine from '../lib/engine';
 import { DEFAULT_RANGES, EXIT_LBL, IND_META, TFS } from '../lib/config';
+const TIERS_META: Record<string, string> = {};
+for (const m of IND_META) if (m.n && m.tier) TIERS_META[m.n] = m.tier;
 import { useStore } from '../lib/store';
 import { estimateCombos } from '../lib/runner';
 import { applyDateFilter, loadFile, loadRepoCSV } from '../lib/data';
@@ -93,11 +95,22 @@ export default function Sidebar() {
           <Num id="topN" label="Top-N board" value={st.topN} onChange={(v: number) => set({ topN: v || 500 })} />
           <Num id="cap" label="Max combos cap" value={st.cap} onChange={(v: number) => set({ cap: v || 60000 })} />
         </div>
+        <div className="flex items-center gap-2 mt-2">
+          <label className="flex items-center gap-2 text-[11px] text-zinc-300 cursor-pointer">
+            <input type="checkbox" checked={st.wfOn} onChange={() => set({ wfOn: !st.wfOn })} />
+            Walk-forward: verify top-200 on untouched tail</label>
+          {st.wfOn && (
+            <label className="flex items-center gap-1 text-[11px] text-zinc-400">IS
+              <input type="number" value={st.wfSplit} min={50} max={90} className="w-14 num"
+                onChange={e => set({ wfSplit: Math.min(90, Math.max(50, +e.target.value || 70)) })} />%</label>
+          )}
+        </div>
         <ComboEst />
         <RunProgress />
       </Section>
 
       <ExecSection />
+      <RegimeSection />
       <IndSection />
       <Section n="⑥ Fill model (anti-lookahead)">
         <label className="lbl">Signal fill timing</label>
@@ -223,6 +236,30 @@ function ExecSection() {
   );
 }
 
+function RegimeSection() {
+  const regimeOn = useStore(s => s.regimeOn);
+  const regimeSource = useStore(s => s.regimeSource);
+  const set = useStore(s => s.set);
+  return (
+    <section className="card p-3">
+      <div className="flex items-center gap-2 mb-2"><span className="w-[7px] h-[7px] rounded-full bg-emerald-400" /><div className="lbl">⑦ Market regime router</div></div>
+      <label className="flex items-center gap-2 text-[12px] font-semibold text-green-300 cursor-pointer">
+        <input type="checkbox" checked={regimeOn} onChange={() => set({ regimeOn: !regimeOn })} />
+        Route entries by regime (trend / range / high-vol)
+      </label>
+      <div className="flex gap-3 text-xs mt-1.5">
+        <label className="flex items-center gap-1"><input type="radio" checked={regimeSource === 'rules'} onChange={() => set({ regimeSource: 'rules' })} /> Rule regimes</label>
+        <label className="flex items-center gap-1"><input type="radio" checked={regimeSource === 'ml'} onChange={() => set({ regimeSource: 'ml' })} /> ML predicted ★</label>
+      </div>
+      <details className="mt-1.5 text-[11px] text-zinc-400">
+        <summary className="cursor-pointer text-zinc-500">routing table (indicator → regimes)</summary>
+        <div className="num mt-1">T+ trend-up · T− trend-down · RH range-high-vol · RL range-low-vol</div>
+        <div className="num mt-1">trend legs → T+/T− · mean-reversion → RH/RL · breakout → T/RH · gates → all</div>
+      </details>
+    </section>
+  );
+}
+
 function IndSection() {
   const inds = useStore(s => s.inds);
   const set = useStore(s => s.set);
@@ -232,11 +269,21 @@ function IndSection() {
     <section className="card p-3">
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-2"><span className="w-[7px] h-[7px] rounded-full bg-emerald-400" /><div className="lbl">⑤ Indicators A–Z + param ranges</div></div>
-        <button className="text-[10px] text-green-400 hover:underline" onClick={() => {
-          const cur = { ...useStore.getState().inds };
-          for (const k of Object.keys(cur)) cur[k] = { ...cur[k], on: true };
-          set({ inds: cur });
-        }}>select all</button>
+        <div className="flex gap-1 items-center">
+          {[['A', 'Tier A only'], ['B', 'Tier B only'], ['C', 'Tier C only']].map(([t, l]) => (
+            <button key={t} title={l} className="text-[10px] px-1.5 py-0.5 rounded border border-zinc-700 text-zinc-300 hover:border-green-400"
+              onClick={() => {
+                const cur = { ...useStore.getState().inds };
+                for (const k of Object.keys(cur)) cur[k] = { ...cur[k], on: (TIERS_META[k] || 'B') === t };
+                set({ inds: cur });
+              }}>{t}</button>
+          ))}
+          <button className="text-[10px] text-green-400 hover:underline px-1" onClick={() => {
+            const cur = { ...useStore.getState().inds };
+            for (const k of Object.keys(cur)) cur[k] = { ...cur[k], on: true };
+            set({ inds: cur });
+          }}>all</button>
+        </div>
       </div>
       <div className="space-y-2">
         {IND_META.map((m, ix) => {
@@ -246,8 +293,11 @@ function IndSection() {
           return (
             <div key={m.n} className={`ind-card${st.on ? ' on' : ''}`}>
               <label className="flex items-center gap-2 text-[13px] font-semibold cursor-pointer">
-                <input type="checkbox" checked={st.on} onChange={() => upd(m.n!, { on: !st.on })} /> {m.n}
-                <span className="text-[10px] text-zinc-500 font-normal">{m.d}</span>
+                <input type="checkbox" checked={st.on} onChange={() => upd(m.n!, { on: !st.on })} />
+                <span className="text-[10px] font-bold px-1 rounded" style={{
+                  color: m.tier === 'A' ? '#22ff88' : m.tier === 'B' ? '#fbbf24' : '#8b8b96',
+                  border: '1px solid currentColor', opacity: 0.9 }}> {m.tier} </span>
+                {m.n} <span className="text-[10px] text-zinc-500 font-normal">{m.d}</span>
               </label>
               {schema.length ? (
                 <div className="param-grid">

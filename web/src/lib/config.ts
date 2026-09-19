@@ -1,28 +1,29 @@
 // Indicator catalogue + default search ranges (mirrors the classic terminal).
-export type IndMeta = { cat?: string; n?: string; d?: string; on?: boolean };
+export type IndMeta = { cat?: string; n?: string; d?: string; on?: boolean; tier?: string };
+export const TIERS = ['A', 'B', 'C'] as const;
 
 export const IND_META: IndMeta[] = [
   { cat: 'A · Classic trend, momentum & volatility' },
-  { n: 'EMA', d: 'Trend · price vs EMA', on: true }, { n: 'SMA', d: 'Trend · price vs SMA', on: true },
-  { n: 'HMA', d: 'Hull MA trend', on: true }, { n: 'DEMA', d: 'Double EMA trend', on: true },
-  { n: 'Bollinger', d: 'Mean-reversion bands', on: true }, { n: 'Keltner', d: 'ATR channel breakout', on: true },
-  { n: 'RSI', d: 'Momentum oversold/overbought', on: true }, { n: 'MACD', d: 'MACD vs signal', on: true },
-  { n: 'VWAP', d: 'Intraday session VWAP', on: true }, { n: 'SuperTrend', d: 'ATR trailing trend', on: true },
-  { n: 'ADX', d: 'ADX strength + MA', on: true }, { n: 'Stochastic', d: '%K/%D stochastic', on: true },
-  { n: 'ChandeKroll', d: 'Chande-Kroll stops', on: true }, { n: 'POC', d: 'Volume Profile POC', on: true },
-  { n: 'KAMA', d: '★ Kaufman adaptive MA', on: true }, { n: 'Fisher', d: '★ Fisher Transform turns', on: true },
-  { n: 'Squeeze', d: '★ TTM squeeze release', on: true }, { n: 'CRSI', d: '★ Connors RSI mean-rev', on: true },
+  {tier: 'A', n: 'EMA', d: 'Trend · price vs EMA', on: true }, {tier: 'B', n: 'SMA', d: 'Trend · price vs SMA', on: false },
+  {tier: 'B', n: 'HMA', d: 'Hull MA trend', on: false }, {tier: 'B', n: 'DEMA', d: 'Double EMA trend', on: false },
+  {tier: 'A', n: 'Bollinger', d: 'Mean-reversion bands', on: true }, {tier: 'B', n: 'Keltner', d: 'ATR channel breakout', on: false },
+  {tier: 'A', n: 'RSI', d: 'Momentum oversold/overbought', on: true }, {tier: 'B', n: 'MACD', d: 'MACD vs signal', on: false },
+  {tier: 'B', n: 'VWAP', d: 'Intraday session VWAP', on: false }, {tier: 'A', n: 'SuperTrend', d: 'ATR trailing trend', on: true },
+  {tier: 'B', n: 'ADX', d: 'ADX strength + MA', on: false }, {tier: 'A', n: 'Stochastic', d: '%K/%D stochastic', on: true },
+  {tier: 'C', n: 'ChandeKroll', d: 'Chande-Kroll stops', on: false }, {tier: 'B', n: 'POC', d: 'Volume Profile POC', on: false },
+  {tier: 'A', n: 'KAMA', d: '★ Kaufman adaptive MA', on: true }, {tier: 'C', n: 'Fisher', d: '★ Fisher Transform turns', on: false },
+  {tier: 'A', n: 'Squeeze', d: '★ TTM squeeze release', on: true }, {tier: 'B', n: 'CRSI', d: '★ Connors RSI mean-rev', on: false },
   { cat: 'B · Institutional Order Flow & Smart Money' },
-  { n: 'VWAPBands', d: '★ VWAP ±1–3σ deviation bands', on: true }, { n: 'CVD', d: '★ Cumulative Volume Delta divergence', on: true },
-  { n: 'FVG', d: '★ Fair Value Gap / imbalance taps', on: true },
-  { n: 'Regime', d: '★ Choppiness gate for trend loops', on: true },
+  {tier: 'A', n: 'VWAPBands', d: '★ VWAP ±1–3σ deviation bands', on: true }, {tier: 'C', n: 'CVD', d: '★ Cumulative Volume Delta divergence', on: false },
+  {tier: 'C', n: 'FVG', d: '★ Fair Value Gap / imbalance taps', on: false },
+  {tier: 'C', n: 'Regime', d: '★ Choppiness gate for trend loops', on: false },
   { cat: 'C · Pure price/volume oscillators (new)' },
-  { n: 'Chop', d: '★ Choppiness consolidation filter', on: true }, { n: 'Cyber', d: '★ Ehlers cycle turning points', on: true },
-  { n: 'VWMA', d: '★ Volume-weighted MA trend', on: true }, { n: 'CMO', d: '★ Chande momentum exhaustion', on: true },
-  { n: 'Aroon', d: '★ Time-between-highs trend', on: true },
+  {tier: 'C', n: 'Chop', d: '★ Choppiness consolidation filter', on: false }, {tier: 'C', n: 'Cyber', d: '★ Ehlers cycle turning points', on: false },
+  {tier: 'C', n: 'VWMA', d: '★ Volume-weighted MA trend', on: false }, {tier: 'B', n: 'CMO', d: '★ Chande momentum exhaustion', on: false },
+  {tier: 'B', n: 'Aroon', d: '★ Time-between-highs trend', on: false },
   { cat: 'D · Combinatorial presets (multi-leg)' },
-  { n: 'SqueezeBreak', d: '★P Squeeze + volume + CK stops', on: true }, { n: 'TrendRegime', d: '★P Chop gate + ST + MACD', on: true },
-  { n: 'VWAPRev', d: '★P VWAP fade + CMO trigger', on: true },
+  {tier: 'A', n: 'SqueezeBreak', d: '★P Squeeze + volume + CK stops', on: true }, {tier: 'B', n: 'TrendRegime', d: '★P Chop gate + ST + MACD', on: false },
+  {tier: 'A', n: 'VWAPRev', d: '★P VWAP fade + CMO trigger', on: true },
 ];
 
 export const DEFAULT_RANGES: Record<string, Record<string, [number, number, number]>> = {

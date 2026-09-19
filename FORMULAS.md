@@ -231,7 +231,26 @@ Flat (`0`) during indicator warmup; otherwise:
    else. Volume is summed on resample; no open-interest, delivery, or
    quote-depth data is read or required.
 
-## 9. Built-in validation (🛠 Developer panel → Debug & Validate)
+## 9. Market regimes, router, ML classifier, walk-forward
+
+- **Regimes** (`regimeSeries`, OHLCV-only, causal): `0` trend-up / `1` trend-down
+  (ADX ≥ 20 + EMA20/50 slope) else `2` range-high-vol / `3` range-low-vol
+  (trailing 100-bar volatility rank ≥ 0.6). ~5 ms per 7k bars.
+- **Router** (`ROUTER` + `regimeMask`): trend legs trade only in 0/1,
+  mean-reversion only in 2/3, breakout in 0/1/2, gates everywhere. Enforced as
+  `tradeMask` inside `desiredTarget` and both entry branches — exits and
+  management are untouched. Toggleable; unlisted legs trade all regimes.
+- **ML classifier** (`trainRegimeML`): 10 scale-free causal features → softmax
+  (4 classes, zero-init deterministic, L2, strided ≤5k training rows) predicting
+  the dominant rule-regime over the next 15 bars. Train in-sample (70%),
+  apply everywhere. Typical: ~82% train accuracy in <100 ms/TF. Selected via
+  regime source rules/ml; per-TF accuracy logged.
+- **Walk-forward** (optional, default 70/30 by time): the grid searches only
+  the in-sample slice; the top-200 re-run on the untouched tail with identical
+  configs (incl. regime routing) and gain `oosNet/oosWR/oosN/survived`
+  (`survived = oosNet > 0`). Detail/compare views stay full-data.
+
+## 10. Built-in validation (🛠 Developer panel → Debug & Validate)
 
 Runs entirely on the LOADED live bars — zero synthetic data. Each run asserts:
 - **L1 integrity**: timestamps strictly ascending, no duplicates, all OHLC finite.

@@ -165,3 +165,33 @@ test('new indicators + presets run with warmup quarantine', () => {
     assert.ok(isFinite(bt.metrics.sharpe) && isFinite(bt.metrics.maxDD));
   }
 });
+
+test('regime engine: 4 regimes, router masks, tradeMask respected', () => {
+  const d = bars(300, i => { const c = 100 + 12 * Math.sin(i / 25) + i * 0.05; return [c, c + 0.4, c - 0.4, c, 3000]; });
+  const reg = E.regimeSeries(d, {});
+  assert.equal(reg.length, 300);
+  const seen = new Set(Array.from(reg));
+  assert.ok(seen.size >= 2, 'multiple regimes present');
+  const mEMA = E.regimeMask(reg, 'EMA');
+  const mBB = E.regimeMask(reg, 'Bollinger');
+  assert.ok(mEMA.some(v => v === 1) && mBB.some(v => v === 1));
+  assert.ok(mEMA.some((v, i) => v !== mBB[i]), 'router differentiates legs');
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 9 } });
+  const base = { direction: 'Both', slPct: 2, tpPct: 4, capital: 100000, qty: 10, lotSize: 1, cost: 0 };
+  const b0 = E.backtest(d, sig.pos, Object.assign({ sessionMask: new Int8Array(300).fill(1) }, base));
+  const b1 = E.backtest(d, sig.pos, Object.assign({ sessionMask: new Int8Array(300).fill(1), tradeMask: mEMA }, base));
+  assert.ok(b1.trades.length <= b0.trades.length);
+  const blocked = new Int8Array(300); // nothing allowed
+  const b2 = E.backtest(d, sig.pos, Object.assign({ sessionMask: new Int8Array(300).fill(1), tradeMask: blocked }, base));
+  assert.equal(b2.trades.length, 0);
+});
+
+test('ML regime classifier trains deterministically and predicts', () => {
+  const d = bars(600, i => { const c = 100 + 10 * Math.sin(i / 30) + (i % 200 < 100 ? i * 0.02 : -i * 0.01); return [c, c + 0.5, c - 0.5, c, 2000]; });
+  const a = E.trainRegimeML(d, 0.7, 15, 200);
+  const b = E.trainRegimeML(d, 0.7, 15, 200);
+  assert.deepEqual(a.W, b.W);
+  assert.ok(a.trainAcc > 0.4 && a.trainAcc <= 1, 'train acc sane: ' + a.trainAcc);
+  assert.equal(a.pred.length, 600);
+  assert.ok(a.pred.every(v => v >= 0 && v <= 3));
+});

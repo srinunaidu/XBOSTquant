@@ -30,6 +30,9 @@ function rowToObj(r: BoardRow, ix: number) {
     sl: (r.slPct || 0).toFixed(2), tp: (r.tpPct || 0).toFixed(2),
     pnl: m.netPnL, wr: m.winRate, n: m.totalTrades, tpd: m.tradesPerDay || 0,
     pf: m.profitFactor, dd: m.maxDD, sh: m.sharpe, so: m.sortino,
+    oos: r.oosNet == null ? null : r.oosNet,
+    oosWR: r.oosWR == null ? null : r.oosWR,
+    surv: r.survived == null ? '' : r.survived ? '✓' : '✗',
     _r: r,
   };
 }
@@ -51,6 +54,19 @@ const COLS = [
   { field: 'dd', headerName: 'MaxDD %', width: 92, type: 'rightAligned', valueFormatter: (p: any) => (+p.value).toFixed(2), cellStyle: { color: '#fb4d6d' } },
   { field: 'sharpe', headerName: 'Sharpe', width: 82, type: 'rightAligned', valueFormatter: (p: any) => (+p.value).toFixed(2) },
   { field: 'so', headerName: 'Sortino', width: 82, type: 'rightAligned', valueFormatter: (p: any) => (+p.value).toFixed(2) },
+  {
+    field: 'oos', headerName: 'OOS Net ₹', width: 110, type: 'rightAligned',
+    valueFormatter: (p: any) => (p.value == null ? '' : fmtMoney(p.value)),
+    cellStyle: (p: any) => (p.value == null ? {} : { color: p.value >= 0 ? '#22ff88' : '#fb4d6d' }),
+  },
+  {
+    field: 'oosWR', headerName: 'OOS WR%', width: 84, type: 'rightAligned',
+    valueFormatter: (p: any) => (p.value == null ? '' : (+p.value).toFixed(1)),
+  },
+  {
+    field: 'surv', headerName: 'Surv', width: 60,
+    cellStyle: (p: any) => ({ color: p.value === '✓' ? '#22ff88' : p.value === '✗' ? '#fb4d6d' : '#5b5b66' }),
+  },
 ];
 
 export default function Leaderboard() {

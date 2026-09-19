@@ -320,6 +320,10 @@ function pocSeries(d,lookback){
   const n=d.c.length,out=new Float64Array(n).fill(NaN);
   for(let i=0;i<n;i++){
     const s=Math.max(0,i-lookback+1);
+    // volume-less windows carry no information -> NaN (never a fake POC)
+    let wv=0;
+    for(let j=s;j<=i;j++)wv+=d.v[j]||0;
+    if(wv<=0){out[i]=NaN;continue;}
     // 24 bins over window range
     let mn=Infinity,mx=-Infinity;
     for(let j=s;j<=i;j++){if(d.l[j]<mn)mn=d.l[j];if(d.h[j]>mx)mx=d.h[j];}
@@ -690,11 +694,14 @@ function buildSignals(d, cfg){
     const sq=ttmSqueeze(d.h,d.l,d.c,per,P.bbMult||2,per,P.kcMult||1.5);
     const vb=sma(d.v,20);
     const vm=P.volMult||2;
+    // volume-less files: total session volume is 0 -> bypass the spike gate (pure squeeze)
+    let noVol=true;
+    for(let i=0;i<n;i++)if(d.v[i]>0){noVol=false;break;}
     osc={sqzMom:sq.mom};
     let dir=0;
     for(let i=0;i<n;i++){
       if(isNaN(sq.mom[i])||isNaN(vb[i]))continue;
-      if(sq.fire[i]&&d.v[i]>vm*vb[i])dir=sq.mom[i]>0?1:-1;
+      if(sq.fire[i]&&(noVol||d.v[i]>vm*vb[i]))dir=sq.mom[i]>0?1:-1;
       pos[i]=dir;
     }
   } else if(ind==='TrendRegime'){
@@ -733,6 +740,131 @@ function exitOptsFromParams(indicator, params){
   return null;
 }
 
+// ---------- market regimes (unsupervised, OHLCV only) ----------
+// 0 = trend-up, 1 = trend-down, 2 = range-high-vol, 3 = range-low-vol
+function regimeSeries(d, o){
+  o=o||{};
+  const chopP=Math.max(5,Math.round(o.chopPeriod||14));
+  const adxGate=o.adxGate!=null?o.adxGate:20;
+  const volGate=o.volGate!=null?o.volGate:0.6;
+  const n=d.c.length, out=new Int8Array(n);
+  const ch=choppiness(d.h,d.l,d.c,chopP);
+  const ax=adx(d.h,d.l,d.c,14);
+  const at=atr(d.h,d.l,d.c,14);
+  const ef=ema(d.c,20), es=ema(d.c,50);
+  const vp=new Float64Array(n);
+  for(let i=0;i<n;i++)vp[i]=d.c[i]>0?at[i]/d.c[i]:0;
+  for(let i=0;i<n;i++){
+    if(isNaN(ch[i])||isNaN(ax[i])||isNaN(vp[i])){out[i]=3;continue;}
+    // trailing volatility rank over 100 bars (causal)
+    const s=Math.max(0,i-100);
+    let below=0,cnt=0;
+    for(let j=s;j<i;j++){cnt++;if(vp[j]<vp[i])below++;}
+    const vr=cnt>0?below/cnt:0.5;
+    const trending=ax[i]>=adxGate;
+    const up=ef[i]>=es[i];
+    out[i]=trending?(up?0:1):(vr>=volGate?2:3);
+  }
+  return out;
+}
+// Router: which regimes each leg may trade. Unlisted legs trade everywhere.
+const ROUTER={
+  EMA:[0,1],SMA:[0,1],HMA:[0,1],DEMA:[0,1],KAMA:[0,1],MACD:[0,1],SuperTrend:[0,1],
+  ADX:[0,1],Aroon:[0,1],VWMA:[0,1],TrendRegime:[0,1],CVD:[0,1,2],
+  Bollinger:[2,3],RSI:[2,3],Stochastic:[2,3],CRSI:[2,3],CMO:[2,3],Fisher:[2,3],
+  VWAP:[2,3],VWAPBands:[2,3],VWAPRev:[2,3],
+  Keltner:[0,1,2],Squeeze:[0,1,2],SqueezeBreak:[0,1,2],ChandeKroll:[0,1,2],
+  POC:[2,3],FVG:[2,3],Cyber:[2,3],
+  Chop:[0,1,2,3],Regime:[0,1,2,3]
+};
+function regimeMask(regimes, indicator){
+  const allow=ROUTER[indicator];
+  const n=regimes.length, out=new Int8Array(n);
+  if(!allow){out.fill(1);return out;}
+  for(let i=0;i<n;i++)out[i]=allow.indexOf(regimes[i])>=0?1:0;
+  return out;
+}
+
+// ---------- ML regime classifier (multinomial softmax, deterministic) ----------
+// Features are scale-free and causal (no rolling fits). Target = dominant
+// rule-regime over the NEXT K bars. Train in-sample, apply everywhere.
+function regimeFeatures(d){
+  const n=d.c.length;
+  const ch=choppiness(d.h,d.l,d.c,14), ax=adx(d.h,d.l,d.c,14);
+  const at=atr(d.h,d.l,d.c,14);
+  const bb=bollinger(d.c,20,2), mc=macd(d.c,12,26,9), ef=ema(d.c,20), es=ema(d.c,50);
+  const rs=rsi(d.c,14), vsma=sma(d.v,50);
+  const F=10, X=new Float64Array(n*F);
+  for(let i=0;i<n;i++){
+    const a=at[i]||1e-9, c=d.c[i]||1;
+    const bw=(isNaN(bb.up[i])||bb.mid[i]===0)?0:(bb.up[i]-bb.lo[i])/Math.abs(bb.mid[i]);
+    const f=[
+      (isNaN(ch[i])?62:ch[i])/100, (isNaN(ax[i])?20:ax[i])/100,
+      Math.min(2,bw*10), Math.min(0.05,a/c)*20,
+      (isNaN(rs[i])?50:rs[i])/100,
+      (isNaN(mc.hist[i])?0:mc.hist[i])/a,
+      (!isNaN(ef[i])&&!isNaN(es[i]))?(ef[i]-es[i])/a:0,
+      vsma[i]>0?Math.min(3,(d.v[i]||0)/vsma[i]):1,
+      0.5, 0
+    ];
+    const dt=new Date(d.t[i]);
+    f[8]=((dt.getHours()*60+dt.getMinutes())-555)/375; // minutes since 09:15 / session
+    for(let k=0;k<F;k++)X[i*F+k]=(k===F-1)?1:(isFinite(f[k])?f[k]:0);
+  }
+  return {X, n, p:F};
+}
+function trainSoftmax(X, y, n, p, C, iters, lr, l2){
+  const W=new Float64Array(C*p); // zeros: deterministic
+  const probs=new Float64Array(C);
+  for(let it=0;it<iters;it++){
+    const G=new Float64Array(C*p);
+    for(let i=0;i<n;i++){
+      let mx=-1e18;
+      for(let c=0;c<C;c++){let s=0;for(let k=0;k<p;k++)s+=W[c*p+k]*X[i*p+k];probs[c]=s;if(s>mx)mx=s;}
+      let den=0;for(let c=0;c<C;c++){probs[c]=Math.exp(probs[c]-mx);den+=probs[c];}
+      for(let c=0;c<C;c++){
+        const pr=probs[c]/den, tgt=(y[i]===c)?1:0, err=pr-tgt;
+        for(let k=0;k<p;k++)G[c*p+k]+=err*X[i*p+k]/n;
+      }
+    }
+    for(let w=0;w<C*p;w++)W[w]-=lr*(G[w]+l2*W[w]);
+  }
+  return W;
+}
+function predictSoftmax(X, W, n, p, C){
+  const out=new Int8Array(n);
+  for(let i=0;i<n;i++){
+    let bc=0,bs=-1e18;
+    for(let c=0;c<C;c++){let s=0;for(let k=0;k<p;k++)s+=W[c*p+k]*X[i*p+k];if(s>bs){bs=s;bc=c;}}
+    out[i]=bc;
+  }
+  return out;
+}
+// Train on rows [0,isN), return weights + train accuracy + predictions for all rows.
+// Training subset is strided to ≤ maxTrain rows (speed); prediction covers all.
+function trainRegimeML(d, isFrac, K, iters, maxTrain){
+  K=K||15;iters=iters||200;maxTrain=maxTrain||5000;
+  const f=regimeFeatures(d);
+  const X=f.X,n=f.n,p=f.p;
+  const rule=regimeSeries(d,{});
+  const y=new Int8Array(n);
+  for(let i=0;i<n;i++){
+    const e=Math.min(n,i+K), cnt=[0,0,0,0];
+    for(let j=i;j<e;j++)cnt[rule[j]]++;
+    let b=0;for(let c=1;c<4;c++)if(cnt[c]>cnt[b])b=c;
+    y[i]=b;
+  }
+  const isN=Math.max(100,Math.floor(n*isFrac));
+  const stride=Math.max(1,Math.floor(isN/maxTrain));
+  const nS=Math.ceil(isN/stride);
+  const Xs=new Float64Array(nS*p), ys=new Int8Array(nS);
+  for(let s=0;s<nS;s++){const i=s*stride;ys[s]=y[i];for(let k=0;k<p;k++)Xs[s*p+k]=X[i*p+k];}
+  const W=trainSoftmax(Xs,ys,nS,p,4,iters,0.5,0.001);
+  const pred=predictSoftmax(X,W,n,p,4);
+  let hit=0;for(let i=0;i<isN;i++)if(pred[i]===y[i])hit++;
+  return {W:Array.from(W), p, trainAcc:isN?hit/isN:0, pred:Array.from(pred), n, stride};
+}
+
 // ---------- backtest ----------
 function timeToMin(s){const[a,b]=s.split(':').map(Number);return a*60+b;}
 
@@ -763,6 +895,7 @@ function backtest(d, sigPos, opts){
     if(s===1&&!allowLong)s=0;
     if(s===-1&&!allowShort)s=0;
     if(useMask&&!useMask[i])s=0; // intraday: force flat outside session; carry: hold overnight
+    if(tmask&&!tmask[i])s=0; // regime router: only trade in-regime bars
     return s;
   }
   let curQty=0;
@@ -779,6 +912,7 @@ function backtest(d, sigPos, opts){
   if(exitMode==='ck')ckArr=chandeKroll(d.h,d.l,d.c,Math.max(2,Math.round(opts.ckPeriod||10)),opts.ckMult||3);
   let hiEntry=0, loEntry=0, beDone=false;
   const useMask=opts.carry?null:mask; // carry overnight => ignore session flattening
+  const tmask=opts.tradeMask||null; // regime router: 1 = may trade this bar
   // Explicit fill timing (anti-lookahead): 'close' fills signal trades at the
   // signal bar's close; 'next' executes them at the NEXT bar's open. Resting
   // stop orders (SL/TP/trailing) always fill intrabar at their stop levels.
@@ -855,7 +989,7 @@ function backtest(d, sigPos, opts){
         // (no point burning 1M-bar loops for a dead parameter set).
         if(liveEq<=0){ruined=true;for(let j=i;j<n;j++)eqMtm[j]=liveEq;lastExitBar=i;break;}
         // immediate re-entry on flip (mask already enforced via tgt)
-        if(!trigOnly&&flip&&(!useMask||useMask[i])&&!ruined){
+        if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined){
           position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;
           hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
         }
@@ -865,7 +999,7 @@ function backtest(d, sigPos, opts){
       }
     } else {
       const allowEntry=!trigOnly||(edge&&i>lastExitBar);
-      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&!ruined&&allowEntry){
+      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry){
         position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;
         hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
       }
@@ -1069,7 +1203,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

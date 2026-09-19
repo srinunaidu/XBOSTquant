@@ -107,7 +107,13 @@ volume sub-charts → equity + underwater drawdown (MTM) → trade log (red edge
 exited inside the max-DD window; DD window times in the equity title) →
 CSV exports (board + per-strategy trades with IST timestamps).
 
-## 6. Indicator catalogue (30, all grid-searched)
+## 6. Indicator catalogue (30, all grid-searched, Tier A default)
+
+Tiers (recomputable from Best-per-indicator; defaults: A on, B/C tick-to-run):
+**A** — EMA, Bollinger, RSI, SuperTrend, VWAPBands, Squeeze, Stochastic, KAMA,
+SqueezeBreak, VWAPRev. **B** — SMA, HMA, DEMA, MACD, Keltner, ADX, VWAP, CRSI,
+CMO, Aroon, TrendRegime, POC. **C** — ChandeKroll, Fisher, CVD, FVG, Regime,
+Chop, Cyber, VWMA.
 
 Classic: EMA, SMA, HMA, DEMA, Bollinger, Keltner, RSI, MACD, VWAP, SuperTrend,
 ADX, Stochastic, Chande-Kroll, POC. Proprietary-style (★): KAMA, Fisher
@@ -136,7 +142,16 @@ peak→trough attribution), Sharpe / Sortino (daily strategy returns over
 *starting* capital — immune to negative-equity artefacts), Expectancy,
 final capital, gross ±. Board also shows SL %, TP %, Exit mode, Session.
 
-## 9. Search engine
+## 9. Search engine (+ regimes, ML, walk-forward)
+
+- Regime routing (toggle, default ON): entries only on in-regime bars per the
+  router table (rules or ML-predicted source); exits unchanged. Per-regime
+  split (trades/WR/net) shown for the selected strategy.
+- ML regime classifier: softmax on 10 causal features, trained in-sample,
+  applied everywhere; per-timeframe train accuracy in the session log.
+- Walk-forward (optional): grid on in-sample slice, top-200 verified on the
+  untouched tail → `oosNet/oosWR/survived` columns + export.
+
 
 - **Stage 1**: exhaustive Cartesian product
   timeframes × params × SL × TP × exit-mode (fixed/breakeven/ATR/CK)

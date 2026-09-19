@@ -4,6 +4,7 @@ import { EXIT_LBL } from '../lib/config';
 import { fmtMoney, fmtT } from '../lib/format';
 import KpiStrip from './KpiStrip';
 import Leaderboard from './Leaderboard';
+import RegimeSplit from './RegimeSplit';
 import { DrawdownPanel, EquityPanel, OscPanel, PriceChart, VolPanel } from './ChartPanels';
 import TradeLog from './TradeLog';
 
@@ -19,6 +20,7 @@ export default function MainView() {
     <main className="flex-1 min-w-0 p-3 space-y-3">
       <KpiStrip />
       <Leaderboard />
+      {detail && <RegimeSplit />}
       {detail ? (
         <>
           <section className="card p-3">

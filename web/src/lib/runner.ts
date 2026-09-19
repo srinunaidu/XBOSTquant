@@ -63,6 +63,7 @@ export function tradeOpts(): Record<string, any> {
     atrTrailPeriod: s.atrP, atrTrailMult: s.atrM,
     ckPeriod: s.ckP, ckMult: s.ckM,
     fill: s.fill, entry: s.entry,
+    regimeOn: s.regimeOn, regimeSource: s.regimeSource,
   };
 }
 
@@ -91,14 +92,14 @@ export function stopRun() {
   useStore.getState().runSeq = seq;
 }
 
-function runWithWorker(grid: any[], opts: any, objective: string, topN: number,
+function runWithWorker(grid: any[], gData: OHLCV, opts: any, objective: string, topN: number,
   onBatch: (done: number, total: number | string, top: BoardRow[], cur: any, stage: string, pass: number) => void,
-  paramSteps: any, risk: any): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[] }> {
+  paramSteps: any, risk: any): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[] }> {
   return new Promise((resolve, reject) => {
     let w: Worker;
     try { w = new Worker('/worker.js'); } catch (e) { return reject(e); }
     worker = w;
-    const d = useStore.getState().data as OHLCV;
+    const d = gData;
     const timer = window.setTimeout(() => { try { w.terminate(); } catch { /* noop */ } rejecter = null; reject(new Error('worker timeout')); }, 1000 * 60 * 30);
     rejecter = reject;
     w.onmessage = (e: MessageEvent) => {
@@ -106,7 +107,7 @@ function runWithWorker(grid: any[], opts: any, objective: string, topN: number,
       if (m.type === 'progress') onBatch(m.done, m.total, m.top, m.current, m.stage, m.pass);
       else if (m.type === 'done') {
         clearTimeout(timer); w.terminate(); worker = null; rejecter = null;
-        resolve({ top: m.top, refined: m.refined || 0, passes: m.passes || 0, errSamples: m.errSamples || [] });
+        resolve({ top: m.top, refined: m.refined || 0, passes: m.passes || 0, errSamples: m.errSamples || [], ml: m.ml || [] });
       }
     };
     (w as any).onerror = (e: any) => { clearTimeout(timer); try { w.terminate(); } catch { /* noop */ } worker = null; rejecter = null; reject(e.message || e); };
@@ -121,9 +122,8 @@ function runWithWorker(grid: any[], opts: any, objective: string, topN: number,
 
 async function runAsync(grid: any[], opts: any, objective: string, topN: number,
   onBatch: (done: number, total: number | string, top: BoardRow[], cur: any, stage: string, pass: number) => void,
-  paramSteps: any, risk: any, mySeq: number) {
-  const st0 = useStore.getState();
-  const data = st0.data as OHLCV;
+  paramSteps: any, risk: any, mySeq: number, dataSrc?: OHLCV) {
+  const data = (dataSrc || useStore.getState().data) as OHLCV;
   let tfCache: any = null, sigCache: any = { key: null, sig: null };
   const res: BoardRow[] = [];
   const getTF = (tf: number) => {
@@ -135,6 +135,10 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
   };
   const testCfg = (cfg: any, idx: number, refined: boolean): BoardRow => {
     const tfc = getTF(cfg.timeframe), d = tfc.d;
+    if (opts.regimeOn && !tfc.reg) tfc.reg = engine.regimeSeries(d, {});
+    if (opts.regimeOn && opts.regimeSource === 'ml' && !tfc.mlPred) {
+      tfc.mlPred = Int8Array.from(engine.trainRegimeML(d, 0.7, 15, 200).pred);
+    }
     const eff: any = Object.assign({}, opts, { sessionMask: cfg.carry ? tfc.maskCarry : tfc.maskIn });
     if (cfg.slPct != null) eff.slPct = cfg.slPct;
     if (cfg.tpPct != null) eff.tpPct = cfg.tpPct;
@@ -142,6 +146,7 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
     eff.exit = cfg.exit || 'fixed'; eff.carry = !!cfg.carry;
     const xof = engine.exitOptsFromParams(cfg.indicator, cfg.params || {});
     if (xof) { eff.ckPeriod = xof.ckPeriod; eff.ckMult = xof.ckMult; }
+    if (opts.regimeOn) eff.tradeMask = engine.regimeMask(opts.regimeSource === 'ml' ? tfc.mlPred : tfc.reg, cfg.indicator);
     const sk = cfg.timeframe + '|' + cfg.indicator + '|' + JSON.stringify(cfg.params);
     if (sigCache.key !== sk) sigCache = { key: sk, sig: engine.buildSignals(d, cfg) };
     const bt = engine.backtest(d, sigCache.sig.pos, eff);
@@ -202,6 +207,54 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
   return { top: engine.rankResults(res, objective).slice(0, topN), refined, passes: pass, stopped: false };
 }
 
+// Walk-forward verify: re-run top rows on the untouched OOS tail (same config,
+// same regime routing). Rows gain oosNet/oosWR/oosN/survived. Cheap: ≤200 runs.
+export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
+  const st = useStore.getState();
+  const data = st.data!;
+  const splitT = data.t[0] + (st.wfSplit / 100) * (data.t[data.t.length - 1] - data.t[0]);
+  let si = 0;
+  while (si < data.t.length && data.t[si] < splitT) si++;
+  const pick = (a: Float64Array) => a.slice(si);
+  const oos = { t: pick(data.t), o: pick(data.o), h: pick(data.h), l: pick(data.l), c: pick(data.c), v: pick(data.v) };
+  if (oos.t.length < 50) return 'OOS slice too thin, skipped';
+  const tfCache: Record<number, any> = {};
+  const getTF = (tf: number) => {
+    if (!tfCache[tf]) {
+      const d = engine.resample(oos as any, tf);
+      tfCache[tf] = { d, maskIn: engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd), maskCarry: new Int8Array(d.c.length).fill(1), reg: null as any, ml: null as any };
+    }
+    return tfCache[tf];
+  };
+  const cands = rows.slice(0, 200);
+  for (let k = 0; k < cands.length; k++) {
+    if (useStore.getState().runSeq !== mySeq) return 'aborted';
+    const r = cands[k];
+    const tfc = getTF(r.timeframe);
+    const eff: any = Object.assign({}, opts, {
+      sessionMask: r.carry ? tfc.maskCarry : tfc.maskIn,
+      slPct: r.slPct, tpPct: r.tpPct, trailPct: r.trailPct ?? opts.trailPct,
+      exit: r.exit || 'fixed', carry: !!r.carry,
+    });
+    const xo = engine.exitOptsFromParams(r.indicator, r.params || {});
+    if (xo) { eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
+    if (opts.regimeOn) {
+      if (!tfc.reg) tfc.reg = engine.regimeSeries(tfc.d, {});
+      const regs = opts.regimeSource === 'ml'
+        ? (tfc.ml || (tfc.ml = Int8Array.from(engine.trainRegimeML(tfc.d, 0.7, 15, 200).pred)))
+        : tfc.reg;
+      eff.tradeMask = engine.regimeMask(regs, r.indicator);
+    }
+    const sig = engine.buildSignals(tfc.d, { indicator: r.indicator, params: r.params });
+    const bt = engine.backtest(tfc.d, sig.pos, eff);
+    r.oosNet = bt.metrics.netPnL; r.oosWR = bt.metrics.winRate; r.oosN = bt.metrics.totalTrades;
+    r.survived = bt.metrics.netPnL > 0;
+    if (k % 25 === 0) await new Promise(rr => setTimeout(rr, 0));
+  }
+  const surv = cands.filter(r => r.survived).length;
+  return `WF ${st.wfSplit}/${100 - st.wfSplit}: ${surv}/${cands.length} survived OOS`;
+}
+
 export async function runGrid() {
   const st = useStore.getState();
   if (!st.data) { st.set({ alert: 'No market data — upload a 1-min CSV before running a search.' }); return; }
@@ -220,6 +273,19 @@ export async function runGrid() {
   if (!grid.length) { st.set({ alert: 'Empty grid — check parameter ranges.' }); return; }
   const objective = st.objective, topN = st.topN;
   const opts = tradeOpts();
+  // Walk-forward: grid searches the in-sample slice; top rows verify on the
+  // untouched out-of-sample tail. Detail/compare views stay full-data.
+  let gData = st.data!;
+  let wfNote = '';
+  if (st.wfOn && st.data!.t.length > 200) {
+    const d0 = st.data!.t[0], d1 = st.data!.t[st.data!.t.length - 1];
+    const cut = d0 + (st.wfSplit / 100) * (d1 - d0);
+    let si = 0;
+    while (si < st.data!.t.length && st.data!.t[si] < cut) si++;
+    const pk = (a: Float64Array) => a.slice(0, si);
+    gData = { t: pk(st.data!.t), o: pk(st.data!.o), h: pk(st.data!.h), l: pk(st.data!.l), c: pk(st.data!.c), v: pk(st.data!.v) };
+    wfNote = ` WF ${st.wfSplit}/${100 - st.wfSplit}`;
+  }
   const mySeq = seq + 1; seq = mySeq;
   st.runSeq = mySeq;
   st.set({ alert: null });
@@ -227,7 +293,7 @@ export async function runGrid() {
   let lastRender = 0;
   const setRun = (p: Partial<typeof st.run>) => useStore.getState().set({ run: { ...useStore.getState().run, ...p } });
   setRun({ running: true, done: 0, total: grid.length, stage: 'grid', pass: 0, perSec: 0, eta: '', current: 'warming up…', errCount: 0, refined: 0, passes: 0, summary: `0 / ${grid.length}` });
-  logLine(`run start: ${st.symbol || '?'} ${(st.data.t.length / 1000).toFixed(0)}k bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}`);
+  logLine(`run start: ${st.symbol || '?'} ${(st.data.t.length / 1000).toFixed(0)}k bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource : 'off'}${wfNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}`);
   const onBatch = (done: number, total: number | string, top: BoardRow[], current: any, stage: string, pass: number) => {
     if (useStore.getState().runSeq !== mySeq) return;
     if (stage === 'refine' && !useStore.getState()._refineAt) useStore.getState()._refineAt = performance.now();
@@ -248,12 +314,14 @@ export async function runGrid() {
     if (top.length && !s2.detail) selectRow(top[0], true);
   };
   let top: BoardRow[] = [], refineInfo = '', errSamples: any[] = [], runMode = 'worker', stopped = false;
+  let mlInfo: any[] = [];
   useStore.getState()._refineAt = null;
   try {
-    const out = await runWithWorker(grid, opts, objective, topN, onBatch, paramSteps, risk);
+    const out = await runWithWorker(grid, gData, opts, objective, topN, onBatch, paramSteps, risk);
     top = out.top;
     refineInfo = out.refined ? ` · 🔁 +${out.refined} refined (${out.passes} passes)` : '';
     errSamples = out.errSamples || [];
+    mlInfo = out.ml || [];
     if (useStore.getState().runSeq === mySeq) useStore.getState().set({ board: top });
   } catch (err: any) {
     if (useStore.getState().stoppedFlag) { /* fall through to stopped finalizer */ }
@@ -261,7 +329,7 @@ export async function runGrid() {
       logLine(`worker unavailable (${err?.message || err}) — main-thread fallback`);
       runMode = 'fallback';
       try {
-        const out = await runAsync(grid, opts, objective, topN, onBatch, paramSteps, risk, mySeq);
+        const out = await runAsync(grid, opts, objective, topN, onBatch, paramSteps, risk, mySeq, gData);
         top = out.top;
         refineInfo = out.refined ? ` · 🔁 +${out.refined} refined (${out.passes} passes)` : '';
         stopped = !!out.stopped;
@@ -288,8 +356,16 @@ export async function runGrid() {
     useStore.getState().set({ alert: `Search stopped — showing partial results (${b.length} rows).` });
   } else {
     const errs = useStore.getState().run.errCount;
-    setRun({ running: false, refined: 0, passes: 0, summary: `done · ${grid.length} combos in ${secs.toFixed(1)}s${refineInfo}${errs ? ` · ⚠ ${errs} errored` : ''}` });
-    logLine(`run done (${runMode}): ${grid.length} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${s3._refineAt ? ` + refine ${(secs - gridSecs).toFixed(1)}s` : ''}] ${(grid.length / Math.max(secs, 0.01)).toFixed(0)}/s objective=${objective} errors=${errs}${refineInfo}`);
+    mlInfo.forEach((m: any) => logLine(`  ML regime ${m.tf}m: train-acc ${(m.trainAcc * 100).toFixed(1)}% in ${m.ms}ms`));
+    let wfMsg = '';
+    if (st.wfOn && !stopped) {
+      setRun({ summary: `done · verifying top-200 out-of-sample…` });
+      wfMsg = await wfVerify(useStore.getState().board, opts, mySeq);
+      logLine(wfMsg);
+      useStore.getState().set({ board: useStore.getState().board });
+    }
+    setRun({ running: false, refined: 0, passes: 0, summary: `done · ${grid.length} combos in ${secs.toFixed(1)}s${refineInfo}${errs ? ` · ⚠ ${errs} errored` : ''}${wfMsg ? ` · ${wfMsg}` : ''}` });
+    logLine(`run done (${runMode}): ${grid.length} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${s3._refineAt ? ` + refine ${(secs - gridSecs).toFixed(1)}s` : ''}] ${(grid.length / Math.max(secs, 0.01)).toFixed(0)}/s objective=${objective} errors=${errs}${refineInfo}${wfMsg ? ' · ' + wfMsg : ''}`);
     errSamples.forEach((e: any) => logLine(`  combo error: ${e}`));
   }
   const bd = useStore.getState().board;
@@ -312,6 +388,12 @@ export function selectRow(r: BoardRow, auto?: boolean) {
   eff.exit = r.exit || 'fixed'; eff.carry = !!r.carry;
   const xod = engine.exitOptsFromParams(r.indicator, r.params || {});
   if (xod) { eff.ckPeriod = xod.ckPeriod; eff.ckMult = xod.ckMult; }
+  if (eff.regimeOn) {
+    const regs = eff.regimeSource === 'ml'
+      ? Int8Array.from(engine.trainRegimeML(d, 0.7, 15, 200).pred)
+      : engine.regimeSeries(d, {});
+    eff.tradeMask = engine.regimeMask(regs, r.indicator);
+  }
   eff.sessionMask = eff.carry ? new Int8Array(d.c.length).fill(1) : engine.buildSessionMask(d, eff.sessionStart, eff.sessionEnd);
   const bt = engine.backtest(d, sig.pos, eff);
   useStore.getState().set({ sel: r, detail: { cfg: r, data: d, sig, bt } });

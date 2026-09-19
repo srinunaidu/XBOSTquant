@@ -26,6 +26,7 @@ export type BoardRow = {
   i: number; timeframe: number; indicator: string; params: Record<string, number>;
   slPct: number; tpPct: number; trailPct: number;
   exit: string; carry: boolean; refined?: boolean; m: Metrics; err?: string;
+  oosNet?: number; oosWR?: number; oosN?: number; survived?: boolean;
 };
 
 export interface Engine {
@@ -46,6 +47,10 @@ export interface Engine {
   paramNeighbors(row: any, steps: any, riskSteps: any): any[];
   cfgKey(c: any): string;
   exitOptsFromParams(indicator: string, params: Record<string, number>): { ckPeriod: number; ckMult: number } | null;
+  regimeSeries(d: OHLCV, o?: Record<string, number>): Int8Array;
+  ROUTER: Record<string, number[]>;
+  regimeMask(regimes: Int8Array, indicator: string): Int8Array;
+  trainRegimeML(d: OHLCV, isFrac: number, K?: number, iters?: number, maxTrain?: number): { W: number[]; p: number; trainAcc: number; pred: number[]; n: number };
   SCHEMA: Record<string, { key: string; min: number; max: number; def: number }[]>;
 }
 

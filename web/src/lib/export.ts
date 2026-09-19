@@ -12,9 +12,9 @@ function dl(name: string, text: string) {
 export function exportBoard() {
   const st = useStore.getState();
   if (!st.board.length) { st.set({ alert: 'Nothing to export — run a grid search first.' }); return; }
-  let s = 'rank,timeframe,indicator,params,exit,carry,sl_pct,tp_pct,net_pnl,win_rate,trades,trades_per_day,profit_factor,max_dd,sharpe,sortino,expectancy\n';
+  let s = 'rank,timeframe,indicator,params,exit,carry,sl_pct,tp_pct,net_pnl,win_rate,trades,trades_per_day,profit_factor,max_dd,sharpe,sortino,expectancy,oos_net,oos_wr,oos_n,survived\n';
   st.board.forEach((r, i) => {
-    s += `${i + 1},${r.timeframe}m,${r.indicator},"${fmtParams(r.params)}",${r.exit || 'fixed'},${r.carry ? 1 : 0},${(r.slPct || 0).toFixed(3)},${(r.tpPct || 0).toFixed(3)},${r.m.netPnL.toFixed(2)},${r.m.winRate.toFixed(2)},${r.m.totalTrades},${(r.m.tradesPerDay || 0).toFixed(3)},${r.m.profitFactor.toFixed(3)},${r.m.maxDD.toFixed(3)},${r.m.sharpe.toFixed(3)},${r.m.sortino.toFixed(3)},${r.m.expectancy.toFixed(2)}\n`;
+    s += `${i + 1},${r.timeframe}m,${r.indicator},"${fmtParams(r.params)}",${r.exit || 'fixed'},${r.carry ? 1 : 0},${(r.slPct || 0).toFixed(3)},${(r.tpPct || 0).toFixed(3)},${r.m.netPnL.toFixed(2)},${r.m.winRate.toFixed(2)},${r.m.totalTrades},${(r.m.tradesPerDay || 0).toFixed(3)},${r.m.profitFactor.toFixed(3)},${r.m.maxDD.toFixed(3)},${r.m.sharpe.toFixed(3)},${r.m.sortino.toFixed(3)},${r.m.expectancy.toFixed(2)},${r.oosNet == null ? '' : r.oosNet.toFixed(2)},${r.oosWR == null ? '' : r.oosWR.toFixed(2)},${r.oosN == null ? '' : r.oosN},${r.survived == null ? '' : r.survived ? 1 : 0}\n`;
   });
   dl('xbost_leaderboard.csv', s);
 }
