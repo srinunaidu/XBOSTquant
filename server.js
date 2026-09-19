@@ -11,7 +11,9 @@ const fs = require('fs');
 const path = require('path');
 
 const PORT = process.env.PORT || 8901;
-const PUBLIC_DIR = path.join(__dirname, 'public');
+// Serve the React build when present, else fall back to the classic terminal.
+const DIST_DIR = path.join(__dirname, 'web', 'dist');
+const PUBLIC_DIR = fs.existsSync(path.join(DIST_DIR, 'index.html')) ? DIST_DIR : path.join(__dirname, 'public');
 const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'changeme';
@@ -137,12 +139,14 @@ app.patch('/api/users/:id', requireAdmin, (req, res) => {
 });
 
 // ---- gate: login page + APIs public, everything else needs a session ----
-const PUBLIC_PATHS = new Set(['/login.html']);
+const LEGACY = PUBLIC_DIR.endsWith('public');
+const PUBLIC_PATHS = new Set(LEGACY ? ['/login.html'] : []);
+const LOGIN_TARGET = LEGACY ? '/login.html' : '/#/login';
 app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
   if (PUBLIC_PATHS.has(req.path)) return next();
   if (req.session && req.session.user) return next();
-  if (req.path === '/' || req.path === '/index.html') return res.redirect('/login.html');
+  if (['/', '/index.html', '/login.html', '/users.html'].includes(req.path)) return res.redirect(LOGIN_TARGET);
   return res.status(401).json({ error: 'unauthorized' });
 });
 app.use(express.static(PUBLIC_DIR, { index: 'index.html', dotfiles: 'ignore' }));

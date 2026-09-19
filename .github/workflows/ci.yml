@@ -16,6 +16,9 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm test
+      - run: npm run typecheck -w web
+      - run: npm run test -w web
+      - run: npm run build -w web
 
   auth-smoke:
     runs-on: ubuntu-latest
@@ -33,15 +36,25 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - run: npm run build -w web
       - run: |
           node server.js & echo $! > server.pid
-          for i in $(seq 1 30); do curl -sf http://localhost:8901/login.html && break || sleep 1; done
-      - name: login page is public
-        run: curl -sf http://localhost:8901/login.html -o /dev/null
+          for i in $(seq 1 30); do curl -sf http://localhost:8901/ -o /dev/null && break || sleep 1; done
+      - name: login hash-route redirects when logged out
+        run: test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/login.html)" = "302"
       - name: terminal is guarded
         run: |
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/)" = "302"
           test "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:8901/engine.js)" = "401"
+      - name: react bundle + worker served after login
+        run: |
+          set -e
+          curl -sf -c jar -H 'Content-Type: application/json' \
+            -d '{"username":"admin","password":"ci-smoke-pass"}' \
+            http://localhost:8901/api/login -o /dev/null
+          curl -sf -b jar http://localhost:8901/ | grep -q 'id="root"'
+          curl -sf -b jar http://localhost:8901/engine.js -o /dev/null
+          curl -sf -b jar http://localhost:8901/worker.js -o /dev/null
       - name: login + use terminal + manage users
         run: |
           set -e

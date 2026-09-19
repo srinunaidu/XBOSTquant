@@ -1,0 +1,33 @@
+{
+  "name": "xbost-web",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "node scripts/sync-engine.js && vite",
+    "prebuild": "node scripts/sync-engine.js",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fontsource/geist-mono": "^5.2.0",
+    "@fontsource/geist-sans": "^5.2.0",
+    "ag-grid-community": "^33.3.0",
+    "ag-grid-react": "^33.3.0",
+    "lightweight-charts": "^4.2.3",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "zustand": "^5.0.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^4.4.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}

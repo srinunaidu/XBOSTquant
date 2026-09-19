@@ -15,6 +15,20 @@ First boot creates the admin user from `ADMIN_USER`/`ADMIN_PASS`.
 Data: place your 1-min CSV at `public/HDFCBANK_minute.csv`
 (`date,open,high,low,close,volume`) or upload it in the UI.
 
+## New React terminal (`web/`)
+
+Vite + React + AG Grid + lightweight-charts, served automatically when built
+(the classic terminal remains as fallback):
+
+```bash
+npm run dev:web     # dev server :5173 (proxies /api to :8901 — run npm start too)
+npm run build:web   # production build into web/dist
+npm run test:web    # vitest utils
+```
+
+The quant engine (`public/engine.js` + `worker.js`) is shared untouched —
+`web/scripts/sync-engine.js` copies it into the web build before every build.
+
 ## Manage users
 
 Log in as admin → **👥 Users** (header) or open `/users.html`:
