@@ -64,12 +64,49 @@ export function tradeOpts(): Record<string, any> {
     ckPeriod: s.ckP, ckMult: s.ckM,
     fill: s.fill, entry: s.entry,
     regimeOn: s.regimeOn, regimeSource: s.regimeSource,
+    granularity: s.granularity, confGate: (s.confGate ?? 60) / 100,
   };
 }
 
 function stepsOf(arr: number[]) {
   if (!arr || arr.length < 2) return 0;
   return Math.abs(arr[1] - arr[0]);
+}
+
+// Shared routing choke-point (mirrors worker tradeMaskFor): day-first with
+// confidence fallback, bar mode for Advanced. Notices fire once per TF.
+export function routingFor(cache: Record<number, any>, tf: number, d: any, cfg: any, opts: any) {
+  const notes: string[] = [];
+  if (!opts.regimeOn) return { mask: null as Int8Array | null, notices: notes };
+  const gate = opts.confGate ?? 0.6;
+  let c = cache[tf];
+  if (!c) c = cache[tf] = {};
+  if ((opts.granularity || 'day') === 'day') {
+    if (!c.dayRT) {
+      c.dayRT = engine.dayRouting(d, { source: opts.regimeSource, confGate: gate });
+      c.dayNoted = false;
+    }
+    const rt = c.dayRT;
+    if (!c.dayNoted) {
+      c.dayNoted = true;
+      rt.notices.forEach((n: string) => notes.push(`${tf}m: ${n}`));
+      if (rt.dayReg) {
+        let fbD = 0; const total = rt.dayReg.pred.length;
+        for (let s = 0; s < total; s++) if (rt.dayReg.pred[s] < 0 || (rt.dayReg.conf && rt.dayReg.conf[s] < gate)) fbD++;
+        notes.push(`${tf}m: ${fbD}/${total} fallback days (unrouted, counted)`);
+      }
+    }
+    if (!rt.dayReg) return { mask: null as Int8Array | null, notices: notes };
+    return { mask: engine.dayRegimeMask(d, rt.dayReg, cfg.indicator, gate).mask, notices: notes };
+  }
+  if (!c.reg) c.reg = engine.regimeSeries(d, {});
+  if (opts.regimeSource === 'ml' && !c.ml) {
+    const r = engine.trainRegimeML(d, 0.7, 15, 200);
+    c.ml = { pred: r.pred, acc: r.trainAcc };
+    notes.push(`${tf}m: bar-ML train-acc ${(100 * r.trainAcc).toFixed(1)}%`);
+  }
+  const regs = opts.regimeSource === 'ml' ? c.ml.pred : c.reg;
+  return { mask: engine.regimeMask(Array.isArray(regs) ? Int8Array.from(regs) : regs, cfg.indicator), notices: notes };
 }
 
 export function logLine(s: string) {
@@ -94,7 +131,7 @@ export function stopRun() {
 
 function runWithWorker(grid: any[], gData: OHLCV, opts: any, objective: string, topN: number,
   onBatch: (done: number, total: number | string, top: BoardRow[], cur: any, stage: string, pass: number) => void,
-  paramSteps: any, risk: any): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[] }> {
+  paramSteps: any, risk: any): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[]; route?: string[] }> {
   return new Promise((resolve, reject) => {
     let w: Worker;
     try { w = new Worker('/worker.js'); } catch (e) { return reject(e); }
@@ -107,7 +144,7 @@ function runWithWorker(grid: any[], gData: OHLCV, opts: any, objective: string, 
       if (m.type === 'progress') onBatch(m.done, m.total, m.top, m.current, m.stage, m.pass);
       else if (m.type === 'done') {
         clearTimeout(timer); w.terminate(); worker = null; rejecter = null;
-        resolve({ top: m.top, refined: m.refined || 0, passes: m.passes || 0, errSamples: m.errSamples || [], ml: m.ml || [] });
+        resolve({ top: m.top, refined: m.refined || 0, passes: m.passes || 0, errSamples: m.errSamples || [], ml: m.ml || [], route: m.route || [] });
       }
     };
     (w as any).onerror = (e: any) => { clearTimeout(timer); try { w.terminate(); } catch { /* noop */ } worker = null; rejecter = null; reject(e.message || e); };
@@ -133,12 +170,11 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
     }
     return tfCache;
   };
+  const routeCache: Record<number, any> = {};
   const testCfg = (cfg: any, idx: number, refined: boolean): BoardRow => {
     const tfc = getTF(cfg.timeframe), d = tfc.d;
-    if (opts.regimeOn && !tfc.reg) tfc.reg = engine.regimeSeries(d, {});
-    if (opts.regimeOn && opts.regimeSource === 'ml' && !tfc.mlPred) {
-      tfc.mlPred = Int8Array.from(engine.trainRegimeML(d, 0.7, 15, 200).pred);
-    }
+    const routed = routingFor(routeCache, cfg.timeframe, d, cfg, opts);
+    routed.notices.forEach(n => logLine('  route: ' + n));
     const eff: any = Object.assign({}, opts, { sessionMask: cfg.carry ? tfc.maskCarry : tfc.maskIn });
     if (cfg.slPct != null) eff.slPct = cfg.slPct;
     if (cfg.tpPct != null) eff.tpPct = cfg.tpPct;
@@ -146,7 +182,7 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
     eff.exit = cfg.exit || 'fixed'; eff.carry = !!cfg.carry;
     const xof = engine.exitOptsFromParams(cfg.indicator, cfg.params || {});
     if (xof) { eff.ckPeriod = xof.ckPeriod; eff.ckMult = xof.ckMult; }
-    if (opts.regimeOn) eff.tradeMask = engine.regimeMask(opts.regimeSource === 'ml' ? tfc.mlPred : tfc.reg, cfg.indicator);
+    if (routed.mask) eff.tradeMask = routed.mask;
     const sk = cfg.timeframe + '|' + cfg.indicator + '|' + JSON.stringify(cfg.params);
     if (sigCache.key !== sk) sigCache = { key: sk, sig: engine.buildSignals(d, cfg) };
     const bt = engine.backtest(d, sigCache.sig.pos, eff);
@@ -219,6 +255,7 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
   const oos = { t: pick(data.t), o: pick(data.o), h: pick(data.h), l: pick(data.l), c: pick(data.c), v: pick(data.v) };
   if (oos.t.length < 50) return 'OOS slice too thin, skipped';
   const tfCache: Record<number, any> = {};
+  const wfRouteCache: Record<number, any> = {};
   const getTF = (tf: number) => {
     if (!tfCache[tf]) {
       const d = engine.resample(oos as any, tf);
@@ -238,13 +275,9 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
     });
     const xo = engine.exitOptsFromParams(r.indicator, r.params || {});
     if (xo) { eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
-    if (opts.regimeOn) {
-      if (!tfc.reg) tfc.reg = engine.regimeSeries(tfc.d, {});
-      const regs = opts.regimeSource === 'ml'
-        ? (tfc.ml || (tfc.ml = Int8Array.from(engine.trainRegimeML(tfc.d, 0.7, 15, 200).pred)))
-        : tfc.reg;
-      eff.tradeMask = engine.regimeMask(regs, r.indicator);
-    }
+    { const routed = routingFor(wfRouteCache, r.timeframe, tfc.d, r, eff);
+      if (routed.mask) eff.tradeMask = routed.mask;
+      routed.notices.forEach(n => logLine('  WF route: ' + n)); }
     const sig = engine.buildSignals(tfc.d, { indicator: r.indicator, params: r.params });
     const bt = engine.backtest(tfc.d, sig.pos, eff);
     r.oosNet = bt.metrics.netPnL; r.oosWR = bt.metrics.winRate; r.oosN = bt.metrics.totalTrades;
@@ -293,7 +326,7 @@ export async function runGrid() {
   let lastRender = 0;
   const setRun = (p: Partial<typeof st.run>) => useStore.getState().set({ run: { ...useStore.getState().run, ...p } });
   setRun({ running: true, done: 0, total: grid.length, stage: 'grid', pass: 0, perSec: 0, eta: '', current: 'warming up…', errCount: 0, refined: 0, passes: 0, summary: `0 / ${grid.length}` });
-  logLine(`run start: ${st.symbol || '?'} ${(st.data.t.length / 1000).toFixed(0)}k bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource : 'off'}${wfNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}`);
+  logLine(`run start: ${st.symbol || '?'} ${(st.data.t.length / 1000).toFixed(0)}k bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}`);
   const onBatch = (done: number, total: number | string, top: BoardRow[], current: any, stage: string, pass: number) => {
     if (useStore.getState().runSeq !== mySeq) return;
     if (stage === 'refine' && !useStore.getState()._refineAt) useStore.getState()._refineAt = performance.now();
@@ -314,7 +347,7 @@ export async function runGrid() {
     if (top.length && !s2.detail) selectRow(top[0], true);
   };
   let top: BoardRow[] = [], refineInfo = '', errSamples: any[] = [], runMode = 'worker', stopped = false;
-  let mlInfo: any[] = [];
+  let mlInfo: any[] = [], routeInfo: string[] = [];
   useStore.getState()._refineAt = null;
   try {
     const out = await runWithWorker(grid, gData, opts, objective, topN, onBatch, paramSteps, risk);
@@ -322,6 +355,7 @@ export async function runGrid() {
     refineInfo = out.refined ? ` · 🔁 +${out.refined} refined (${out.passes} passes)` : '';
     errSamples = out.errSamples || [];
     mlInfo = out.ml || [];
+    routeInfo = (out as any).route || [];
     if (useStore.getState().runSeq === mySeq) useStore.getState().set({ board: top });
   } catch (err: any) {
     if (useStore.getState().stoppedFlag) { /* fall through to stopped finalizer */ }
@@ -356,6 +390,7 @@ export async function runGrid() {
     useStore.getState().set({ alert: `Search stopped — showing partial results (${b.length} rows).` });
   } else {
     const errs = useStore.getState().run.errCount;
+    routeInfo.forEach((n: string) => logLine(`  route: ${n}`));
     mlInfo.forEach((m: any) => logLine(`  ML regime ${m.tf}m: train-acc ${(m.trainAcc * 100).toFixed(1)}% in ${m.ms}ms`));
     let wfMsg = '';
     if (st.wfOn && !stopped) {
@@ -388,12 +423,8 @@ export function selectRow(r: BoardRow, auto?: boolean) {
   eff.exit = r.exit || 'fixed'; eff.carry = !!r.carry;
   const xod = engine.exitOptsFromParams(r.indicator, r.params || {});
   if (xod) { eff.ckPeriod = xod.ckPeriod; eff.ckMult = xod.ckMult; }
-  if (eff.regimeOn) {
-    const regs = eff.regimeSource === 'ml'
-      ? Int8Array.from(engine.trainRegimeML(d, 0.7, 15, 200).pred)
-      : engine.regimeSeries(d, {});
-    eff.tradeMask = engine.regimeMask(regs, r.indicator);
-  }
+  { const routed = routingFor({}, r.timeframe, d, r, eff);
+    if (routed.mask) eff.tradeMask = routed.mask; }
   eff.sessionMask = eff.carry ? new Int8Array(d.c.length).fill(1) : engine.buildSessionMask(d, eff.sessionStart, eff.sessionEnd);
   const bt = engine.backtest(d, sig.pos, eff);
   useStore.getState().set({ sel: r, detail: { cfg: r, data: d, sig, bt } });

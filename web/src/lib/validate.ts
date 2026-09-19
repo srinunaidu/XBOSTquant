@@ -77,7 +77,18 @@ export function runValidation() {
     ok('L6 metrics finite, DD ≤ 0', isFinite(m.sharpe) && isFinite(m.sortino) && isFinite(m.maxDD) && m.maxDD <= 0,
       `sharpe=${m.sharpe.toFixed(2)} sortino=${m.sortino.toFixed(2)} dd=${m.maxDD.toFixed(2)}`);
     let inn = 0; for (let i = 0; i < eff.sessionMask.length; i++) inn += eff.sessionMask[i];
-    out.push(`L7 session coverage ${(inn / eff.sessionMask.length * 100).toFixed(1)}% · OHLCV-only engine · fill=${eff.fill} · exit=${eff.exit || 'fixed'}${eff.carry ? ' +carry' : ''}`);
+    out.push(`L7 session coverage ${(inn / eff.sessionMask.length * 100).toFixed(1)}% · OHLCV-only engine · fill=${eff.fill} · exit=${eff.exit || 'fixed'}${eff.carry ? ' +carry' : ''} · regime=${eff.regimeOn ? eff.regimeSource + '/' + (eff.granularity || 'day') : 'off'}`);
+    // Layer checks: regimes / ML / walk-forward viability — FAILS are loud
+    const layers = engine.validateLayers(d, {
+      ml: eff.regimeSource === 'ml', confGate: eff.confGate ?? 0.6,
+      wf: st.wfOn, wfSplit: st.wfSplit,
+    });
+    for (const c of layers) {
+      const tag = c.pass ? (c.warn ? 'WARN' : 'PASS') : 'FAIL';
+      out.push(`${tag} ${c.name} :: ${c.detail}`);
+      if (c.pass) { if (c.warn) skip++; else pass++; }
+      else fail++;
+    }
     out.push('');
     out.push(`LIVE VALIDATION: ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped (thin file)` : ''} — ${st.symbol}, real data only.`);
     logLine(`validation: ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped` : ''}`);
@@ -87,4 +98,7 @@ export function runValidation() {
   }
   out.forEach(l => logLine('[val] ' + l));
   useStore.getState().set({ validation: out, valOk: fail === 0 });
+  if (fail > 0) {
+    useStore.getState().set({ alert: `Validation FAILED on ${fail} check(s) — see 🛠 panel. Nothing was assumed; fix the flagged layer before trusting results.` });
+  }
 }

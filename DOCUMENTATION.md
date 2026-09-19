@@ -144,7 +144,8 @@ final capital, gross ±. Board also shows SL %, TP %, Exit mode, Session.
 
 ## 9. Search engine (+ regimes, ML, walk-forward)
 
-- Regime routing (toggle, default ON): entries only on in-regime bars per the
+- Regime routing (toggle, default ON, day granularity default): one label per
+  session from prior-session data; entries only on in-regime bars per the
   router table (rules or ML-predicted source); exits unchanged. Per-regime
   split (trades/WR/net) shown for the selected strategy.
 - ML regime classifier: softmax on 10 causal features, trained in-sample,

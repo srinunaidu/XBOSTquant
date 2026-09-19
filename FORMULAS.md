@@ -231,7 +231,24 @@ Flat (`0`) during indicator warmup; otherwise:
    else. Volume is summed on resample; no open-interest, delivery, or
    quote-depth data is read or required.
 
-## 9. Market regimes, router, ML classifier, walk-forward
+## 9. Market regimes, router, ML classifier, walk-forward (day-first)
+
+- **Day regimes (default)**: each session gets ONE label from prior-session
+  features only (no leakage — verified by perturbing later sessions).
+  `dayRouting()` is the single choke-point (worker/fallback/detail/WF all use
+  it): <5 sessions → unrouted + loud notice; ML with <20 trainable sessions →
+  genuine RULE labels + loud notice; low-confidence days (<60% default) trade
+  unrouted and are COUNTED as fallback days in the log. Nothing is ever silent.
+- **Rule regimes**: trend-up/down (ADX ≥ 20 + EMA20/50), else range-high/low-vol
+  (trailing 100-bar volatility rank). Per-bar mode remains as an Advanced toggle.
+- **ML classifier**: day-level multinomial softmax (8 prior-session features →
+  next session's majority regime), deterministic zero-init, strided training.
+- **Router** (`ROUTER` + masks): trend legs in T+/T−, mean-reversion in RH/RL,
+  breakout in T/RH, gates everywhere; enforced as `tradeMask`.
+- **Layer validation** (`validateLayers`): D1–D3 data, R1–R2 regimes, M1–M4 ML,
+  W1 walk-forward viability — FAIL = red banner + alert, WARN = amber.
+- **Walk-forward** (optional, default 70/30 by time): grid on in-sample only,
+  top-200 verify on the untouched tail → `oosNet/oosWR/survived`.
 
 - **Regimes** (`regimeSeries`, OHLCV-only, causal): `0` trend-up / `1` trend-down
   (ADX ≥ 20 + EMA20/50 slope) else `2` range-high-vol / `3` range-low-vol

@@ -51,6 +51,13 @@ export interface Engine {
   ROUTER: Record<string, number[]>;
   regimeMask(regimes: Int8Array, indicator: string): Int8Array;
   trainRegimeML(d: OHLCV, isFrac: number, K?: number, iters?: number, maxTrain?: number): { W: number[]; p: number; trainAcc: number; pred: number[]; n: number };
+  daySegments(d: OHLCV): { s: number; e: number; label: string }[];
+  dayRouting(d: OHLCV, o?: { source?: string; confGate?: number }): {
+    dayReg: { segs: { s: number; e: number; label: string }[]; pred: number[]; conf: number[] } | null;
+    mlAcc: number | null; notices: string[]; fallbackDays: number; ok: boolean; mlFallback?: boolean;
+  };
+  dayRegimeMask(d: OHLCV, dayReg: { segs: { s: number; e: number; label: string }[]; pred: number[]; conf: number[] }, indicator: string, confGate: number): { mask: Int8Array; fallbackBars: number };
+  validateLayers(d: OHLCV, o?: Record<string, any>): { name: string; pass: boolean; warn: boolean; detail: string }[];
   SCHEMA: Record<string, { key: string; min: number; max: number; def: number }[]>;
 }
 

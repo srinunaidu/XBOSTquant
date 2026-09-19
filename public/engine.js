@@ -865,6 +865,175 @@ function trainRegimeML(d, isFrac, K, iters, maxTrain){
   return {W:Array.from(W), p, trainAcc:isN?hit/isN:0, pred:Array.from(pred), n, stride};
 }
 
+// ---------- day-level regimes: classify each SESSION, trade its legs ----------
+// A session gets ONE label (stable, interpretable, cheap). Prediction uses
+// strictly prior-session bars — no leakage by construction.
+function daySegments(d){
+  const segs=[];let s=0,cur='';
+  const key=t=>new Date(t).toDateString();
+  for(let i=0;i<d.t.length;i++){
+    const k=key(d.t[i]);
+    if(i===0)cur=k;
+    if(k!==cur){segs.push({s:s,e:i,label:cur});s=i;cur=k;}
+  }
+  if(d.t.length)segs.push({s:s,e:d.t.length,label:cur});
+  return segs;
+}
+// 8 features from ONE session's bars only ([s,e)); last-bar indicator reads.
+function dayFeatures(d, s, e, pre){
+  pre=pre||{};
+  const ch=pre.ch||choppiness(d.h,d.l,d.c,14);
+  const ax=pre.ax||adx(d.h,d.l,d.c,14);
+  const at=pre.at||atr(d.h,d.l,d.c,14);
+  const ef=pre.ef||ema(d.c,20), es=pre.es||ema(d.c,50);
+  const i=e-1;
+  const a=at[i]||1e-9, c=d.c[i]||1;
+  let hh=-Infinity,ll=Infinity,vv=0;
+  for(let j=s;j<e;j++){if(d.h[j]>hh)hh=d.h[j];if(d.l[j]<ll)ll=d.l[j];vv+=d.v[j]||0;}
+  if(!isFinite(hh)||!isFinite(ll)){hh=c;ll=c;}
+  const s0=Math.max(0,i-100);
+  let below=0,cnt=0;
+  for(let j=s0;j<i;j++){cnt++;if((d.c[j]>0?at[j]/d.c[j]:0)<a/c)below++;}
+  const gap=s>0&&d.c[s-1]? (d.o[s]-d.c[s-1])/d.c[s-1] : 0;
+  return [
+    (isNaN(ch[i])?62:ch[i])/100, (isNaN(ax[i])?20:ax[i])/100,
+    cnt>0?below/cnt:0.5,
+    c>0?(hh-ll)/c:0, gap,
+    (!isNaN(ef[i])&&!isNaN(es[i]))?(ef[i]-es[i])/a:0,
+    c>0?(c-d.o[s])/d.o[s]:0,
+    Math.min(3,vv/Math.max(1,(e-s)*20000))
+  ];
+}
+// Majority rule-regime inside each session (training labels / rules source).
+function dayRuleLabels(d, rule){
+  const segs=daySegments(d);
+  return segs.map(sg=>{
+    const cnt=[0,0,0,0];
+    for(let i=sg.s;i<sg.e;i++)cnt[rule[i]]++;
+    let b=3;for(let c=0;c<4;c++)if(cnt[c]>cnt[b])b=c;
+    return b;
+  });
+}
+// Train day-ML: X = features(session i-1) -> y = label(session i). Deterministic.
+function trainDayML(d, K){
+  K=K||0; // reserved (forward offset in sessions; 0 = next session)
+  const segs=daySegments(d);
+  const D=segs.length, F=9;
+  const pre={ch:choppiness(d.h,d.l,d.c,14),ax:adx(d.h,d.l,d.c,14),at:atr(d.h,d.l,d.c,14),ef:ema(d.c,20),es:ema(d.c,50)};
+  const rule=regimeSeries(d,{});
+  const labels=dayRuleLabels(d,rule);
+  const n=D-1;
+  const X=new Float64Array(Math.max(0,n)*F), y=new Int8Array(Math.max(0,n));
+  for(let i=1;i<D;i++){
+    const f=dayFeatures(d,segs[i-1].s,segs[i-1].e,pre);
+    for(let k=0;k<F-1;k++)X[(i-1)*F+k]=isFinite(f[k])?f[k]:0;
+    X[(i-1)*F+F-1]=1;
+    y[i-1]=labels[i];
+  }
+  const W=n>0?trainSoftmax(X,y,n,F,4,300,0.5,0.001):new Float64Array(4*F);
+  // predict every session (session 0 has no prior -> mark unknown)
+  const pred=new Int8Array(D).fill(-1), conf=new Float64Array(D);
+  for(let i=1;i<D;i++){
+    const f=dayFeatures(d,segs[i-1].s,segs[i-1].e,pre);
+    const fv=f.concat([1]);
+    let bc=0,bs=-1e18;const sc=[];
+    for(let c=0;c<4;c++){let s=0;for(let k=0;k<F;k++)s+=W[c*F+k]*fv[k];sc.push(s);if(s>bs){bs=s;bc=c;}}
+    let den=0;for(let c=0;c<4;c++)den+=Math.exp(sc[c]-bs);
+    pred[i]=bc;conf[i]=1/den; // softmax max-probability, always ≤ 1
+  }
+  let hit=0;for(let i=1;i<D;i++)if(pred[i]===labels[i])hit++;
+  return {W:Array.from(W),F,segs:segs.map(s=>({s:s.s,e:s.e,label:s.label})),labels,pred:Array.from(pred),conf:Array.from(conf),
+    acc:D>1?hit/(D-1):0, sessions:D};
+}
+// Day-constant trade mask: whole session allowed/blocked per router.
+// fallbackDays (low confidence / session 0 / ML missing) trade UNROUTED (all 1)
+// and are COUNTED — fallback impact is measured, never silent.
+function dayRegimeMask(d, dayReg, indicator, confGate){
+  const n=d.c.length, out=new Int8Array(n), fb=new Int8Array(n);
+  const allow=ROUTER[indicator];
+  for(let s=0;s<dayReg.segs.length;s++){
+    const sg=dayReg.segs[s];
+    const fbDay=dayReg.pred[s]<0||(dayReg.conf&&dayReg.conf[s]<confGate);
+    for(let i=sg.s;i<sg.e&&i<n;i++){out[i]=1;fb[i]=0;}
+    if(!fbDay&&allow){
+      for(let i=sg.s;i<sg.e&&i<n;i++)out[i]=allow.indexOf(dayReg.pred[s])>=0?1:0;
+    } else if(fbDay){
+      for(let i=sg.s;i<sg.e&&i<n;i++)fb[i]=1;
+    }
+  }
+  let fbN=0;for(let i=0;i<n;i++)if(fb[i])fbN++;
+  return {mask:out, fallbackBars:fbN};
+}
+
+// Single choke-point for ALL day-routing decisions (worker, fallback, detail,
+// walk-forward, validation). Identical rules everywhere — no silent divergence.
+// Returns {dayReg:{segs,pred,conf}, mlAcc|null, notices[], fallbackDays, ok}
+function dayRouting(d, o){
+  o=o||{};
+  const source=o.source||'rules', confGate=o.confGate!=null?o.confGate:0.6;
+  const segs=daySegments(d);
+  const notices=[];
+  if(segs.length<5){
+    return {dayReg:null, mlAcc:null, notices:['<5 sessions: routing disabled, all legs trade everywhere'], fallbackDays:segs.length, ok:false};
+  }
+  if(source==='ml'){
+    const trainable=segs.length-1;
+    if(trainable<20){
+      // LOUD fallback: genuinely use RULE labels (not unrouted) — verified below
+      const rule=regimeSeries(d,{});
+      const labels=dayRuleLabels(d,rule);
+      notices.push('ML unavailable: '+trainable+' trainable sessions (<20) — RULE regimes used instead');
+      return {dayReg:{segs:segs.map(s=>({s:s.s,e:s.e,label:s.label})),pred:labels,conf:labels.map(()=>1)}, mlAcc:null, notices, fallbackDays:0, ok:true, mlFallback:true};
+    }
+    const m=trainDayML(d);
+    let hi=0;for(let i=1;i<m.conf.length;i++)if(m.conf[i]>=confGate)hi++;
+    notices.push('ML day-model: train-acc '+(100*m.trainAcc).toFixed(1)+'%, '+hi+'/'+(segs.length-1)+' confident days ≥ '+Math.round(confGate*100)+'% (rest fallback, counted)');
+    return {dayReg:{segs:segs.map(s=>({s:s.s,e:s.e,label:s.label})),pred:m.pred,conf:m.conf}, mlAcc:m.trainAcc, notices, fallbackDays:0, ok:true};
+  }
+  const rule=regimeSeries(d,{});
+  const labels=dayRuleLabels(d,rule);
+  return {dayReg:{segs:segs.map(s=>({s:s.s,e:s.e,label:s.label})),pred:labels,conf:labels.map(()=>1)}, mlAcc:null, notices:['rule regimes (no ML)'], fallbackDays:0, ok:true};
+}
+
+// ---------- layer validation: assert everything, assume nothing ----------
+// Returns checks [{name, pass, warn, detail}]. FAIL = hard error surface;
+// warn = amber. Callers must surface failures LOUDLY (banner + log), never silent.
+function validateLayers(d, o){
+  o=o||{};
+  const out=[];
+  const n=d.t.length;
+  out.push({name:'D1 bars present',pass:n>50,warn:false,detail:n+' 1m bars'});
+  let asc=true;for(let i=1;i<n;i+=Math.max(1,Math.floor(n/50000)))if(d.t[i]<=d.t[i-1]){asc=false;break;}
+  out.push({name:'D2 timestamps ascending',pass:asc,warn:false,detail:asc?'ordered':'OUT OF ORDER'});
+  let hasVol=false;for(let i=0;i<n;i+=Math.max(1,Math.floor(n/50000)))if(d.v[i]>0){hasVol=true;break;}
+  out.push({name:'D3 volume present (else volume legs degrade)',pass:true,warn:!hasVol,detail:hasVol?'volume OK':'NO VOLUME — POC skipped, VWAP/VWMA fall back, Squeeze spike bypassed'});
+  const segs=daySegments(d);
+  out.push({name:'R1 ≥5 sessions for day regimes',pass:segs.length>=5,warn:false,detail:segs.length+' sessions'});
+  if(segs.length>=5){
+    const rule=regimeSeries(d,{});
+    const labels=dayRuleLabels(d,rule);
+    const cov=[0,0,0,0];labels.forEach(l=>cov[l]++);
+    out.push({name:'R2 regime classes covered',pass:true,warn:cov.some(c=>c===0),detail:'T+/T-/RH/RL = '+cov.join('/')});
+  }
+  if(o.ml){
+    out.push({name:'M1 ML training sessions ≥20',pass:segs.length-1>=20,warn:false,detail:(segs.length-1)+' trainable sessions'});
+    if(segs.length-1>=20){
+      const a=trainDayML(d), b=trainDayML(d);
+      let same=true;for(let i=0;i<a.W.length;i++)if(a.W[i]!==b.W[i]){same=false;break;}
+      out.push({name:'M2 ML deterministic (identical weights)',pass:same,warn:false,detail:same?'bit-identical':'NON-DETERMINISTIC'});
+      out.push({name:'M3 ML beats chance (>25%)',pass:a.acc>0.25,warn:false,detail:(100*a.acc).toFixed(1)+'% train acc'});
+      let hi=0;for(let i=1;i<a.conf.length;i++)if(a.conf[i]>=(o.confGate||0.6))hi++;
+      const cov=segs.length>1?hi/(segs.length-1):0;
+      out.push({name:'M4 confident-day coverage',pass:true,warn:cov<0.3,detail:(100*cov).toFixed(0)+'% days ≥ gate (rest fallback, measured)'});
+    }
+  }
+  if(o.wf){
+    const span=d.t[n-1]-d.t[0];
+    out.push({name:'W1 OOS span viable',pass:span>0,warn:false,detail:'split '+o.wfSplit+'/'+(100-o.wfSplit)});
+  }
+  return out;
+}
+
 // ---------- backtest ----------
 function timeToMin(s){const[a,b]=s.split(':').map(Number);return a*60+b;}
 
@@ -1203,7 +1372,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

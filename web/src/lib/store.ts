@@ -62,6 +62,8 @@ type State = {
   _done: number;
   regimeOn: boolean;
   regimeSource: string;
+  granularity: string;
+  confGate: number;
   wfOn: boolean;
   wfSplit: number;
   detail: Detail;
@@ -111,6 +113,8 @@ export const useStore = create<State>((set) => ({
   _done: 0,
   regimeOn: true,
   regimeSource: 'rules',
+  granularity: 'day',
+  confGate: 60,
   wfOn: false,
   wfSplit: 70,
   detail: null,

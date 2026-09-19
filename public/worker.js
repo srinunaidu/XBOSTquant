@@ -37,13 +37,39 @@ self.onmessage = function(e) {
     }
     return tfCache;
   }
+  const routeNotices = [];
+  const routeSeen = {};
+  function noteTF(tf, arr){ if(routeSeen[tf])return; routeSeen[tf]=1; (arr||[]).forEach(n=>routeNotices.push(tf+'m: '+n)); }
+  // Single choke-point for routing (day default, bar advanced). Returns a bar
+  // mask or null (= run unrouted, always with a logged reason).
+  function tradeMaskFor(cfg){
+    if(!tradeOpts.regimeOn) return null;
+    const dd = getTF(cfg.timeframe);
+    const gate = tradeOpts.confGate != null ? tradeOpts.confGate : 0.6;
+    if((tradeOpts.granularity || 'day') === 'day'){
+      if(!dd.dayRT) dd.dayRT = E.dayRouting(dd.d, {source: tradeOpts.regimeSource, confGate: gate});
+      const rt = dd.dayRT;
+      noteTF(cfg.timeframe, rt.notices);
+      if(!rt.dayReg) return null;
+      if(!routeSeen[cfg.timeframe + 'fb']){
+        routeSeen[cfg.timeframe + 'fb'] = 1;
+        let fbD = 0; const total = rt.dayReg.pred.length;
+        for(let s = 0; s < total; s++) if(rt.dayReg.pred[s] < 0 || (rt.dayReg.conf && rt.dayReg.conf[s] < gate)) fbD++;
+        routeNotices.push(cfg.timeframe + 'm: ' + fbD + '/' + total + ' fallback days (unrouted, counted)');
+      }
+      return E.dayRegimeMask(dd.d, rt.dayReg, cfg.indicator, gate).mask;
+    }
+    // bar mode (advanced): per-bar regimes; ML trains lazily once per TF
+    const regs = tradeOpts.regimeSource === 'ml' ? getML(cfg.timeframe).pred : dd.reg;
+    return E.regimeMask(Array.isArray(regs) ? Int8Array.from(regs) : regs, cfg.indicator);
+  }
   function getML(tf){
-    const tfc=getTF(tf);
-    if(!tfc.ml){
-      const t0=Date.now();
-      const r=E.trainRegimeML(tfc.d, 0.7, 15, 200);
-      tfc.ml={pred:r.pred, trainAcc:r.trainAcc};
-      mlInfo.push({tf, trainAcc:+r.trainAcc.toFixed(3), ms:Date.now()-t0});
+    const tfc = getTF(tf);
+    if(!tfc.ml && tradeOpts.regimeSource === 'ml'){
+      const t0 = Date.now();
+      const r = E.trainRegimeML(tfc.d, 0.7, 15, 200);
+      tfc.ml = { pred: r.pred, trainAcc: r.trainAcc };
+      mlInfo.push({ tf, trainAcc: +r.trainAcc.toFixed(3), ms: Date.now() - t0 });
     }
     return tfc.ml;
   }
@@ -69,11 +95,8 @@ self.onmessage = function(e) {
     eff.carry = !!cfg.carry;
     const xo = E.exitOptsFromParams(cfg.indicator, cfg.params||{});
     if(xo){ eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
-    if(tradeOpts.regimeOn){
-      const dd0 = getTF(cfg.timeframe);
-      const regs = tradeOpts.regimeSource==='ml' ? getML(cfg.timeframe).pred : dd0.reg;
-      eff.tradeMask = E.regimeMask(Array.isArray(regs)?Int8Array.from(regs):regs, cfg.indicator);
-    }
+    const tm = tradeMaskFor(cfg);
+    if(tm) eff.tradeMask = tm;
     const mk = (m, err) => ({ i: idx, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
       slPct: eff.slPct||0, tpPct: eff.tpPct||0, trailPct: eff.trailPct||0,
       exit: eff.exit, carry: eff.carry, refined: !!refined, m: m, err: err });
@@ -138,5 +161,5 @@ self.onmessage = function(e) {
   }
   const ranked = E.rankResults(results, objective);
   self.postMessage({ type:'done', done:total + refined, total: total + refined, top:ranked.slice(0, topN),
-    all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo });
+    all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo, route:routeNotices });
 };

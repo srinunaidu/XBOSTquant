@@ -239,6 +239,8 @@ function ExecSection() {
 function RegimeSection() {
   const regimeOn = useStore(s => s.regimeOn);
   const regimeSource = useStore(s => s.regimeSource);
+  const granularity = useStore(s => s.granularity);
+  const confGate = useStore(s => s.confGate);
   const set = useStore(s => s.set);
   return (
     <section className="card p-3">
@@ -248,9 +250,17 @@ function RegimeSection() {
         Route entries by regime (trend / range / high-vol)
       </label>
       <div className="flex gap-3 text-xs mt-1.5">
+        <label className="flex items-center gap-1"><input type="radio" checked={granularity === 'day'} onChange={() => set({ granularity: 'day' })} /> Day labels ★</label>
+        <label className="flex items-center gap-1"><input type="radio" checked={granularity === 'bar'} onChange={() => set({ granularity: 'bar' })} /> Per-bar (adv)</label>
+      </div>
+      <div className="flex gap-3 text-xs mt-1.5">
         <label className="flex items-center gap-1"><input type="radio" checked={regimeSource === 'rules'} onChange={() => set({ regimeSource: 'rules' })} /> Rule regimes</label>
         <label className="flex items-center gap-1"><input type="radio" checked={regimeSource === 'ml'} onChange={() => set({ regimeSource: 'ml' })} /> ML predicted ★</label>
+        <label className="flex items-center gap-1 text-zinc-400">conf ≥
+          <input type="number" value={confGate} min={0} max={100} className="w-14 num"
+            onChange={e => set({ confGate: Math.min(100, Math.max(0, +e.target.value || 60)) })} />%</label>
       </div>
+      <div className="text-[10px] text-zinc-500 mt-1">Below 60% confidence a day runs unrouted — counted in the log, never silent.</div>
       <details className="mt-1.5 text-[11px] text-zinc-400">
         <summary className="cursor-pointer text-zinc-500">routing table (indicator → regimes)</summary>
         <div className="num mt-1">T+ trend-up · T− trend-down · RH range-high-vol · RL range-low-vol</div>
