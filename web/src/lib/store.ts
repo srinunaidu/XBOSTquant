@@ -74,6 +74,7 @@ type State = {
   validation: string[];
   valOk: boolean | null;
   log: string[];
+  lastRun: any | null;
   set: (p: Partial<State>) => void;
 };
 
@@ -95,7 +96,7 @@ export const useStore = create<State>((set) => ({
   topN: 500, cap: 60000,
   direction: 'Both', entry: 'trigger', fill: 'close',
   sessStart: '09:15', sessEnd: '15:15', useSession: true,
-  slFix: 0.8, tpFix: 1.6, trail: 0.5, cost: 20, qty: 50, lot: 1,
+  slFix: 0.8, tpFix: 1.6, trail: 0.5, cost: 20, qty: 1, lot: 1,
   capital: 100000,
   beTrigger: 0.5, beLock: 0, atrP: 14, atrM: 3, ckP: 10, ckM: 3,
   exits: ['fixed', 'breakeven'], sessMode: 'intraday',
@@ -125,6 +126,7 @@ export const useStore = create<State>((set) => ({
   validation: [],
   valOk: null,
   log: [],
+  lastRun: null,
   set: (p) => set(p),
 }));
 

@@ -1,5 +1,32 @@
 import { useStore } from './store';
+import engine from './engine';
 import { fmtIST, fmtParams } from './format';
+
+const REG_NAMES = ['T+', 'T-', 'RH', 'RL'];
+
+function tradeRegimes() {
+  const st = useStore.getState();
+  const detail = st.detail;
+  if (!detail) return null;
+  const d = detail.data, n = d.t.length;
+  const regOf = new Int8Array(n).fill(-2);
+  const confOf = new Float64Array(n).fill(NaN);
+  if (st.regimeOn) {
+    const gate = (st.confGate ?? 60) / 100;
+    if ((st.granularity || 'day') === 'day') {
+      const rt = engine.dayRouting(d, { source: st.regimeSource, confGate: gate });
+      if (rt.dayReg) rt.dayReg.segs.forEach((sg, si) => {
+        const r = rt.dayReg!.pred[si];
+        const fb = r < 0 || (rt.dayReg!.conf && rt.dayReg!.conf[si] < gate);
+        for (let i = sg.s; i < sg.e && i < n; i++) { regOf[i] = fb ? -1 : r; confOf[i] = rt.dayReg!.conf ? rt.dayReg!.conf[si] : NaN; }
+      });
+    } else {
+      const regs = st.regimeSource === 'ml' ? Int8Array.from(engine.trainRegimeML(d, 0.7, 15, 200).pred) : engine.regimeSeries(d, {});
+      for (let i = 0; i < n; i++) regOf[i] = regs[i];
+    }
+  }
+  return { regOf, confOf };
+}
 
 function dl(name: string, text: string) {
   const a = document.createElement('a');
@@ -24,9 +51,20 @@ export function exportTrades() {
   if (!st.detail) { st.set({ alert: 'No strategy loaded — run a search and click any leaderboard row.' }); return; }
   const { bt } = st.detail;
   const r = st.sel!;
-  let s = 'id,entry_time_ist,exit_time_ist,type,entry_px,exit_px,pnl,pnl_pct,reason\n';
+  let s = 'id,entry_time_ist,exit_time_ist,type,entry_px,exit_px,pnl,pnl_pct,reason,regime,ml_conf\n';
+  const ri = tradeRegimes();
+  const regLbl = (idx: number) => {
+    if (!ri) return '';
+    const r = ri.regOf[Math.min(ri.regOf.length - 1, Math.max(0, idx))];
+    return r < -1 ? '' : r < 0 ? 'FB' : REG_NAMES[r];
+  };
+  const confLbl = (idx: number) => {
+    if (!ri) return '';
+    const c = ri.confOf[Math.min(ri.confOf.length - 1, Math.max(0, idx))];
+    return isFinite(c) ? (c * 100).toFixed(1) + '%' : '';
+  };
   for (const t of bt.trades) {
-    s += `${t.id},${fmtIST(t.entryTime)},${fmtIST(t.exitTime)},${t.type},${t.entryPx},${t.exitPx},${t.pnl.toFixed(2)},${t.pnlPct.toFixed(3)},${t.reason}\n`;
+    s += `${t.id},${fmtIST(t.entryTime)},${fmtIST(t.exitTime)},${t.type},${t.entryPx},${t.exitPx},${t.pnl.toFixed(2)},${t.pnlPct.toFixed(3)},${t.reason},${regLbl(t.entryIdx)},${confLbl(t.entryIdx)}\n`;
   }
   dl(`xbost_trades_${r.indicator}_${r.timeframe}m_${r.exit || 'fixed'}${r.carry ? '_carry' : ''}_SL${r.slPct || 0}_TP${r.tpPct || 0}.csv`, s);
 }

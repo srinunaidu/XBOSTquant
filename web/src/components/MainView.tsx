@@ -5,6 +5,7 @@ import { fmtMoney, fmtT } from '../lib/format';
 import KpiStrip from './KpiStrip';
 import Leaderboard from './Leaderboard';
 import RegimeSplit from './RegimeSplit';
+import RunSummary from './RunSummary';
 import { DrawdownPanel, EquityPanel, OscPanel, PriceChart, VolPanel } from './ChartPanels';
 import TradeLog from './TradeLog';
 
@@ -19,6 +20,7 @@ export default function MainView() {
   return (
     <main className="flex-1 min-w-0 p-3 space-y-3">
       <KpiStrip />
+      <RunSummary />
       <Leaderboard />
       {detail && <RegimeSplit />}
       {detail ? (

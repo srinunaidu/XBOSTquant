@@ -105,7 +105,12 @@ Sharpe/Sortino) → Leaderboard tabs (**All results** · **Best per indicator** 
 **⚖ Compare exits**) → candlestick + overlays + signal markers → oscillator /
 volume sub-charts → equity + underwater drawdown (MTM) → trade log (red edge =
 exited inside the max-DD window; DD window times in the equity title) →
-CSV exports (board + per-strategy trades with IST timestamps).
+CSV exports (board + per-strategy trades with IST timestamps, both carrying
+regime/confidence columns). Trade rows show the ML regime decision at entry
+(T+/T−/RH/RL, FB = fallback day, — = routing off) plus ML confidence %.
+After every run a 🧾 summary box reports the full config used, the best row
+with all metrics, top-5, timings and environment — mirrored into the
+downloadable session log, which is written agent-readable end to end.
 
 ## 6. Indicator catalogue (30, all grid-searched, Tier A default)
 

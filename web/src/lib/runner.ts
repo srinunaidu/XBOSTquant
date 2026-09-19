@@ -347,6 +347,7 @@ export async function runGrid() {
     if (top.length && !s2.detail) selectRow(top[0], true);
   };
   let top: BoardRow[] = [], refineInfo = '', errSamples: any[] = [], runMode = 'worker', stopped = false;
+  let refinedN = 0, passesN = 0;
   let mlInfo: any[] = [], routeInfo: string[] = [];
   useStore.getState()._refineAt = null;
   try {
@@ -354,6 +355,7 @@ export async function runGrid() {
     top = out.top;
     refineInfo = out.refined ? ` · 🔁 +${out.refined} refined (${out.passes} passes)` : '';
     errSamples = out.errSamples || [];
+    refinedN = out.refined || 0; passesN = out.passes || 0;
     mlInfo = out.ml || [];
     routeInfo = (out as any).route || [];
     if (useStore.getState().runSeq === mySeq) useStore.getState().set({ board: top });
@@ -367,6 +369,7 @@ export async function runGrid() {
         top = out.top;
         refineInfo = out.refined ? ` · 🔁 +${out.refined} refined (${out.passes} passes)` : '';
         stopped = !!out.stopped;
+        refinedN = out.refined || 0; passesN = out.passes || 0;
         useStore.getState().set({ board: top });
       } catch (err2: any) {
         setRun({ running: false, summary: `❌ ERROR: ${err2?.message || err2}` });
@@ -405,6 +408,37 @@ export async function runGrid() {
   }
   const bd = useStore.getState().board;
   bd.slice(0, 3).forEach((r, i) => logLine(`  #${i + 1} ${r.timeframe}m ${r.indicator} ${fmtParams(r.params)} SL=${r.slPct} TP=${r.tpPct} WR=${r.m.winRate.toFixed(1)}% n=${r.m.totalTrades} pnl=${r.m.netPnL.toFixed(0)}`));
+  // Agent-grade complete summary: config used + best + top-5 + environment
+  try {
+    const sL = useStore.getState();
+    const best = bd[0] || null;
+    sL.set({
+      lastRun: {
+        at: new Date().toISOString(),
+        stopped, mode: runMode, secs: +secs.toFixed(1),
+        dataset: { symbol: sL.symbol || '?', bars: sL.data ? sL.data.t.length : 0, from: sL.fromDate, to: sL.toDate, layout: ((sL.raw || {}) as any).layout || 'auto' },
+        objective, topN, cap: sL.cap,
+        exec: { direction: opts.direction, entry: opts.entry, fill: opts.fill, session: `${opts.sessionStart || '—'}→${opts.sessionEnd || '—'}`, exits: dims.exits, carry: dims.carry, regime: opts.regimeOn ? `${opts.regimeSource}/${opts.granularity || 'day'}` : 'off', confGate: opts.confGate },
+        risk: { sl: risk ? risk.sl : [opts.slPct], tp: risk ? risk.tp : [opts.tpPct], trail: opts.trailPct, cost: opts.cost },
+        sizing: { capital: opts.capital, qty: opts.qty, lot: opts.lotSize },
+        grid: grid.length, refined: refinedN, passes: passesN, rate: +(grid.length / Math.max(secs, 0.01)).toFixed(0),
+        errors: sL.run.errCount,
+        best: best ? { tf: best.timeframe, ind: best.indicator, params: best.params, sl: best.slPct, tp: best.tpPct, exit: best.exit, carry: best.carry, refined: !!best.refined, m: best.m, oos: { net: best.oosNet ?? null, wr: best.oosWR ?? null, n: best.oosN ?? null, survived: best.survived ?? null } } : null,
+        top5: bd.slice(0, 5).map(r => ({ tf: r.timeframe, ind: r.indicator, params: r.params, wr: +r.m.winRate.toFixed(1), n: r.m.totalTrades, pnl: Math.round(r.m.netPnL), dd: +r.m.maxDD.toFixed(2), sharpe: +r.m.sharpe.toFixed(2) })),
+      },
+    });
+    const L = useStore.getState().lastRun;
+    logLine('===== RUN SUMMARY (agent-readable) =====');
+    logLine(`when: ${L.at} · mode: ${L.mode} · duration: ${L.secs}s · rate: ${L.rate}/s · stopped: ${L.stopped}`);
+    logLine(`dataset: ${L.dataset.symbol} ${L.dataset.bars} bars ${L.dataset.from}→${L.dataset.to} [${L.dataset.layout}]`);
+    logLine(`config: objective=${L.objective} topN=${L.topN} cap=${L.cap} dir=${L.exec.direction} entry=${L.exec.entry} fill=${L.exec.fill} session=${L.exec.session} exits=[${L.exec.exits}] carry=[${L.exec.carry}] regime=${L.exec.regime} confGate=${L.exec.confGate}`);
+    logLine(`risk: SL=[${L.risk.sl}] TP=[${L.risk.tp}] trail=${L.risk.trail}% cost=${L.risk.cost}/trade · sizing: cap=${L.sizing.capital} qty=${L.sizing.qty}x${L.sizing.lot}`);
+    logLine(`grid: ${L.grid} combos · refined=${L.refined} passes=${L.passes} · errors=${L.errors}`);
+    if (L.best) logLine(`best: ${L.best.tf}m ${L.best.ind} ${fmtParams(L.best.params)} SL=${L.best.sl} TP=${L.best.tp} exit=${L.best.exit}${L.best.carry ? '+carry' : ''}${L.best.refined ? ' [refined]' : ''} WR=${L.best.m.winRate}% n=${L.best.m.totalTrades} pnl=${L.best.m.netPnL} dd=${L.best.m.maxDD}% sharpe=${L.best.m.sharpe} OOS=${L.best.oos.net ?? '—'}/${L.best.oos.survived ?? '—'}`);
+    L.top5.forEach((t: any, i: number) => logLine(`  top${i + 1}: ${t.tf}m ${t.ind} WR=${t.wr}% n=${t.n} pnl=${t.pnl} dd=${t.dd}% sharpe=${t.sharpe}`));
+    logLine(`env: ${typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 120) : 'node'}`);
+    logLine('===== END SUMMARY =====');
+  } catch (e: any) { logLine('summary build failed: ' + (e?.message || e)); }
   setRun({ current: '' });
   const s4 = useStore.getState();
   if (bd.length && !s4.userPickedSeq) selectRow(bd[0], true);

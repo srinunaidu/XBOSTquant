@@ -302,13 +302,16 @@ function IndSection() {
           const schema = (engine as any).SCHEMA[m.n!] || [];
           return (
             <div key={m.n} className={`ind-card${st.on ? ' on' : ''}`}>
-              <label className="flex items-center gap-2 text-[13px] font-semibold cursor-pointer">
-                <input type="checkbox" checked={st.on} onChange={() => upd(m.n!, { on: !st.on })} />
+              <label className="flex items-center gap-2 text-[13px] font-semibold cursor-pointer"
+                onClick={e => { e.preventDefault(); upd(m.n!, { on: !st.on }); }}>
+                <input type="checkbox" checked={st.on} readOnly />
                 <span className="text-[10px] font-bold px-1 rounded" style={{
                   color: m.tier === 'A' ? '#22ff88' : m.tier === 'B' ? '#fbbf24' : '#8b8b96',
                   border: '1px solid currentColor', opacity: 0.9 }}> {m.tier} </span>
                 {m.n} <span className="text-[10px] text-zinc-500 font-normal">{m.d}</span>
+                <span className="ml-auto text-zinc-600 text-[10px]">{st.on ? '▾' : '▸'}</span>
               </label>
+              {st.on && (<>
               {schema.length ? (
                 <div className="param-grid">
                   {schema.map((p: any) => (
@@ -326,6 +329,7 @@ function IndSection() {
                   ))}
                 </div>
               ) : <div className="text-[10px] text-zinc-500 mt-1">No parameters — single config per timeframe.</div>}
+              </>)}
             </div>
           );
         })}
