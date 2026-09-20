@@ -6,6 +6,7 @@ import KpiStrip from './KpiStrip';
 import Leaderboard from './Leaderboard';
 import RegimeSplit from './RegimeSplit';
 import RunSummary from './RunSummary';
+import StressPanel from './StressPanel';
 import { DrawdownPanel, EquityPanel, OscPanel, PriceChart, VolPanel } from './ChartPanels';
 import TradeLog from './TradeLog';
 
@@ -23,6 +24,7 @@ export default function MainView() {
       <RunSummary />
       <Leaderboard />
       {detail && <RegimeSplit />}
+      {detail && <StressPanel />}
       {detail ? (
         <>
           <section className="card p-3">

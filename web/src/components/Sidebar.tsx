@@ -263,6 +263,17 @@ function ExecSection() {
       <label className="flex items-center gap-2 text-[11px] text-zinc-400 mt-2">
         <input type="checkbox" checked={st.useSession} onChange={() => set({ useSession: !st.useSession })} />
         Enforce intraday session filter (flat outside hours, no overnight)</label>
+      <div className="mt-1.5">
+        <div className="lbl mb-1">Trade windows (uncheck to drop a chop zone)</div>
+        <div className="grid grid-cols-2 gap-1">
+          {[['b1', '09:15–10:00'], ['b2', '10:00–12:00'], ['b3', '12:00–14:00'], ['b4', '14:00–15:30']].map(([v, l]) => (
+            <label key={v} className="flex items-center gap-1.5 text-[11px] text-zinc-300 cursor-pointer">
+              <input type="checkbox" checked={st.tradeWindows.includes(v)}
+                onChange={() => set({ tradeWindows: st.tradeWindows.includes(v) ? st.tradeWindows.filter(x => x !== v) : [...st.tradeWindows, v] })} />
+              {l}</label>
+          ))}
+        </div>
+      </div>
     </section>
   );
 }

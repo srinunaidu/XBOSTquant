@@ -5,7 +5,7 @@ import engine, { type BoardRow } from '../lib/engine';
 import { EXIT_LBL } from '../lib/config';
 import { useStore } from '../lib/store';
 import { fmtMoney, fmtParams } from '../lib/format';
-import { selectRow } from '../lib/runner';
+import { selectRow, detailFor } from '../lib/runner';
 
 ModuleRegistry.registerModules([AllCommunityModule]);
 
@@ -221,33 +221,7 @@ function CmpEquity({ champs }: { champs: BoardRow[] }) {
 
 // synchronous detail backtest (no store write) for overlay curves
 function runDetailForChart(r: BoardRow) {
-  const st = useStore.getState();
-  const ds = r.symbol ? st.datasets[r.symbol] : null;
-  const src = ds ? ds.raw : st.data;
-  if (!src || !src.t.length) return null;
-  const f = st.fromDate || st.toDate
-    ? (() => {
-        const lo = st.fromDate ? new Date(st.fromDate + 'T00:00:00').getTime() : -Infinity;
-        const hi = st.toDate ? new Date(st.toDate + 'T23:59:59').getTime() : Infinity;
-        const idx: number[] = [];
-        for (let i = 0; i < src.t.length; i++) if (src.t[i] >= lo && src.t[i] <= hi) idx.push(i);
-        const pk = (a: Float64Array) => Float64Array.from(idx.map(i => a[i]));
-        return { t: pk(src.t), o: pk(src.o), h: pk(src.h), l: pk(src.l), c: pk(src.c), v: pk(src.v) };
-      })()
-    : src;
-  const d = engine.resample(src, r.timeframe);
-  const sig = engine.buildSignals(d, { indicator: r.indicator, params: r.params });
-  const base = {
-    direction: 'Both', sessionStart: st.useSession ? st.sessStart : null, sessionEnd: st.useSession ? st.sessEnd : null,
-    slPct: r.slPct ?? 0.8, tpPct: r.tpPct ?? 1.6, trailPct: st.trail, capital: st.capital, qty: st.qty, lotSize: st.lot,
-    cost: st.cost, beTrigger: st.beTrigger, beLock: st.beLock, atrTrailPeriod: st.atrP, atrTrailMult: st.atrM,
-    ckPeriod: st.ckP, ckMult: st.ckM, fill: st.fill, entry: st.entry,
-    exit: r.exit || 'fixed', carry: !!r.carry,
-  };
-  const xo = engine.exitOptsFromParams(r.indicator, r.params || {});
-  if (xo) { (base as any).ckPeriod = xo.ckPeriod; (base as any).ckMult = xo.ckMult; }
-  (base as any).sessionMask = (base as any).carry ? new Int8Array(d.c.length).fill(1) : engine.buildSessionMask(d, (base as any).sessionStart, (base as any).sessionEnd);
-  const bt = engine.backtest(d, sig.pos, base);
-  return { d, bt };
+  const det = detailFor(r);
+  return det ? { d: det.data, bt: det.bt, cfg: det.cfg } : null;
 }
 

@@ -283,9 +283,7 @@ tailwind.config = { darkMode:'class', theme:{ extend:{
     <div class="card-hd mb-2"><span class="dot"></span><div class="lbl">⑥ Fill model (anti-lookahead)</div></div>
     <label class="lbl">Signal fill timing</label>
     <select id="fillMode" class="w-full mt-1">
-      <option value="close">Signal-bar CLOSE (causal, standard)</option>
-      <option value="next">NEXT bar OPEN (stricter, no touch)</option>
-    </select>
+      <option value="next" selected>Next-bar OPEN (stricter, no touch)</option><option value="close">Signal-bar CLOSE (causal, standard)</option></select>
     <div class="text-[10px] text-zinc-500 mt-1">Stops fill intrabar at stop levels in both modes. See FORMULAS.md §5.</div>
   </section>
 

@@ -28,6 +28,7 @@ export type BoardRow = {
   exit: string; carry: boolean; refined?: boolean; m: Metrics; err?: string;
   symbol: string;
   oosNet?: number; oosWR?: number; oosN?: number; survived?: boolean;
+  oosSharpe?: number | null; oosDegr?: number | null;
 };
 
 export interface Engine {
@@ -35,6 +36,9 @@ export interface Engine {
   parseCSVAll(text: string): { symbol: string | null; full: string; d: OHLCV }[];
   resample(d: OHLCV, tfMin: number): OHLCV;
   buildSessionMask(d: OHLCV, start: string | null, end: string | null): Int8Array;
+  buildWindowMask(t: Float64Array, wins: number[][]): Int8Array;
+  combineMasks(a: Int8Array | null, b: Int8Array | null): Int8Array | null;
+  sessionMaskFor(d: OHLCV, opts: Record<string, any>): Int8Array | null;
   rsi(close: Float64Array, p: number): Float64Array;
   buildSignals(d: OHLCV, cfg: { indicator: string; params: Record<string, number> }): {
     pos: Int8Array; overlay: Record<string, any>; osc: Record<string, any>;

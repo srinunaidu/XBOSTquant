@@ -41,7 +41,7 @@ export function runValidation() {
     for (let i = 0; i < sig.pos.length; i++) if (sig.pos[i] !== 0) { firstSig = i; break; }
     ok('L3 warmup quarantined (first signal >= bar 20)', firstSig >= 20, 'first=' + firstSig);
     const eff = tradeOpts();
-    eff.sessionMask = engine.buildSessionMask(d5, eff.sessionStart, eff.sessionEnd);
+    eff.sessionMask = engine.combineMasks(engine.buildSessionMask(d5, eff.sessionStart, eff.sessionEnd), engine.buildWindowMask(d5.t, eff.tradeWindows));
     const bt = engine.backtest(d5, sig.pos, eff);
     const m = bt.metrics;
     ok('L4 cost identity (net == grossP - grossL)', Math.abs(m.netPnL - (m.grossProfit - m.grossLoss)) < 0.01, `${(m.grossProfit - m.grossLoss).toFixed(2)} vs ${m.netPnL.toFixed(2)}`);

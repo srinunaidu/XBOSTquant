@@ -68,6 +68,13 @@ export default function RunSummary() {
           Top-5: {lastRun.top5.map((t: any, i: number) => `#${i + 1} ${t.tf}m ${t.ind} WR${t.wr}% n${t.n} ${fmtMoney(t.pnl)}`).join(' · ')}
         </div>
       )}
+      {lastRun.stress && (
+        <div className="mt-2 text-[11px] num text-zinc-400">
+          Stress[best]: MC maxDD p5 {lastRun.stress.mcP5}% · med {lastRun.stress.mcMed}% · worst {lastRun.stress.mcWorst}% ·
+          loss streak max {lastRun.stress.maxLossStreak} (P4 {(100 * lastRun.stress.p4).toFixed(1)}% · P5 {(100 * lastRun.stress.p5).toFixed(1)}% · P6 {(100 * lastRun.stress.p6).toFixed(1)}%) ·
+          avgMAE {fmtMoney(lastRun.stress.avgMAE)} · avgMFE {fmtMoney(lastRun.stress.avgMFE)}
+        </div>
+      )}
     </section>
   );
 }

@@ -1157,6 +1157,32 @@ function buildSessionMask(d, startStr, endStr){
   for(let i=0;i<n;i++){const dt=new Date(d.t[i]);const m=dt.getHours()*60+dt.getMinutes();mask[i]=(m>=s0&&m<=s1)?1:0;}
   return mask;
 }
+// Intraday window mask: 1 inside the allowed [fromMin,toMin) buckets (local clock).
+// Empty/missing list = all-pass (an all-off selection would silently zero every
+// backtest, so absence of a filter means no filtering).
+function buildWindowMask(t, wins){
+  const n=t.length, m=new Int8Array(n);
+  if(!wins||!wins.length){m.fill(1);return m;}
+  for(let i=0;i<n;i++){const dt=new Date(t[i]);const mm=dt.getHours()*60+dt.getMinutes();
+    let ok=0;for(let k=0;k<wins.length;k++){const w=wins[k];if(mm>=w[0]&&mm<w[1]){ok=1;break;}}
+    m[i]=ok;}
+  return m;
+}
+function combineMasks(a,b){
+  if(!a)return b; if(!b)return a;
+  const n=a.length,o=new Int8Array(n);
+  for(let i=0;i<n;i++)o[i]=a[i]&&b[i];
+  return o;
+}
+// One choke-point for execution gating: session (unless carry) ANDed with
+// allowed intraday windows. Returns null = trade everywhere.
+function sessionMaskFor(d, opts){
+  opts=opts||{};
+  let m=null;
+  if(!opts.carry)m=buildSessionMask(d,opts.sessionStart,opts.sessionEnd);
+  if(opts.tradeWindows&&opts.tradeWindows.length)m=combineMasks(m,buildWindowMask(d.t,opts.tradeWindows));
+  return m;
+}
 
 function backtest(d, sigPos, opts){
   opts=opts||{};
@@ -1165,7 +1191,7 @@ function backtest(d, sigPos, opts){
   const capital0=opts.capital||100000, qty=opts.qty||1, lotSize=opts.lotSize||1;
   const costPerTrade=opts.cost||0;
   const n=d.c.length;
-  const mask=opts.sessionMask||buildSessionMask(d, opts.sessionStart, opts.sessionEnd);
+  const mask=opts.sessionMask||sessionMaskFor(d, opts);
   const trades=[];
   let position=0, entryPx=0, entryIdx=0, entryTime=0, peak=0, trough=0, stopPx=0, trailPeak=0;
   const allowLong=direction==='Long'||direction==='Both';
@@ -1179,6 +1205,7 @@ function backtest(d, sigPos, opts){
     return s;
   }
   let curQty=0;
+  let trMAE=0, trMFE=0; // current-trade excursion (₹), reset on entry
   let liveEq=capital0, ruined=false; // ruin guard: account blown -> no new entries
   const eqMtm=new Float64Array(n).fill(capital0); // mark-to-market equity incl. open heat
   // dynamic exit plumbing
@@ -1191,7 +1218,7 @@ function backtest(d, sigPos, opts){
   let ckArr=null;
   if(exitMode==='ck')ckArr=chandeKroll(d.h,d.l,d.c,Math.max(2,Math.round(opts.ckPeriod||10)),opts.ckMult||3);
   let hiEntry=0, loEntry=0, beDone=false;
-  const useMask=opts.carry?null:mask; // carry overnight => ignore session flattening
+  const useMask=mask; // null = trade everywhere (carry, or no filters at all)
   const tmask=opts.tradeMask||null; // regime router: 1 = may trade this bar
   // Explicit fill timing (anti-lookahead): 'close' fills signal trades at the
   // signal bar's close; 'next' executes them at the NEXT bar's open. Resting
@@ -1217,6 +1244,9 @@ function backtest(d, sigPos, opts){
       const ret=position===1?(px-entryPx)/entryPx:(entryPx-px)/entryPx;
       if(position===1){if(px>trailPeak)trailPeak=px;if(d.h[i]>hiEntry)hiEntry=d.h[i];}
       else{if(px<trough||trough===0)trough=px; if(trough===0)trough=px;if(d.l[i]<loEntry||loEntry===0)loEntry=d.l[i];}
+      // MAE/MFE excursion tracking (₹, includes the entry bar onward)
+      if(position===1){const f=(d.h[i]-entryPx)*curQty,a=(entryPx-d.l[i])*curQty;if(f>trMFE)trMFE=f;if(a>trMAE)trMAE=a;}
+      else{const f=(entryPx-d.l[i])*curQty,a=(d.h[i]-entryPx)*curQty;if(f>trMFE)trMFE=f;if(a>trMAE)trMAE=a;}
       if(exitMode==='breakeven'&&!beDone&&ret>=beTrig)beDone=true; // lock floor once +beTrigger reached
       // trailing stop
       let stopHit=false, reason='';
@@ -1262,7 +1292,7 @@ function backtest(d, sigPos, opts){
         const units=qty*lotSize;
         let pnl=(position===1?(exitPx-entryPx):(entryPx-exitPx))*units - costPerTrade;
         const pnlPct=position===1?(exitPx-entryPx)/entryPx*100:(entryPx-exitPx)/entryPx*100;
-        trades.push({id:trades.length+1,entryIdx,exitIdx:i,entryTime:d.t[entryIdx],exitTime:d.t[i],entryPx,exitPx,type:position===1?'LONG':'SHORT',pnl,pnlPct,reason:stopHit?reason:(flip?'FLIP':(flatSignal?'SESSION/FLAT':'END'))});
+        trades.push({id:trades.length+1,entryIdx,exitIdx:i,entryTime:d.t[entryIdx],exitTime:d.t[i],entryPx,exitPx,type:position===1?'LONG':'SHORT',pnl,pnlPct,reason:stopHit?reason:(flip?'FLIP':(flatSignal?'SESSION/FLAT':'END')),mae:+trMAE.toFixed(2),mfe:+trMFE.toFixed(2),lat:stopHit?0:(fillNext?1:0)});
         position=0;curQty=0;
         liveEq+=pnl;
         // GUARD: halt immediately on ruin — fill the tail flat and break
@@ -1271,7 +1301,7 @@ function backtest(d, sigPos, opts){
         // immediate re-entry on flip (mask already enforced via tgt)
         if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined){
           position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;
-          hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
+          hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
         }
         lastExitBar=i;
         eqMtm[i]=liveEq+(position!==0?(position===1?(px-entryPx):(entryPx-px))*curQty:0);
@@ -1281,7 +1311,7 @@ function backtest(d, sigPos, opts){
       const allowEntry=!trigOnly||(edge&&i>lastExitBar);
       if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry){
         position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;
-        hiEntry=d.h[i];loEntry=d.l[i];beDone=false;
+        hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
       }
     }
     if(position!==0)eqMtm[i]=liveEq+(position===1?(px-entryPx):(entryPx-px))*curQty;
@@ -1483,7 +1513,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

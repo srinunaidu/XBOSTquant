@@ -105,6 +105,8 @@ export default function TradeLog() {
             { field: 'pnl', headerName: 'P&L ₹', width: 100, type: 'rightAligned', valueFormatter: (p: any) => (p.value >= 0 ? '+' : '') + (+p.value).toFixed(0), cellStyle: (p: any) => ({ color: p.value >= 0 ? '#22ff88' : '#fb4d6d' }) },
             { field: 'pnlPct', headerName: 'P&L %', width: 90, type: 'rightAligned', valueFormatter: (p: any) => (+p.value).toFixed(2) + '%' },
             { field: 'reason', headerName: 'Reason', width: 110 },
+            { field: 'mae', headerName: 'MAE ₹', width: 90, type: 'rightAligned', valueFormatter: (p: any) => (+p.value || 0).toFixed(0) },
+            { field: 'mfe', headerName: 'MFE ₹', width: 90, type: 'rightAligned', valueFormatter: (p: any) => (+p.value || 0).toFixed(0) },
             { field: 'regime', headerName: 'Regime', width: 76 },
             { field: 'conf', headerName: 'ML conf', width: 80, type: 'rightAligned' },
             { field: 'cap', headerName: 'Capital', width: 110, type: 'rightAligned', valueFormatter: (p: any) => '₹' + (+p.value).toLocaleString('en-IN') },

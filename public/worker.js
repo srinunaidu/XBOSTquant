@@ -33,7 +33,8 @@ self.onmessage = function(e) {
     if(!tfCache || tfCache.tf !== tf){
       const d=E.resample(d1m, tf);
       tfCache={tf, d, maskIn:E.buildSessionMask(d, tradeOpts.sessionStart, tradeOpts.sessionEnd),
-        maskCarry:new Int8Array(d.c.length).fill(1), reg:E.regimeSeries(d, {}), ml:null};
+        maskCarry:new Int8Array(d.c.length).fill(1), win:E.buildWindowMask(d.t, tradeOpts.tradeWindows),
+        reg:E.regimeSeries(d, {}), ml:null};
     }
     return tfCache;
   }
@@ -102,7 +103,7 @@ self.onmessage = function(e) {
       exit: eff.exit, carry: eff.carry, refined: !!refined, m: m, err: err });
     try {
       const dd = getTF(cfg.timeframe);
-      eff.sessionMask = eff.carry ? dd.maskCarry : dd.maskIn;
+      eff.sessionMask = E.combineMasks(eff.carry ? dd.maskCarry : dd.maskIn, dd.win);
       const sig = getSig(cfg); // cached: computed once per (tf, indicator, params)
       const bt = E.backtest(dd.d, sig.pos, eff);
       return mk(bt.metrics);

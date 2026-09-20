@@ -67,6 +67,7 @@ type State = {
   confGate: number;
   wfOn: boolean;
   wfSplit: number;
+  tradeWindows: string[];
   detail: Detail;
   view: 'all' | 'best' | 'cmp';
   boardFilter: string;
@@ -96,7 +97,7 @@ export const useStore = create<State>((set) => ({
   timeframes: [...TFS],
   objective: 'sharpe',
   topN: 500, cap: 60000,
-  direction: 'Both', entry: 'trigger', fill: 'close',
+  direction: 'Both', entry: 'trigger', fill: 'next',
   sessStart: '09:15', sessEnd: '15:15', useSession: true,
   slFix: 0.8, tpFix: 1.6, trail: 0.5, cost: 0, qty: 1, lot: 1,
   capital: 100000,
@@ -120,6 +121,7 @@ export const useStore = create<State>((set) => ({
   confGate: 60,
   wfOn: false,
   wfSplit: 70,
+  tradeWindows: ['b1', 'b2', 'b3', 'b4'],
   detail: null,
   view: 'all',
   boardFilter: '',

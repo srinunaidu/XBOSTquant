@@ -448,6 +448,25 @@ export async function runGrid() {
   try {
     const sL = useStore.getState();
     const best = bd[0] || null;
+    let stress: any = null;
+    if (best) {
+      try {
+        const det = detailFor(best);
+        if (det && det.bt.trades.length) {
+          const { monteCarloDD, streakStats, heatmap, excursionStats } = await import('./stress');
+          const mc = monteCarloDD(det.bt.trades, opts.capital, 1000, 42);
+          const sk = streakStats(det.bt.trades);
+          const ht = heatmap(det.bt.trades);
+          const ex = excursionStats(det.bt.trades);
+          stress = mc ? {
+            mcN: mc.iters, mcP5: +mc.p5.toFixed(1), mcMed: +mc.p50.toFixed(1), mcWorst: +mc.worst.toFixed(1),
+            maxLossStreak: sk.maxLossStreak, p4: +sk.p4.toFixed(3), p5: +sk.p5.toFixed(3), p6: +sk.p6.toFixed(3),
+            avgMAE: ex ? Math.round(ex.avgMAE) : null, avgMFE: ex ? Math.round(ex.avgMFE) : null,
+            heat: ht.map(h => ({ w: h.label, n: h.n, wr: +h.wr.toFixed(1), pnl: Math.round(h.pnl) })),
+          } : null;
+        }
+      } catch { /* best-effort */ }
+    }
     sL.set({
       lastRun: {
         at: new Date().toISOString(),
@@ -465,6 +484,7 @@ export async function runGrid() {
           return rb ? { sym: ssx, tf: rb.timeframe, ind: rb.indicator, wr: +rb.m.winRate.toFixed(1), n: rb.m.totalTrades, pnl: Math.round(rb.m.netPnL), sharpe: +rb.m.sharpe.toFixed(2) } : { sym: ssx, ind: null };
         }),
         top5: bd.slice(0, 5).map(r => ({ sym: r.symbol, tf: r.timeframe, ind: r.indicator, params: r.params, wr: +r.m.winRate.toFixed(1), n: r.m.totalTrades, pnl: Math.round(r.m.netPnL), dd: +r.m.maxDD.toFixed(2), sharpe: +r.m.sharpe.toFixed(2) })),
+        stress,
       },
     });
     const L = useStore.getState().lastRun;
@@ -477,6 +497,12 @@ export async function runGrid() {
     if (L.best) logLine(`best: [${L.best.sym}] ${L.best.tf}m ${L.best.ind} ${fmtParams(L.best.params)} SL=${L.best.sl} TP=${L.best.tp} exit=${L.best.exit}${L.best.carry ? '+carry' : ''}${L.best.refined ? ' [refined]' : ''} WR=${L.best.m.winRate}% n=${L.best.m.totalTrades} pnl=${L.best.m.netPnL} dd=${L.best.m.maxDD}% sharpe=${L.best.m.sharpe} OOS=${L.best.oos.net ?? '—'}/${L.best.oos.survived ?? '—'}`);
     L.top5.forEach((t: any, i: number) => logLine(`  top${i + 1}: [${t.sym}] ${t.tf}m ${t.ind} WR=${t.wr}% n=${t.n} pnl=${t.pnl} dd=${t.dd}% sharpe=${t.sharpe}`));
     (L.bestPerSymbol || []).forEach((t: any) => logLine(t.ind ? `  best[${t.sym}]: ${t.tf}m ${t.ind} WR=${t.wr}% n=${t.n} pnl=${t.pnl} sharpe=${t.sharpe}` : `  best[${t.sym}]: no rows`));
+    if (L.stress) {
+      const S = L.stress;
+      logLine(`stress[best]: MC1000 maxDD p5=${S.mcP5}% med=${S.mcMed}% worst=${S.mcWorst}% · lossStreak max=${S.maxLossStreak} P4=${(100 * S.p4).toFixed(1)}% P5=${(100 * S.p5).toFixed(1)}% P6=${(100 * S.p6).toFixed(1)}% · avgMAE=${S.avgMAE} avgMFE=${S.avgMFE}`);
+      S.heat.forEach((h: any) => logLine(`  heat ${h.w}: n=${h.n} WR=${h.wr}% pnl=${h.pnl}`));
+    }
+    logLine(`env: ${typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 120) : 'node'}`);
     logLine(`env: ${typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 120) : 'node'}`);
     logLine('===== END SUMMARY =====');
   } catch (e: any) { logLine('summary build failed: ' + (e?.message || e)); }
@@ -485,14 +511,12 @@ export async function runGrid() {
   if (bd.length && !s4.userPickedSeq) selectRow(bd[0], true);
 }
 
-export function selectRow(r: BoardRow, auto?: boolean) {
+export function detailFor(r: BoardRow) {
   const st = useStore.getState();
-  if (!auto) st.userPickedSeq = st.runSeq || 0;
-  // detail data comes from the ROW's symbol (multi-symbol runs)
   const ds = r.symbol ? st.datasets[r.symbol] : null;
-  const data = (ds ? filterData(ds.raw, st.fromDate, st.toDate) : st.data) as OHLCV;
-  if (!data || !data.t.length) return;
-  const d = engine.resample(data, r.timeframe);
+  const src = ds ? filterData(ds.raw, st.fromDate, st.toDate) : st.data;
+  if (!src || !src.t.length) return null;
+  const d = engine.resample(src, r.timeframe);
   const sig = engine.buildSignals(d, { indicator: r.indicator, params: r.params });
   const eff: any = tradeOpts();
   if (r.slPct != null) eff.slPct = r.slPct;
@@ -501,10 +525,20 @@ export function selectRow(r: BoardRow, auto?: boolean) {
   eff.exit = r.exit || 'fixed'; eff.carry = !!r.carry;
   const xod = engine.exitOptsFromParams(r.indicator, r.params || {});
   if (xod) { eff.ckPeriod = xod.ckPeriod; eff.ckMult = xod.ckMult; }
-  { const routed = routingFor({}, r.timeframe, d, r, eff);
-    if (routed.mask) eff.tradeMask = routed.mask; }
-  eff.sessionMask = eff.carry ? new Int8Array(d.c.length).fill(1) : engine.buildSessionMask(d, eff.sessionStart, eff.sessionEnd);
+  const routed = routingFor({}, r.timeframe, d, r, eff);
+  if (routed.mask) eff.tradeMask = routed.mask;
+  eff.sessionMask = engine.combineMasks(
+    eff.carry ? new Int8Array(d.c.length).fill(1) : engine.buildSessionMask(d, eff.sessionStart, eff.sessionEnd),
+    engine.buildWindowMask(d.t, eff.tradeWindows));
   const bt = engine.backtest(d, sig.pos, eff);
-  useStore.getState().set({ sel: r, detail: { cfg: r, data: d, sig, bt } });
+  return { cfg: r, data: d, sig, bt };
+}
+
+export function selectRow(r: BoardRow, auto?: boolean) {
+  const st = useStore.getState();
+  if (!auto) st.userPickedSeq = st.runSeq || 0;
+  const det = detailFor(r);
+  if (!det) return;
+  useStore.getState().set({ sel: r, detail: det });
 }
 
