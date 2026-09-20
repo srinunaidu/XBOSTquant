@@ -337,6 +337,10 @@ function IndSection() {
           }}>all</button>
         </div>
       </div>
+      <label className="flex items-center gap-2 text-[11px] text-emerald-300 mb-2 cursor-pointer">
+        <input type="checkbox" checked={useStore(s => s.adaptive)} onChange={e => set({ adaptive: e.target.checked })} />
+        Adaptive — auto-expand to B/C if best is weak (Sharpe &lt;1.2)
+      </label>
       <div className="space-y-2">
         {IND_META.map((m, ix) => {
           if (m.cat) return <div key={ix} className="lbl !text-green-400 pt-1">{m.cat}</div>;

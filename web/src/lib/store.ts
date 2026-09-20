@@ -68,6 +68,7 @@ type State = {
   wfOn: boolean;
   wfSplit: number;
   tradeWindows: string[];
+  adaptive: boolean;
   detail: Detail;
   view: 'all' | 'best' | 'cmp';
   boardFilter: string;
@@ -106,6 +107,7 @@ export const useStore = create<State>((set) => ({
   optRisk: true,
   slMin: 0.5, slMax: 1.1, slStep: 0.3, tpMin: 1.0, tpMax: 2.0, tpStep: 0.5,
   inds: defaultInds(),
+  adaptive: true,
   board: [],
   sel: null,
   userPickedSeq: 0,

@@ -1,10 +1,47 @@
 // Grid-search runner: worker-first with main-thread fallback, stop support,
 // live progress, hill-climb refinement. Faithful port of the validated logic.
 import engine, { type BoardRow, type OHLCV } from './engine';
-import { EXIT_LBL } from './config';
+import { EXIT_LBL, IND_META } from './config';
 import { useStore } from './store';
 import { fmtMoney, fmtParams } from './format';
 import { enabledSymbols, filterData } from './data';
+
+const IND_TIER: Record<string, string> = {};
+for (const m of IND_META) if (m.n && m.tier) IND_TIER[m.n] = m.tier;
+
+function selsForTiers(tiers: string[]) {
+  const s = useStore.getState();
+  const tfs = s.timeframes;
+  const sels: any[] = [];
+  const paramSteps: Record<string, Record<string, number>> = {};
+  const want = new Set(tiers);
+  for (const [ind, st] of Object.entries(s.inds)) {
+    if (!want.has(IND_TIER[ind] || 'B')) continue;
+    const ranges: Record<string, any> = {};
+    const steps: Record<string, number> = {};
+    for (const [k, r] of Object.entries(st.ranges)) {
+      ranges[k] = { min: +r.min, max: +r.max, step: +r.step };
+      steps[k] = +r.step || 0;
+    }
+    paramSteps[ind] = steps;
+    sels.push({ indicator: ind, ranges, steps, timeframes: tfs.length ? tfs : [5] });
+  }
+  return { sels, paramSteps };
+}
+
+function isGood(m: any): boolean {
+  if (!m || m.totalTrades < 5) return false;
+  // Balanced gate across your 5 objectives: WR, T/day proxy via trades, DD, Sharpe/Sortino
+  // Tuned to be permissive — only fails when edge is clearly weak.
+  const ddOk = m.maxDD >= -15; // not catastrophic
+  const wrOk = m.winRate >= 52;
+  const pfOk = m.profitFactor >= 1.15;
+  const shOk = m.sharpe >= 1.0;
+  // Good if Sharpe passes + at least 2 of the other 3
+  let score = 0;
+  if (wrOk) score++; if (pfOk) score++; if (ddOk) score++;
+  return shOk && score >= 2;
+}
 
 let worker: Worker | null = null;
 let rejecter: ((e: any) => void) | null = null;
@@ -514,6 +551,35 @@ export async function runGrid() {
   setRun({ current: '' });
   const s4 = useStore.getState();
   if (bd.length && !s4.userPickedSeq) selectRow(bd[0], true);
+  // Adaptive tier escalation: if Tier A best is weak, auto-enable next tier and re-run
+  if (s4.adaptive && !stopped && bd.length) {
+    const bestM = bd[0].m;
+    if (!isGood(bestM)) {
+      const cur = useStore.getState().inds;
+      const hasB = Object.entries(cur).some(([k, v]) => IND_TIER[k] === 'B' && v.on);
+      const hasC = Object.entries(cur).some(([k, v]) => IND_TIER[k] === 'C' && v.on);
+      let next: string | null = null;
+      if (!hasB) next = 'B';
+      else if (!hasC) next = 'C';
+      if (next) {
+        logLine(`Adaptive: best Tier ${next === 'B' ? 'A' : 'A+B'} weak (Sharpe ${bestM.sharpe.toFixed(2)}, WR ${bestM.winRate.toFixed(1)}%) — auto-enabling Tier ${next} and re-running`);
+        const nxt: any = { ...cur };
+        for (const k of Object.keys(IND_TIER)) if (IND_TIER[k] === next) nxt[k] = { ...nxt[k], on: true };
+        useStore.getState().set({ inds: nxt });
+        setTimeout(() => runGrid(), 400);
+      } else {
+        logLine(`Adaptive: all tiers exhausted — best remains Sharpe ${bestM.sharpe.toFixed(2)}`);
+      }
+    } else {
+      logLine(`Adaptive: Tier ${hasTierLabel()} good enough (Sharpe ${bestM.sharpe.toFixed(2)} WR ${bestM.winRate.toFixed(1)}%) — stopping`);
+    }
+  }
+}
+
+function hasTierLabel(): string {
+  const cur = useStore.getState().inds;
+  const onTiers = new Set(Object.entries(cur).filter(([_, v]: any) => v.on).map(([k]) => IND_TIER[k]));
+  return [...onTiers].sort().join('+') || '—';
 }
 
 export function detailFor(r: BoardRow) {
