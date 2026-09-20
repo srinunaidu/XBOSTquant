@@ -2,8 +2,9 @@
    Stage 1: exhaustive Cartesian grid. Stage 2: hill-climb refinement of the
    top rows (neighbors ±1 step incl. SL/TP) until no improvement. */
 try { importScripts('engine.js'); } catch(e) {}
+try { importScripts('robustness.js'); } catch(e) {}
 
-self.onmessage = function(e) {
+self.onmessage = async function(e) {
   const msg = e.data;
   if (msg.type !== 'run') return;
   const E = self.XBOST_ENGINE;
@@ -160,7 +161,33 @@ self.onmessage = function(e) {
     const nowBest = E.objectiveValue(pool[0].m, objective);
     if (nowBest > best + 1e-9) { best = nowBest; improved = true; }
   }
-  const ranked = E.rankResults(results, objective);
+  let ranked = E.rankResults(results, objective);
+  // §27 staged robustness: cheap on Top-500, medium on Top-100, full on Top-25
+  const Rb = (typeof XBOST_ROBUST !== 'undefined' ? XBOST_ROBUST : null);
+  if (Rb) {
+    const totalCombos = grid.length * (tradeOpts.sym || 'data').length || grid.length;
+    const tfs = (() => {
+      try {
+        const tf = ranked[0]?.timeframe || 5;
+        const d = getTF(tf).d;
+        return d;
+      } catch { return null; }
+    })();
+    if (tfs) {
+      for (let i = 0; i < Math.min(ranked.length, 25); i++) {
+        const cand = ranked[i];
+        const d0 = getTF(cand.timeframe).d;
+        try {
+          const r = await Rb.robustnessFor(d0, cand, Object.assign({}, tradeOpts), null, totalCombos, i + 1);
+          cand.robustness = r;
+          cand.robustScore = r.final.adjusted;
+        } catch (e) { cand.robustError = String(e && e.message || e); }
+      }
+      // re-rank Top-25 by robustness score (§24: robustness first)
+      const top25 = ranked.slice(0, 25).sort((a, b) => (b.robustScore || 0) - (a.robustScore || 0));
+      ranked = top25.concat(ranked.slice(25));
+    }
+  }
   self.postMessage({ type:'done', done:total + refined, total: total + refined, top:ranked.slice(0, topN),
     all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo, route:routeNotices });
 };

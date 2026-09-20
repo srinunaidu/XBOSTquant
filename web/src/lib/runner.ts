@@ -5,6 +5,7 @@ import { EXIT_LBL, IND_META } from './config';
 import { useStore } from './store';
 import { fmtMoney, fmtParams } from './format';
 import { enabledSymbols, filterData } from './data';
+import Robust from './robustness';
 
 const IND_TIER: Record<string, string> = {};
 for (const m of IND_META) if (m.n && m.tier) IND_TIER[m.n] = m.tier;

@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const files = ['engine.js', 'worker.js'];
+const files = ['engine.js', 'worker.js', 'robustness.js'];
 mkdirSync(join(root, 'public'), { recursive: true });
 for (const f of files) {
   copyFileSync(join(root, '..', 'public', f), join(root, 'public', f));
