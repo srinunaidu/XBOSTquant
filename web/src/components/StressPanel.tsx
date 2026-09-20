@@ -24,7 +24,14 @@ export default function StressPanel() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail, ran, mcN, capital]);
 
-  if (!detail) return null;
+  if (!detail) {
+    return (
+      <section className="card p-3">
+        <div className="font-display font-semibold text-[14px] tracking-tight">🧪 Stress Lab <span className="text-zinc-500 font-normal text-xs">· Monte Carlo · heatmap · streaks · MAE/MFE · best time</span></div>
+        <div className="empty-state">Select a strategy (click any leaderboard row) to run 1,000-shuffle Monte Carlo, heatmaps and streak odds…<br/><span className="text-zinc-600">Fill mode is next-bar OPEN by default (strict, no look-ahead).</span></div>
+      </section>
+    );
+  }
   const run = () => {
     setRan(r => r + 1);
     setTimeout(() => {
