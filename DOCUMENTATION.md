@@ -81,6 +81,15 @@ The detected layout string is shown under the data panel (e.g.
 Session filter default 09:15–15:15; bars outside flatten intraday positions
 (carry mode holds overnight). Date From/To inputs slice the loaded file.
 
+## 5. Dashboard tour (multi-symbol)
+
+Upload multiple CSVs — each becomes a toggleable dataset (symbol from column
+or filename). A run searches every enabled symbol with the same grid and
+merges one leaderboard (Symbol column, filterable); the summary names the
+overall best **and the best per symbol**; clicking any row loads that row's
+own symbol data into charts, log and compare overlay. Detail/compare views
+always follow the clicked row's symbol.
+
 ## 5. Dashboard tour
 
 **Sidebar** (collapsible via the ❮ chevron at its edge; state persists):

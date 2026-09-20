@@ -97,7 +97,7 @@ self.onmessage = function(e) {
     if(xo){ eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
     const tm = tradeMaskFor(cfg);
     if(tm) eff.tradeMask = tm;
-    const mk = (m, err) => ({ i: idx, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
+    const mk = (m, err) => ({ i: idx, symbol: msg.symbol || '', timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
       slPct: eff.slPct||0, tpPct: eff.tpPct||0, trailPct: eff.trailPct||0,
       exit: eff.exit, carry: eff.carry, refined: !!refined, m: m, err: err });
     try {

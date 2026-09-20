@@ -24,8 +24,7 @@ export default function RunSummary() {
       <div className="grid grid-cols-1 md:grid-cols-3 gap-3 text-[12px]">
         <div>
           <div className="lbl mb-1">Dataset &amp; grid</div>
-          {kv('Symbol', lastRun.dataset.symbol)}
-          {kv('Bars', Number(lastRun.dataset.bars).toLocaleString())}
+          {kv('Symbols', lastRun.dataset.symbols)}
           {kv('Range', `${lastRun.dataset.from} → ${lastRun.dataset.to}`)}
           {kv('Objective', lastRun.objective)}
           {kv('Combos', Number(lastRun.grid).toLocaleString())}
@@ -48,7 +47,7 @@ export default function RunSummary() {
         <div>
           <div className="lbl mb-1">Best found {b?.refined ? '(refined 🔁)' : ''}</div>
           {b ? (<>
-            {kv('Strategy', `${b.tf}m ${b.ind}`)}
+            {kv('Strategy', `[${b.sym}] ${b.tf}m ${b.ind}`)}
             {kv('Params', fmtParams(b.params))}
             {kv('SL / TP', `${b.sl}% / ${b.tp}% · ${b.exit}${b.carry ? '+carry' : ''}`)}
             {kv('Net P&L', <span className={b.m.netPnL >= 0 ? 'pos' : 'neg'}>{fmtMoney(b.m.netPnL)}</span>)}
@@ -59,6 +58,11 @@ export default function RunSummary() {
           </>) : <div className="text-zinc-500 text-[12px]">No rows (stopped early).</div>}
         </div>
       </div>
+      {lastRun.bestPerSymbol?.length > 1 && (
+        <div className="mt-2 text-[11px] num text-zinc-300">
+          Best per symbol: {lastRun.bestPerSymbol.map((t: any) => `[${t.sym}] ${t.ind ? `${t.tf}m ${t.ind} WR${t.wr}% n${t.n} ${fmtMoney(t.pnl)}` : 'no rows'}`).join(' · ')}
+        </div>
+      )}
       {lastRun.top5?.length > 1 && (
         <div className="mt-2 text-[11px] num text-zinc-400">
           Top-5: {lastRun.top5.map((t: any, i: number) => `#${i + 1} ${t.tf}m ${t.ind} WR${t.wr}% n${t.n} ${fmtMoney(t.pnl)}`).join(' · ')}

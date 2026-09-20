@@ -195,3 +195,34 @@ test('ML regime classifier trains deterministically and predicts', () => {
   assert.equal(a.pred.length, 600);
   assert.ok(a.pred.every(v => v >= 0 && v <= 3));
 });
+
+function multiDay(days, per, fn) {
+  // synthetic sessions with real calendar day boundaries
+  const n = days * per;
+  const t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+    l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+  const t0 = Date.parse('2024-01-01T09:15:00');
+  for (let d = 0; d < days; d++) for (let i = 0; i < per; i++) {
+    const k = d * per + i, b = fn(k, d);
+    t[k] = t0 + d * 86400000 + i * 60000;
+    o[k] = b[0]; h[k] = b[1]; l[k] = b[2]; c[k] = b[3]; v[k] = b[4] || 1000;
+  }
+  return { t, o, h, l, c, v };
+}
+
+test('validateLayers covers ML checks M5/M6', () => {
+  const d = multiDay(25, 40, (k, dd) => { const c = 100 + 8 * Math.sin(k / 20) + (dd % 2 ? k * 0.03 : -k * 0.01); return [c, c + 0.3, c - 0.3, c, 2000]; });
+  const checks = E.validateLayers(d, { ml: true, confGate: 0.6, wf: true, wfSplit: 70 });
+  const names = checks.map(c => c.name);
+  assert.ok(names.some(n => n.indexOf('M5') === 0), 'M5 present');
+  assert.ok(names.some(n => n.indexOf('M6') === 0), 'M6 present');
+  for (const c of checks) assert.ok(typeof c.pass === 'boolean' && typeof c.detail === 'string');
+});
+
+test('dayRegimeMask counts fallback bars', () => {
+  const d = multiDay(8, 40, (k) => { const c = 100 + k * 0.1; return [c, c + 0.2, c - 0.2, c, 1000]; });
+  const rt = E.dayRouting(d, { source: 'rules', confGate: 0.6 });
+  assert.ok(rt.dayReg);
+  const dm = E.dayRegimeMask(d, rt.dayReg, 'EMA', 0.6);
+  assert.ok(dm.mask.length === d.t.length && dm.fallbackBars >= 0);
+});

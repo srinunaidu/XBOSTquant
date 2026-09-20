@@ -36,7 +36,8 @@ type State = {
   sbHide: boolean;
   symbol: string;
   raw: OHLCV | null;
-  data: OHLCV | null; // date-filtered 1m
+  data: OHLCV | null; // date-filtered 1m (active symbol)
+  datasets: Record<string, { raw: OHLCV; label: string; enabled?: boolean }>;
   fromDate: string; toDate: string;
   dataInfo: string;
   timeframes: number[];
@@ -89,6 +90,7 @@ export const useStore = create<State>((set) => ({
   symbol: '',
   raw: null,
   data: null,
+  datasets: {},
   fromDate: '', toDate: '',
   dataInfo: 'No file loaded — upload a 1-min CSV to begin.',
   timeframes: [...TFS],

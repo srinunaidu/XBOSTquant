@@ -1056,6 +1056,11 @@ function validateLayers(d, o){
       let same=true;for(let i=0;i<a.W.length;i++)if(a.W[i]!==b.W[i]){same=false;break;}
       out.push({name:'M2 ML deterministic (identical weights)',pass:same,warn:false,detail:same?'bit-identical':'NON-DETERMINISTIC'});
       out.push({name:'M3 ML beats chance (>25%)',pass:a.acc>0.25,warn:false,detail:(100*a.acc).toFixed(1)+'% train acc'});
+      let fin=true;for(let i=0;i<a.W.length;i++)if(!isFinite(a.W[i])){fin=false;break;}
+      out.push({name:'M5 ML weights finite (no blowup)',pass:fin,warn:false,detail:fin?'all ' +a.W.length+' weights finite':'NON-FINITE WEIGHTS'});
+      const seen={};for(let i=1;i<a.pred.length;i++)seen[a.pred[i]]=1;
+      const ncov=Object.keys(seen).length;
+      out.push({name:'M6 ML predicts ≥2 classes (not collapsed)',pass:true,warn:ncov<2,detail:ncov+' distinct predicted classes'});
       let hi=0;for(let i=1;i<a.conf.length;i++)if(a.conf[i]>=(o.confGate||0.6))hi++;
       const cov=segs.length>1?hi/(segs.length-1):0;
       out.push({name:'M4 confident-day coverage',pass:true,warn:cov<0.3,detail:(100*cov).toFixed(0)+'% days ≥ gate (rest fallback, measured)'});

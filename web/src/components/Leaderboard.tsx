@@ -24,7 +24,7 @@ const darkTheme = themeQuartz.withParams({
 function rowToObj(r: BoardRow, ix: number) {
   const m = r.m;
   return {
-    ix: ix + 1, tf: r.timeframe + 'm', ind: r.indicator + (r.refined ? ' 🔁' : ''),
+    ix: ix + 1, sym: r.symbol || '', tf: r.timeframe + 'm', ind: r.indicator + (r.refined ? ' 🔁' : ''),
     params: fmtParams(r.params),
     exit: EXIT_LBL[r.exit || 'fixed'] || 'FIX', sess: r.carry ? 'CRY' : 'DAY',
     sl: (r.slPct || 0).toFixed(2), tp: (r.tpPct || 0).toFixed(2),
@@ -39,6 +39,7 @@ function rowToObj(r: BoardRow, ix: number) {
 
 const COLS = [
   { field: 'ix', headerName: '#', width: 52 },
+  { field: 'sym', headerName: 'Symbol', width: 96 },
   { field: 'tf', headerName: 'TF', width: 62 },
   { field: 'ind', headerName: 'Strategy', minWidth: 130, flex: 1 },
   { field: 'params', headerName: 'Params', minWidth: 200, flex: 2 },
@@ -80,7 +81,7 @@ export default function Leaderboard() {
   const rows = useMemo(() => {
     const q = boardFilter.toLowerCase();
     let list = board.filter(r =>
-      !q || (r.indicator + ' ' + r.timeframe + ' ' + fmtParams(r.params) + ' ' + (r.exit || '') + (r.carry ? ' carry' : '')).toLowerCase().includes(q));
+      !q || (r.symbol + ' ' + r.indicator + ' ' + r.timeframe + ' ' + fmtParams(r.params) + ' ' + (r.exit || '') + (r.carry ? ' carry' : '')).toLowerCase().includes(q));
     if (view === 'best') {
       const ranked = engine.rankResults(board, objective);
       const seen = new Set<string>(), out: BoardRow[] = [];
@@ -146,8 +147,8 @@ function CompareView() {
       <div className="overflow-auto max-h-[300px] border border-[#232329] rounded-lg mb-2">
         <table className="w-full min-w-[1150px] text-[12px] num">
           <thead className="bg-[#141419] sticky top-0">
-            <tr className="text-[10px] uppercase tracking-wider text-zinc-400">
-              <th className="p-2 text-left">#</th><th className="p-2 text-left">Exit profile</th><th className="p-2 text-right">TF</th>
+              <tr className="text-[10px] uppercase tracking-wider text-zinc-400">
+                <th className="p-2 text-left">#</th><th className="p-2 text-left">Symbol</th><th className="p-2 text-left">Exit profile</th><th className="p-2 text-right">TF</th>
               <th className="p-2 text-left">Strategy</th><th className="p-2 text-left">Params</th><th className="p-2 text-right">SL %</th>
               <th className="p-2 text-right">TP %</th><th className="p-2 text-right">Net P&L ₹</th><th className="p-2 text-right">WR %</th>
               <th className="p-2 text-right">Trades</th><th className="p-2 text-right">PF</th><th className="p-2 text-right">MaxDD %</th><th className="p-2 text-right">Sharpe</th>
@@ -157,6 +158,7 @@ function CompareView() {
             {champs.map((r, ix) => (
               <tr key={ix} className="border-t border-[#1b1b22] hover:bg-[#17171f] cursor-pointer" onClick={() => selectRow(r)}>
                 <td className="p-2">{ix + 1}</td>
+                <td className="p-2">{r.symbol || ''}</td>
                 <td className="p-2">{EXIT_LBL[r.exit || 'fixed']}{r.carry ? ' + carry' : ' intraday'}</td>
                 <td className="p-2 text-right">{r.timeframe}m</td>
                 <td className="p-2">{r.indicator}</td>
@@ -201,7 +203,7 @@ function CmpEquity({ champs }: { champs: BoardRow[] }) {
         for (let i = 0; i < det.d.t.length; i += stride) {
           pts.push({ time: Math.floor(det.d.t[i] / 1000) as any, value: +det.bt.equity[i].toFixed(0) });
         }
-        const ls = chart.addLineSeries({ color: colors[di % colors.length], lineWidth: 2, priceFormat: { type: 'volume' } });
+        const ls = chart.addLineSeries({ color: colors[di % colors.length], lineWidth: 2, title: `[${r.symbol || ''}] ${r.indicator} ${r.timeframe}m`, priceFormat: { type: 'volume' } });
         ls.setData(pts);
       });
       chart.timeScale().fitContent();
@@ -220,8 +222,20 @@ function CmpEquity({ champs }: { champs: BoardRow[] }) {
 // synchronous detail backtest (no store write) for overlay curves
 function runDetailForChart(r: BoardRow) {
   const st = useStore.getState();
-  if (!st.data) return null;
-  const d = engine.resample(st.data, r.timeframe);
+  const ds = r.symbol ? st.datasets[r.symbol] : null;
+  const src = ds ? ds.raw : st.data;
+  if (!src || !src.t.length) return null;
+  const f = st.fromDate || st.toDate
+    ? (() => {
+        const lo = st.fromDate ? new Date(st.fromDate + 'T00:00:00').getTime() : -Infinity;
+        const hi = st.toDate ? new Date(st.toDate + 'T23:59:59').getTime() : Infinity;
+        const idx: number[] = [];
+        for (let i = 0; i < src.t.length; i++) if (src.t[i] >= lo && src.t[i] <= hi) idx.push(i);
+        const pk = (a: Float64Array) => Float64Array.from(idx.map(i => a[i]));
+        return { t: pk(src.t), o: pk(src.o), h: pk(src.h), l: pk(src.l), c: pk(src.c), v: pk(src.v) };
+      })()
+    : src;
+  const d = engine.resample(src, r.timeframe);
   const sig = engine.buildSignals(d, { indicator: r.indicator, params: r.params });
   const base = {
     direction: 'Both', sessionStart: st.useSession ? st.sessStart : null, sessionEnd: st.useSession ? st.sessEnd : null,

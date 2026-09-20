@@ -26,6 +26,7 @@ export type BoardRow = {
   i: number; timeframe: number; indicator: string; params: Record<string, number>;
   slPct: number; tpPct: number; trailPct: number;
   exit: string; carry: boolean; refined?: boolean; m: Metrics; err?: string;
+  symbol: string;
   oosNet?: number; oosWR?: number; oosN?: number; survived?: boolean;
 };
 

@@ -30,7 +30,7 @@ export default function MainView() {
               <div className="font-display font-semibold text-[14px] tracking-tight">
                 📈 Price · Overlays · Signals{' '}
                 <span className="text-zinc-500 font-normal text-xs num">
-                  · {symbol} · {detail.cfg.timeframe}m · {detail.cfg.indicator} · SL {(detail.cfg.slPct || 0).toFixed(2)}% / TP {(detail.cfg.tpPct || 0).toFixed(2)}% · {EXIT_LBL[detail.cfg.exit || 'fixed'] || 'FIX'}{detail.cfg.carry ? ' +carry' : ''}
+                  · {detail.cfg.symbol || symbol} · {detail.cfg.timeframe}m · {detail.cfg.indicator} · SL {(detail.cfg.slPct || 0).toFixed(2)}% / TP {(detail.cfg.tpPct || 0).toFixed(2)}% · {EXIT_LBL[detail.cfg.exit || 'fixed'] || 'FIX'}{detail.cfg.carry ? ' +carry' : ''}
                 </span>
               </div>
               <div className="ml-auto flex items-center gap-2 text-xs text-zinc-400">

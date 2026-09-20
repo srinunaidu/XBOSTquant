@@ -4,6 +4,7 @@ import engine, { type BoardRow, type OHLCV } from './engine';
 import { EXIT_LBL } from './config';
 import { useStore } from './store';
 import { fmtMoney, fmtParams } from './format';
+import { enabledSymbols, filterData } from './data';
 
 let worker: Worker | null = null;
 let rejecter: ((e: any) => void) | null = null;
@@ -129,7 +130,7 @@ export function stopRun() {
   useStore.getState().runSeq = seq;
 }
 
-function runWithWorker(grid: any[], gData: OHLCV, opts: any, objective: string, topN: number,
+function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, objective: string, topN: number,
   onBatch: (done: number, total: number | string, top: BoardRow[], cur: any, stage: string, pass: number) => void,
   paramSteps: any, risk: any): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[]; route?: string[] }> {
   return new Promise((resolve, reject) => {
@@ -149,7 +150,7 @@ function runWithWorker(grid: any[], gData: OHLCV, opts: any, objective: string, 
     };
     (w as any).onerror = (e: any) => { clearTimeout(timer); try { w.terminate(); } catch { /* noop */ } worker = null; rejecter = null; reject(e.message || e); };
     w.postMessage({
-      type: 'run', t: d.t, o: d.o, h: d.h, l: d.l, c: d.c, v: d.v,
+      type: 'run', symbol: sym, t: d.t, o: d.o, h: d.h, l: d.l, c: d.c, v: d.v,
       grid, tradeOpts: opts, objective, topN, paramSteps: paramSteps || {},
       slStep: risk && risk.sl ? stepsOf(risk.sl) : 0,
       tpStep: risk && risk.tp ? stepsOf(risk.tp) : 0,
@@ -159,7 +160,7 @@ function runWithWorker(grid: any[], gData: OHLCV, opts: any, objective: string, 
 
 async function runAsync(grid: any[], opts: any, objective: string, topN: number,
   onBatch: (done: number, total: number | string, top: BoardRow[], cur: any, stage: string, pass: number) => void,
-  paramSteps: any, risk: any, mySeq: number, dataSrc?: OHLCV) {
+  paramSteps: any, risk: any, mySeq: number, dataSrc?: OHLCV, sym: string = '') {
   const data = (dataSrc || useStore.getState().data) as OHLCV;
   let tfCache: any = null, sigCache: any = { key: null, sig: null };
   const res: BoardRow[] = [];
@@ -187,7 +188,7 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
     if (sigCache.key !== sk) sigCache = { key: sk, sig: engine.buildSignals(d, cfg) };
     const bt = engine.backtest(d, sigCache.sig.pos, eff);
     return {
-      i: idx, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
+      i: idx, symbol: sym, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
       slPct: eff.slPct || 0, tpPct: eff.tpPct || 0, trailPct: eff.trailPct || 0,
       exit: eff.exit, carry: eff.carry, refined: !!refined, m: bt.metrics,
     };
@@ -199,7 +200,7 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
     try { res.push(testCfg(cfg, i, false)); }
     catch (err: any) {
       const s = useStore.getState(); s.set({ run: { ...s.run, errCount: s.run.errCount + 1 } });
-      res.push({ i, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params, slPct: cfg.slPct || 0, tpPct: cfg.tpPct || 0, trailPct: 0, exit: cfg.exit || 'fixed', carry: !!cfg.carry, refined: false, m: { netPnL: 0, winRate: 0, totalTrades: 0, profitFactor: 0, maxDD: 0, sharpe: -99, sortino: -99, expectancy: 0, finalCapital: opts.capital || 100000, tradesPerDay: 0, days: 0 } as any, err: String((err as any)?.message || err) });
+      res.push({ i, symbol: sym, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params, slPct: cfg.slPct || 0, tpPct: cfg.tpPct || 0, trailPct: 0, exit: cfg.exit || 'fixed', carry: !!cfg.carry, refined: false, m: { netPnL: 0, winRate: 0, totalTrades: 0, profitFactor: 0, maxDD: 0, sharpe: -99, sortino: -99, expectancy: 0, finalCapital: opts.capital || 100000, tradesPerDay: 0, days: 0 } as any, err: String((err as any)?.message || err) });
     }
     if (i % 10 === 0 || i === grid.length - 1) {
       onBatch(i + 1, grid.length, engine.rankResults(res, objective).slice(0, topN),
@@ -247,50 +248,70 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
 // same regime routing). Rows gain oosNet/oosWR/oosN/survived. Cheap: ≤200 runs.
 export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
   const st = useStore.getState();
-  const data = st.data!;
-  const splitT = data.t[0] + (st.wfSplit / 100) * (data.t[data.t.length - 1] - data.t[0]);
-  let si = 0;
-  while (si < data.t.length && data.t[si] < splitT) si++;
-  const pick = (a: Float64Array) => a.slice(si);
-  const oos = { t: pick(data.t), o: pick(data.o), h: pick(data.h), l: pick(data.l), c: pick(data.c), v: pick(data.v) };
-  if (oos.t.length < 50) return 'OOS slice too thin, skipped';
-  const tfCache: Record<number, any> = {};
-  const wfRouteCache: Record<number, any> = {};
-  const getTF = (tf: number) => {
-    if (!tfCache[tf]) {
-      const d = engine.resample(oos as any, tf);
-      tfCache[tf] = { d, maskIn: engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd), maskCarry: new Int8Array(d.c.length).fill(1), reg: null as any, ml: null as any };
-    }
-    return tfCache[tf];
-  };
-  const cands = rows.slice(0, 200);
-  for (let k = 0; k < cands.length; k++) {
-    if (useStore.getState().runSeq !== mySeq) return 'aborted';
-    const r = cands[k];
-    const tfc = getTF(r.timeframe);
-    const eff: any = Object.assign({}, opts, {
-      sessionMask: r.carry ? tfc.maskCarry : tfc.maskIn,
-      slPct: r.slPct, tpPct: r.tpPct, trailPct: r.trailPct ?? opts.trailPct,
-      exit: r.exit || 'fixed', carry: !!r.carry,
-    });
-    const xo = engine.exitOptsFromParams(r.indicator, r.params || {});
-    if (xo) { eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
-    { const routed = routingFor(wfRouteCache, r.timeframe, tfc.d, r, eff);
-      if (routed.mask) eff.tradeMask = routed.mask;
-      routed.notices.forEach(n => logLine('  WF route: ' + n)); }
-    const sig = engine.buildSignals(tfc.d, { indicator: r.indicator, params: r.params });
-    const bt = engine.backtest(tfc.d, sig.pos, eff);
-    r.oosNet = bt.metrics.netPnL; r.oosWR = bt.metrics.winRate; r.oosN = bt.metrics.totalTrades;
-    r.survived = bt.metrics.netPnL > 0;
-    if (k % 25 === 0) await new Promise(rr => setTimeout(rr, 0));
+  const bySym: Record<string, BoardRow[]> = {};
+  for (const r of rows.slice(0, 200)) {
+    const k = r.symbol || st.symbol || 'DATA';
+    (bySym[k] = bySym[k] || []).push(r);
   }
-  const surv = cands.filter(r => r.survived).length;
-  return `WF ${st.wfSplit}/${100 - st.wfSplit}: ${surv}/${cands.length} survived OOS`;
+  const filt = (raw: OHLCV): OHLCV => {
+    if (!st.fromDate && !st.toDate) return raw;
+    const lo = st.fromDate ? new Date(st.fromDate + 'T00:00:00').getTime() : -Infinity;
+    const hi = st.toDate ? new Date(st.toDate + 'T23:59:59').getTime() : Infinity;
+    const idx: number[] = [];
+    for (let i = 0; i < raw.t.length; i++) if (raw.t[i] >= lo && raw.t[i] <= hi) idx.push(i);
+    const pk = (a: Float64Array) => Float64Array.from(idx.map(i => a[i]));
+    return { t: pk(raw.t), o: pk(raw.o), h: pk(raw.h), l: pk(raw.l), c: pk(raw.c), v: pk(raw.v) };
+  };
+  let total = 0, surv = 0;
+  for (const sym of Object.keys(bySym)) {
+    if (useStore.getState().runSeq !== mySeq) return 'aborted';
+    const ds = st.datasets[sym];
+    const data = ds ? filt(ds.raw) : st.data;
+    if (!data || data.t.length < 100) continue;
+    const splitT = data.t[0] + (st.wfSplit / 100) * (data.t[data.t.length - 1] - data.t[0]);
+    let si = 0;
+    while (si < data.t.length && data.t[si] < splitT) si++;
+    const pick = (a: Float64Array) => a.slice(si);
+    const oos = { t: pick(data.t), o: pick(data.o), h: pick(data.h), l: pick(data.l), c: pick(data.c), v: pick(data.v) };
+    if (oos.t.length < 50) continue;
+    const tfCache: Record<number, any> = {};
+    const wfRouteCache: Record<number, any> = {};
+    const getTF = (tf: number) => {
+      if (!tfCache[tf]) {
+        const d = engine.resample(oos as any, tf);
+        tfCache[tf] = { d, maskIn: engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd), maskCarry: new Int8Array(d.c.length).fill(1) };
+      }
+      return tfCache[tf];
+    };
+    for (const r of bySym[sym]) {
+      if (useStore.getState().runSeq !== mySeq) return 'aborted';
+      const tfc = getTF(r.timeframe);
+      const eff: any = Object.assign({}, opts, {
+        sessionMask: r.carry ? tfc.maskCarry : tfc.maskIn,
+        slPct: r.slPct, tpPct: r.tpPct, trailPct: r.trailPct ?? opts.trailPct,
+        exit: r.exit || 'fixed', carry: !!r.carry,
+      });
+      const xo = engine.exitOptsFromParams(r.indicator, r.params || {});
+      if (xo) { eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
+      const routed = routingFor(wfRouteCache, r.timeframe, tfc.d, r, eff);
+      if (routed.mask) eff.tradeMask = routed.mask;
+      const sig = engine.buildSignals(tfc.d, { indicator: r.indicator, params: r.params });
+      const bt = engine.backtest(tfc.d, sig.pos, eff);
+      r.oosNet = bt.metrics.netPnL; r.oosWR = bt.metrics.winRate; r.oosN = bt.metrics.totalTrades;
+      r.survived = bt.metrics.netPnL > 0;
+      total++;
+      if (r.survived) surv++;
+      if (total % 25 === 0) await new Promise(rr => setTimeout(rr, 0));
+    }
+    logLine(`  WF [${sym}]: ${bySym[sym].filter(r => r.survived).length}/${bySym[sym].length} survived OOS`);
+  }
+  return `WF ${st.wfSplit}/${100 - st.wfSplit}: ${surv}/${total} survived OOS`;
 }
 
 export async function runGrid() {
   const st = useStore.getState();
-  if (!st.data) { st.set({ alert: 'No market data — upload a 1-min CSV before running a search.' }); return; }
+  const syms = enabledSymbols();
+  if (!syms.length) { st.set({ alert: 'No market data — upload 1-min CSV file(s) before running a search.' }); return; }
   const { sels, paramSteps } = buildSelection();
   if (!sels.length) { st.set({ alert: 'No indicators selected — enable at least one strategy.' }); return; }
   const risk = buildRisk();
@@ -306,27 +327,29 @@ export async function runGrid() {
   if (!grid.length) { st.set({ alert: 'Empty grid — check parameter ranges.' }); return; }
   const objective = st.objective, topN = st.topN;
   const opts = tradeOpts();
-  // Walk-forward: grid searches the in-sample slice; top rows verify on the
-  // untouched out-of-sample tail. Detail/compare views stay full-data.
-  let gData = st.data!;
-  let wfNote = '';
-  if (st.wfOn && st.data!.t.length > 200) {
-    const d0 = st.data!.t[0], d1 = st.data!.t[st.data!.t.length - 1];
-    const cut = d0 + (st.wfSplit / 100) * (d1 - d0);
-    let si = 0;
-    while (si < st.data!.t.length && st.data!.t[si] < cut) si++;
-    const pk = (a: Float64Array) => a.slice(0, si);
-    gData = { t: pk(st.data!.t), o: pk(st.data!.o), h: pk(st.data!.h), l: pk(st.data!.l), c: pk(st.data!.c), v: pk(st.data!.v) };
-    wfNote = ` WF ${st.wfSplit}/${100 - st.wfSplit}`;
-  }
+  // Per-symbol execution data (WF in-sample slice when enabled; detail views
+  // stay full-data). Single-symbol runs behave exactly as before.
+  const symData: [string, OHLCV][] = syms.map(([sym, d]) => {
+    if (st.wfOn && d.t.length > 200) {
+      const d0 = d.t[0], d1 = d.t[d.t.length - 1];
+      const cut = d0 + (st.wfSplit / 100) * (d1 - d0);
+      let si = 0;
+      while (si < d.t.length && d.t[si] < cut) si++;
+      const pk = (a: Float64Array) => a.slice(0, si);
+      return [sym, { t: pk(d.t), o: pk(d.o), h: pk(d.h), l: pk(d.l), c: pk(d.c), v: pk(d.v) }];
+    }
+    return [sym, d];
+  });
+  const wfNote = st.wfOn ? ` WF ${st.wfSplit}/${100 - st.wfSplit}` : '';
+  const grandTotal = grid.length * symData.length;
   const mySeq = seq + 1; seq = mySeq;
   st.runSeq = mySeq;
   st.set({ alert: null });
   const t0 = performance.now();
   let lastRender = 0;
   const setRun = (p: Partial<typeof st.run>) => useStore.getState().set({ run: { ...useStore.getState().run, ...p } });
-  setRun({ running: true, done: 0, total: grid.length, stage: 'grid', pass: 0, perSec: 0, eta: '', current: 'warming up…', errCount: 0, refined: 0, passes: 0, summary: `0 / ${grid.length}` });
-  logLine(`run start: ${st.symbol || '?'} ${(st.data.t.length / 1000).toFixed(0)}k bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}`);
+  setRun({ running: true, done: 0, total: grandTotal, stage: 'grid', pass: 0, perSec: 0, eta: '', current: 'warming up…', errCount: 0, refined: 0, passes: 0, summary: `0 / ${grandTotal}` });
+  logLine(`run start: ${syms.map(([s, d]) => `${s} ${(d.t.length / 1000).toFixed(0)}k`).join(' + ')} bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}x${symData.length}sym`);
   const onBatch = (done: number, total: number | string, top: BoardRow[], current: any, stage: string, pass: number) => {
     if (useStore.getState().runSeq !== mySeq) return;
     if (stage === 'refine' && !useStore.getState()._refineAt) useStore.getState()._refineAt = performance.now();
@@ -338,7 +361,7 @@ export async function runGrid() {
       const s = Math.round((total - done) / perSec);
       eta = ` · ETA ${fmtETA(s)}`;
     }
-    const cur = current ? `${stage === 'refine' ? '🔁 refining best:' : '⚙ now running:'} ${current.indicator} ${current.timeframe}m · ${fmtParams(current.params)}${current.slPct != null ? ` · SL ${current.slPct}% TP ${current.tpPct}%` : ''}${current.exit ? ` · ${EXIT_LBL[current.exit] || current.exit}${current.carry ? '+carry' : ''}` : ''}` : '';
+    const cur = current ? `${stage === 'refine' ? '🔁 refining best:' : '⚙ now running:'} ${current.sym ? `[${current.sym}] ` : ''}${current.indicator} ${current.timeframe}m · ${fmtParams(current.params)}${current.slPct != null ? ` · SL ${current.slPct}% TP ${current.tpPct}%` : ''}${current.exit ? ` · ${EXIT_LBL[current.exit] || current.exit}${current.carry ? '+carry' : ''}` : ''}` : '';
     setRun({ done: typeof done === 'number' ? done : 0, total, perSec, eta, current: cur, summary: `${done} / ${total}${stage === 'refine' ? ` · refine pass ${pass || ''}` : ''} (${pct}%) · ${perSec.toFixed(0)}/s${eta}` });
     useStore.getState().set({ board: top });
     const now = performance.now();
@@ -349,36 +372,48 @@ export async function runGrid() {
   let top: BoardRow[] = [], refineInfo = '', errSamples: any[] = [], runMode = 'worker', stopped = false;
   let refinedN = 0, passesN = 0;
   let mlInfo: any[] = [], routeInfo: string[] = [];
+  const allRows: BoardRow[] = [];
   useStore.getState()._refineAt = null;
-  try {
-    const out = await runWithWorker(grid, gData, opts, objective, topN, onBatch, paramSteps, risk);
-    top = out.top;
-    refineInfo = out.refined ? ` · 🔁 +${out.refined} refined (${out.passes} passes)` : '';
-    errSamples = out.errSamples || [];
-    refinedN = out.refined || 0; passesN = out.passes || 0;
-    mlInfo = out.ml || [];
-    routeInfo = (out as any).route || [];
-    if (useStore.getState().runSeq === mySeq) useStore.getState().set({ board: top });
-  } catch (err: any) {
-    if (useStore.getState().stoppedFlag) { /* fall through to stopped finalizer */ }
-    else {
-      logLine(`worker unavailable (${err?.message || err}) — main-thread fallback`);
+  let doneBase = 0;
+  for (const [sym, sData] of symData) {
+    if (useStore.getState().runSeq !== mySeq || useStore.getState().stoppedFlag) break;
+    const wrapBatch = (done: number, total: number | string, btop: BoardRow[], cur: any, stage: string, pass: number) => {
+      const gDone = typeof done === 'number' ? doneBase + done : done;
+      onBatch(gDone, grandTotal, btop, cur ? { ...cur, sym } : cur, stage, pass);
+    };
+    try {
+      const out = await runWithWorker(grid, sData, sym, opts, objective, topN, wrapBatch, paramSteps, risk);
+      allRows.push(...out.top);
+      refineInfo += out.refined ? ` · ${sym}+${out.refined}r` : '';
+      errSamples.push(...(out.errSamples || []));
+      refinedN += out.refined || 0; passesN = Math.max(passesN, out.passes || 0);
+      mlInfo.push(...(out.ml || []).map((m: any) => ({ ...m, sym })));
+      routeInfo.push(...((out as any).route || []).map((n: string) => `[${sym}] ${n}`));
+      if (useStore.getState().runSeq === mySeq) {
+        useStore.getState().set({ board: engine.rankResults(allRows, objective).slice(0, topN) });
+      }
+    } catch (err: any) {
+      if (useStore.getState().stoppedFlag) break;
+      logLine(`[${sym}] worker unavailable (${err?.message || err}) — main-thread fallback`);
       runMode = 'fallback';
       try {
-        const out = await runAsync(grid, opts, objective, topN, onBatch, paramSteps, risk, mySeq, gData);
-        top = out.top;
-        refineInfo = out.refined ? ` · 🔁 +${out.refined} refined (${out.passes} passes)` : '';
+        const out = await runAsync(grid, opts, objective, topN, wrapBatch, paramSteps, risk, mySeq, sData, sym);
+        allRows.push(...out.top);
+        refineInfo += out.refined ? ` · ${sym}+${out.refined}r` : '';
         stopped = !!out.stopped;
-        refinedN = out.refined || 0; passesN = out.passes || 0;
-        useStore.getState().set({ board: top });
+        refinedN += out.refined || 0; passesN = Math.max(passesN, out.passes || 0);
+        if (stopped) break;
       } catch (err2: any) {
-        setRun({ running: false, summary: `❌ ERROR: ${err2?.message || err2}` });
-        useStore.getState().set({ alert: `Grid search failed: ${err2?.message || err2} — see console (F12).` });
-        logLine(`run ERROR: ${err2?.message || err2}`);
+        setRun({ running: false, summary: `❌ ERROR on ${sym}: ${(err2?.message || err2)}` });
+        useStore.getState().set({ alert: `Grid search failed on ${sym}: ${(err2?.message || err2)} — see console (F12).` });
+        logLine(`run ERROR [${sym}]: ${(err2?.message || err2)}`);
         return;
       }
     }
+    doneBase += grid.length;
   }
+  top = engine.rankResults(allRows, objective).slice(0, topN);
+  useStore.getState().set({ board: top });
   const s3 = useStore.getState();
   if (s3.stoppedFlag) stopped = true;
   s3.stoppedFlag = false;
@@ -386,10 +421,11 @@ export async function runGrid() {
   if (s3.runSeq !== mySeq && !stopped) return;
   const secs = (performance.now() - t0) / 1000;
   const gridSecs = s3._refineAt ? (s3._refineAt - t0) / 1000 : secs;
+  const tested = doneBase;
   if (stopped) {
     const b = useStore.getState().board;
-    setRun({ running: false, summary: `■ stopped by user — partial board kept (${b.length} rows)` });
-    logLine(`run STOPPED by user after ${secs.toFixed(1)}s — partial board kept`);
+    setRun({ running: false, summary: `■ stopped by user — partial board kept (${b.length} rows, ${tested} combos)` });
+    logLine(`run STOPPED by user after ${secs.toFixed(1)}s (${tested} combos) — partial board kept`);
     useStore.getState().set({ alert: `Search stopped — showing partial results (${b.length} rows).` });
   } else {
     const errs = useStore.getState().run.errCount;
@@ -402,12 +438,12 @@ export async function runGrid() {
       logLine(wfMsg);
       useStore.getState().set({ board: useStore.getState().board });
     }
-    setRun({ running: false, refined: 0, passes: 0, summary: `done · ${grid.length} combos in ${secs.toFixed(1)}s${refineInfo}${errs ? ` · ⚠ ${errs} errored` : ''}${wfMsg ? ` · ${wfMsg}` : ''}` });
-    logLine(`run done (${runMode}): ${grid.length} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${s3._refineAt ? ` + refine ${(secs - gridSecs).toFixed(1)}s` : ''}] ${(grid.length / Math.max(secs, 0.01)).toFixed(0)}/s objective=${objective} errors=${errs}${refineInfo}${wfMsg ? ' · ' + wfMsg : ''}`);
+    setRun({ running: false, refined: 0, passes: 0, summary: `done · ${tested} combos in ${secs.toFixed(1)}s${refineInfo}${errs ? ` · ⚠ ${errs} errored` : ''}${wfMsg ? ` · ${wfMsg}` : ''}` });
+    logLine(`run done (${runMode}): ${tested} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${s3._refineAt ? ` + refine ${(secs - gridSecs).toFixed(1)}s` : ''}] ${(tested / Math.max(secs, 0.01)).toFixed(0)}/s objective=${objective} errors=${errs}${refineInfo}${wfMsg ? ' · ' + wfMsg : ''}`);
     errSamples.forEach((e: any) => logLine(`  combo error: ${e}`));
   }
   const bd = useStore.getState().board;
-  bd.slice(0, 3).forEach((r, i) => logLine(`  #${i + 1} ${r.timeframe}m ${r.indicator} ${fmtParams(r.params)} SL=${r.slPct} TP=${r.tpPct} WR=${r.m.winRate.toFixed(1)}% n=${r.m.totalTrades} pnl=${r.m.netPnL.toFixed(0)}`));
+  bd.slice(0, 3).forEach((r, i) => logLine(`  #${i + 1} [${r.symbol || '?'}] ${r.timeframe}m ${r.indicator} ${fmtParams(r.params)} SL=${r.slPct} TP=${r.tpPct} WR=${r.m.winRate.toFixed(1)}% n=${r.m.totalTrades} pnl=${r.m.netPnL.toFixed(0)}`));
   // Agent-grade complete summary: config used + best + top-5 + environment
   try {
     const sL = useStore.getState();
@@ -416,26 +452,31 @@ export async function runGrid() {
       lastRun: {
         at: new Date().toISOString(),
         stopped, mode: runMode, secs: +secs.toFixed(1),
-        dataset: { symbol: sL.symbol || '?', bars: sL.data ? sL.data.t.length : 0, from: sL.fromDate, to: sL.toDate, layout: ((sL.raw || {}) as any).layout || 'auto' },
+        dataset: { symbols: syms.map(([ssx, dd]) => `${ssx} ${(dd.t.length / 1000).toFixed(0)}k`).join(' + '), from: sL.fromDate, to: sL.toDate },
         objective, topN, cap: sL.cap,
         exec: { direction: opts.direction, entry: opts.entry, fill: opts.fill, session: `${opts.sessionStart || '—'}→${opts.sessionEnd || '—'}`, exits: dims.exits, carry: dims.carry, regime: opts.regimeOn ? `${opts.regimeSource}/${opts.granularity || 'day'}` : 'off', confGate: opts.confGate },
         risk: { sl: risk ? risk.sl : [opts.slPct], tp: risk ? risk.tp : [opts.tpPct], trail: opts.trailPct, cost: opts.cost },
         sizing: { capital: opts.capital, qty: opts.qty, lot: opts.lotSize },
-        grid: grid.length, refined: refinedN, passes: passesN, rate: +(grid.length / Math.max(secs, 0.01)).toFixed(0),
+        grid: tested, refined: refinedN, passes: passesN, rate: +(grid.length / Math.max(secs, 0.01)).toFixed(0),
         errors: sL.run.errCount,
-        best: best ? { tf: best.timeframe, ind: best.indicator, params: best.params, sl: best.slPct, tp: best.tpPct, exit: best.exit, carry: best.carry, refined: !!best.refined, m: best.m, oos: { net: best.oosNet ?? null, wr: best.oosWR ?? null, n: best.oosN ?? null, survived: best.survived ?? null } } : null,
-        top5: bd.slice(0, 5).map(r => ({ tf: r.timeframe, ind: r.indicator, params: r.params, wr: +r.m.winRate.toFixed(1), n: r.m.totalTrades, pnl: Math.round(r.m.netPnL), dd: +r.m.maxDD.toFixed(2), sharpe: +r.m.sharpe.toFixed(2) })),
+        best: best ? { sym: best.symbol, tf: best.timeframe, ind: best.indicator, params: best.params, sl: best.slPct, tp: best.tpPct, exit: best.exit, carry: best.carry, refined: !!best.refined, m: best.m, oos: { net: best.oosNet ?? null, wr: best.oosWR ?? null, n: best.oosN ?? null, survived: best.survived ?? null } } : null,
+        bestPerSymbol: syms.map(([ssx]) => {
+          const rb = bd.find(r => (r.symbol || '') === ssx) || null;
+          return rb ? { sym: ssx, tf: rb.timeframe, ind: rb.indicator, wr: +rb.m.winRate.toFixed(1), n: rb.m.totalTrades, pnl: Math.round(rb.m.netPnL), sharpe: +rb.m.sharpe.toFixed(2) } : { sym: ssx, ind: null };
+        }),
+        top5: bd.slice(0, 5).map(r => ({ sym: r.symbol, tf: r.timeframe, ind: r.indicator, params: r.params, wr: +r.m.winRate.toFixed(1), n: r.m.totalTrades, pnl: Math.round(r.m.netPnL), dd: +r.m.maxDD.toFixed(2), sharpe: +r.m.sharpe.toFixed(2) })),
       },
     });
     const L = useStore.getState().lastRun;
     logLine('===== RUN SUMMARY (agent-readable) =====');
     logLine(`when: ${L.at} · mode: ${L.mode} · duration: ${L.secs}s · rate: ${L.rate}/s · stopped: ${L.stopped}`);
-    logLine(`dataset: ${L.dataset.symbol} ${L.dataset.bars} bars ${L.dataset.from}→${L.dataset.to} [${L.dataset.layout}]`);
+    logLine(`datasets: ${L.dataset.symbols} ${L.dataset.from}→${L.dataset.to}`);
     logLine(`config: objective=${L.objective} topN=${L.topN} cap=${L.cap} dir=${L.exec.direction} entry=${L.exec.entry} fill=${L.exec.fill} session=${L.exec.session} exits=[${L.exec.exits}] carry=[${L.exec.carry}] regime=${L.exec.regime} confGate=${L.exec.confGate}`);
     logLine(`risk: SL=[${L.risk.sl}] TP=[${L.risk.tp}] trail=${L.risk.trail}% cost=${L.risk.cost}/trade · sizing: cap=${L.sizing.capital} qty=${L.sizing.qty}x${L.sizing.lot}`);
     logLine(`grid: ${L.grid} combos · refined=${L.refined} passes=${L.passes} · errors=${L.errors}`);
-    if (L.best) logLine(`best: ${L.best.tf}m ${L.best.ind} ${fmtParams(L.best.params)} SL=${L.best.sl} TP=${L.best.tp} exit=${L.best.exit}${L.best.carry ? '+carry' : ''}${L.best.refined ? ' [refined]' : ''} WR=${L.best.m.winRate}% n=${L.best.m.totalTrades} pnl=${L.best.m.netPnL} dd=${L.best.m.maxDD}% sharpe=${L.best.m.sharpe} OOS=${L.best.oos.net ?? '—'}/${L.best.oos.survived ?? '—'}`);
-    L.top5.forEach((t: any, i: number) => logLine(`  top${i + 1}: ${t.tf}m ${t.ind} WR=${t.wr}% n=${t.n} pnl=${t.pnl} dd=${t.dd}% sharpe=${t.sharpe}`));
+    if (L.best) logLine(`best: [${L.best.sym}] ${L.best.tf}m ${L.best.ind} ${fmtParams(L.best.params)} SL=${L.best.sl} TP=${L.best.tp} exit=${L.best.exit}${L.best.carry ? '+carry' : ''}${L.best.refined ? ' [refined]' : ''} WR=${L.best.m.winRate}% n=${L.best.m.totalTrades} pnl=${L.best.m.netPnL} dd=${L.best.m.maxDD}% sharpe=${L.best.m.sharpe} OOS=${L.best.oos.net ?? '—'}/${L.best.oos.survived ?? '—'}`);
+    L.top5.forEach((t: any, i: number) => logLine(`  top${i + 1}: [${t.sym}] ${t.tf}m ${t.ind} WR=${t.wr}% n=${t.n} pnl=${t.pnl} dd=${t.dd}% sharpe=${t.sharpe}`));
+    (L.bestPerSymbol || []).forEach((t: any) => logLine(t.ind ? `  best[${t.sym}]: ${t.tf}m ${t.ind} WR=${t.wr}% n=${t.n} pnl=${t.pnl} sharpe=${t.sharpe}` : `  best[${t.sym}]: no rows`));
     logLine(`env: ${typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 120) : 'node'}`);
     logLine('===== END SUMMARY =====');
   } catch (e: any) { logLine('summary build failed: ' + (e?.message || e)); }
@@ -447,7 +488,10 @@ export async function runGrid() {
 export function selectRow(r: BoardRow, auto?: boolean) {
   const st = useStore.getState();
   if (!auto) st.userPickedSeq = st.runSeq || 0;
-  const data = st.data as OHLCV;
+  // detail data comes from the ROW's symbol (multi-symbol runs)
+  const ds = r.symbol ? st.datasets[r.symbol] : null;
+  const data = (ds ? filterData(ds.raw, st.fromDate, st.toDate) : st.data) as OHLCV;
+  if (!data || !data.t.length) return;
   const d = engine.resample(data, r.timeframe);
   const sig = engine.buildSignals(d, { indicator: r.indicator, params: r.params });
   const eff: any = tradeOpts();

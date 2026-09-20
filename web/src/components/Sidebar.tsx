@@ -5,7 +5,7 @@ const TIERS_META: Record<string, string> = {};
 for (const m of IND_META) if (m.n && m.tier) TIERS_META[m.n] = m.tier;
 import { useStore } from '../lib/store';
 import { estimateCombos } from '../lib/runner';
-import { applyDateFilter, loadFile, loadRepoCSV } from '../lib/data';
+import { applyDateFilter, loadFile } from '../lib/data';
 import { downloadLog } from '../lib/export';
 import { runValidation } from '../lib/validate';
 
@@ -31,28 +31,24 @@ export default function Sidebar() {
   const set = useStore(s => s.set);
   const [loadPct, setLoadPct] = useState<number | null>(null);
 
-  const onUpload = async (f: File | undefined) => {
-    if (!f) return;
-    try {
-      setLoadPct(10);
-      await loadFile(f, setLoadPct);
-      setLoadPct(null);
-    } catch (e: any) {
-      setLoadPct(null);
-      set({ alert: `Could not parse "${f.name}": ${e?.message || e}. Expected header date,open,high,low,close,volume.` });
+  const onUpload = async (files: FileList | null) => {
+    if (!files || !files.length) return;
+    setLoadPct(10);
+    let ok = 0, fail: string | null = null;
+    for (const f of Array.from(files)) {
+      try { await loadFile(f); ok++; }
+      catch (e: any) { fail = `"${f.name}": ${e?.message || e}`; }
     }
-  };
-
-  const onRepo = async () => {
-    try { await loadRepoCSV(); }
-    catch (e: any) { set({ alert: `Bundled HDFCBANK.csv not found on this server — upload a 1-min CSV file instead. (${e?.message || e})` }); }
+    setLoadPct(null);
+    if (fail) set({ alert: `Could not parse ${fail}. Expected header date,open,high,low,close,volume (or SYMBOL,YYYYMMDD,HH:MM futures).` });
   };
 
   return (
     <div className="space-y-3">
-      <Section n="① Market Data — 1-min OHLCV">
-        <label className="block text-[11px] text-zinc-400 mb-1">Upload CSV <span className="text-zinc-600">(date,open,high,low,close,volume)</span></label>
-        <input type="file" accept=".csv,.txt" className="w-full mb-2" onChange={e => onUpload(e.target.files?.[0])} />
+      <Section n="① Market Data — 1-min OHLCV (multi-symbol)">
+        <label className="block text-[11px] text-zinc-400 mb-1">Upload CSV files <span className="text-zinc-600">(multi-select allowed)</span></label>
+        <input type="file" accept=".csv,.txt" multiple className="w-full mb-2" onChange={e => onUpload(e.target.files)} />
+        <DatasetList />
         {loadPct !== null && <div className="prog mb-2"><div style={{ width: `${loadPct}%` }} /></div>}
         <div className="grid grid-cols-2 gap-2 mb-2">
           <div><label className="lbl">Symbol</label>
@@ -60,8 +56,7 @@ export default function Sidebar() {
           <div><label className="lbl">Capital ₹</label>
             <input type="number" value={st.capital} className="w-full mt-1 num" onChange={e => set({ capital: +e.target.value || 100000 })} /></div>
         </div>
-        <button className="btn-ghost btn-xs w-full" onClick={onRepo}>📁 Try bundled HDFCBANK.csv</button>
-        <div className="text-[10px] text-zinc-500 mt-1.5">Symbol is set from your file name on upload. Real OHLCV only.</div>
+        <div className="text-[10px] text-zinc-500 mt-1.5">Active symbol follows the file you upload; toggle symbols below to include them in runs.</div>
         <div className="grid grid-cols-2 gap-2 mt-2">
           <div><label className="lbl">From</label>
             <input type="date" value={st.fromDate} className="w-full mt-1" onChange={e => { set({ fromDate: e.target.value }); applyDateFilter(); }} /></div>
@@ -128,6 +123,42 @@ export default function Sidebar() {
         <div className="text-[10px] text-zinc-500 mt-1">Audits the loaded file + engine identities. Zero synthetic data.</div>
         <ValidationOut />
       </section>
+    </div>
+  );
+}
+
+function DatasetList() {
+  const datasets = useStore(s => s.datasets);
+  const set = useStore(s => s.set);
+  const names = Object.keys(datasets);
+  if (!names.length) return null;
+  const toggle = (k: string) => {
+    const ds = { ...datasets, [k]: { ...datasets[k], enabled: datasets[k].enabled === false } };
+    set({ datasets: ds });
+  };
+  const remove = (k: string) => {
+    const ds = { ...datasets };
+    delete ds[k];
+    set({ datasets: ds });
+    if (useStore.getState().symbol === k) {
+      const rest = Object.keys(ds);
+      set({ symbol: rest[0] || '' });
+    }
+  };
+  return (
+    <div className="space-y-1 mb-2">
+      {names.map(k => {
+        const n = datasets[k].raw.t.length;
+        const on = datasets[k].enabled !== false;
+        return (
+          <div key={k} className="flex items-center gap-2 text-[12px] bg-[#15151b] border border-[#2e2e36] rounded-md px-2 py-1">
+            <input type="checkbox" checked={on} onChange={() => toggle(k)} title="Include in runs" />
+            <span className="num font-semibold">{k}</span>
+            <span className="text-zinc-500 num">{(n / 1000).toFixed(0)}k bars</span>
+            <button className="ml-auto text-zinc-500 hover:text-red-400" onClick={() => remove(k)} title="Remove">✕</button>
+          </div>
+        );
+      })}
     </div>
   );
 }

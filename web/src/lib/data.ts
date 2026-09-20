@@ -9,22 +9,42 @@ function pick(a: Float64Array, idx: number[]) {
   return out;
 }
 
+export function filterData(raw: OHLCV, from: string, to: string): OHLCV {
+  if (!from && !to) return raw;
+  const lo = from ? new Date(from + 'T00:00:00').getTime() : -Infinity;
+  const hi = to ? new Date(to + 'T23:59:59').getTime() : Infinity;
+  const idx: number[] = [];
+  for (let i = 0; i < raw.t.length; i++) if (raw.t[i] >= lo && raw.t[i] <= hi) idx.push(i);
+  return {
+    t: pick(raw.t, idx), o: pick(raw.o, idx), h: pick(raw.h, idx),
+    l: pick(raw.l, idx), c: pick(raw.c, idx), v: pick(raw.v, idx),
+  };
+}
+
+// Enabled datasets for a run: [[symbol, filtered-1m-data], ...].
+// state.data/state.raw mirror the FIRST enabled symbol (charts default, validation).
+export function enabledSymbols(): [string, OHLCV][] {
+  const st = useStore.getState();
+  const names = Object.keys(st.datasets).filter(k => st.datasets[k].enabled !== false && st.datasets[k].raw.t.length);
+  if (!names.length) {
+    if (st.data && st.data.t.length) return [[st.symbol || 'DATA', st.data]];
+    return [];
+  }
+  return names.map(k => [k, filterData(st.datasets[k].raw, st.fromDate, st.toDate)] as [string, OHLCV]);
+}
+
 export function applyDateFilter() {
   const st = useStore.getState();
-  const d = st.raw;
-  if (!d) return;
-  if (!st.fromDate && !st.toDate) {
-    if (st.data !== d) st.set({ data: d });
-    return;
+  const first = enabledSymbols()[0];
+  if (first && st.datasets[first[0]]) {
+    const ds = st.datasets[first[0]];
+    st.set({ raw: ds.raw, data: first[1], symbol: first[0] });
+    const d = first[1];
+    st.set({ dataInfo: `${new Date(d.t[0]).toLocaleDateString()} → ${new Date(d.t[d.t.length - 1]).toLocaleDateString()} · ${d.t.length.toLocaleString()} bars · ${Object.keys(st.datasets).length} symbol(s)` });
+  } else if (st.raw) {
+    const d = filterData(st.raw, st.fromDate, st.toDate);
+    st.set({ data: d, dataInfo: `Filtered: ${d.t.length.toLocaleString()} bars` });
   }
-  const lo = st.fromDate ? new Date(st.fromDate + 'T00:00:00').getTime() : -Infinity;
-  const hi = st.toDate ? new Date(st.toDate + 'T23:59:59').getTime() : Infinity;
-  const idx: number[] = [];
-  for (let i = 0; i < d.t.length; i++) if (d.t[i] >= lo && d.t[i] <= hi) idx.push(i);
-  st.set({
-    data: { t: pick(d.t, idx), o: pick(d.o, idx), h: pick(d.h, idx), l: pick(d.l, idx), c: pick(d.c, idx), v: pick(d.v, idx) },
-    dataInfo: `Filtered: ${idx.length.toLocaleString()} bars`,
-  });
 }
 
 export function setData(d: OHLCV, label: string) {
@@ -41,11 +61,6 @@ export function setData(d: OHLCV, label: string) {
   });
 }
 
-function symbolFromFile(name: string): string {
-  const base = name.replace(/\.[^.]+$/, '');
-  return ((base.split(/[_.\-\s]+/)[0] || base).toUpperCase().slice(0, 20));
-}
-
 export async function loadFile(f: File, onProgress?: (p: number) => void): Promise<void> {
   const st = useStore.getState();
   const text = await f.text();
@@ -53,23 +68,15 @@ export async function loadFile(f: File, onProgress?: (p: number) => void): Promi
   const t0 = performance.now();
   const d = engine.parseCSV(text);
   if (!d.t.length) throw new Error('no valid OHLCV rows found');
-  if (d.symbol) st.set({ symbol: d.symbol });
-  else { const sym = symbolFromFile(f.name); if (sym) st.set({ symbol: sym }); }
+  let sym = d.symbol;
+  if (!sym) {
+    const base = f.name.replace(/\.[^.]+$/, '');
+    sym = (base.split(/[_.\-\s]+/)[0] || base).toUpperCase().slice(0, 20) || 'DATA';
+  }
+  const datasets = { ...st.datasets, [sym]: { raw: d, label: f.name, enabled: true } };
+  st.set({ datasets, symbol: sym });
   setData(d, f.name + ' · real');
-  logLine(`loaded ${f.name}: ${(d.t.length / 1000).toFixed(0)}k rows in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+  logLine(`loaded ${f.name} as ${sym}: ${(d.t.length / 1000).toFixed(0)}k rows in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
   if (onProgress) onProgress(100);
 }
 
-export async function loadRepoCSV(): Promise<void> {
-  const st = useStore.getState();
-  st.set({ dataInfo: 'fetching HDFCBANK_minute.csv…' });
-  const r = await fetch('HDFCBANK_minute.csv');
-  if (!r.ok) throw new Error('HTTP ' + r.status + ' — upload your own 1-min CSV instead');
-  const txt = await r.text();
-  const t0 = performance.now();
-  const d = engine.parseCSV(txt);
-  if (!d.t.length) throw new Error('empty file');
-  if (!st.symbol) st.set({ symbol: d.symbol || 'HDFCBANK' });
-  setData(d, 'HDFCBANK_minute.csv · real');
-  logLine(`loaded repo file: ${(d.t.length / 1000).toFixed(0)}k rows in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
-}
