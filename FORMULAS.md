@@ -24,6 +24,12 @@ The parser sniffs each file and adapts; no fixed template is assumed:
   stripped (`BANKNIFTY_F1` → `BANKNIFTY`); falls back to the file-name token.
   The detected layout string (e.g. `positional+SYM+D+T`) is shown under the data
   panel for confirmation. No synthetic data exists anywhere in the pipeline.
+- **Multi-contract files are SPLIT, never blended** (`parseCSVAll`): a file
+  with 42 option strikes becomes 42 pure per-contract datasets (largest
+  enabled by default, rest toggleable). `parseCSV` keeps only the largest
+  contract and flags `{contracts, keptRows, dropped}`. Backtesting a blend of
+  strikes fabricates WR (proven: jumbling produced fantasy 100% win rates) —
+  the loader refuses to do it silently.
 
 ## 2. Resampling (`resample`, timeframe `tf` minutes)
 

@@ -226,3 +226,29 @@ test('dayRegimeMask counts fallback bars', () => {
   const dm = E.dayRegimeMask(d, rt.dayReg, 'EMA', 0.6);
   assert.ok(dm.mask.length === d.t.length && dm.fallbackBars >= 0);
 });
+
+test('multi-contract files split per contract (no strike mixing)', () => {
+  const rows = ['date,symbol,strike,otype,expiry,open,high,low,close,volume'];
+  const t0 = Date.parse('2024-01-02T09:15:00');
+  const contracts = [['AAA1', 100], ['BBB2', 500]];
+  for (const [sym, px] of contracts) {
+    for (let i = 0; i < 60; i++) {
+      const d = new Date(t0 + i * 60000);
+      const ds = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}:00`;
+      const c = px + Math.sin(i / 5) * 2;
+      rows.push(`${ds},${sym},100,CE,01JAN25,${c.toFixed(2)},${(c + 0.5).toFixed(2)},${(c - 0.5).toFixed(2)},${c.toFixed(2)},1000`);
+    }
+  }
+  const all = E.parseCSVAll(rows.join('\n'));
+  assert.equal(all.length, 2);
+  for (const g of all) {
+    assert.equal(g.d.t.length, 60);
+    let jumps = 0;
+    for (let i = 1; i < g.d.t.length; i++) {
+      if (Math.abs(g.d.c[i] - g.d.c[i - 1]) / g.d.c[i - 1] > 0.5) jumps++;
+    }
+    assert.equal(jumps, 0);
+  }
+  const one = E.parseCSV(rows.join('\n'));
+  assert.ok(one.mixed && one.mixed.contracts === 2 && one.mixed.dropped > 0);
+});

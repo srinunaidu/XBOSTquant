@@ -64,19 +64,37 @@ export function setData(d: OHLCV, label: string) {
 export async function loadFile(f: File, onProgress?: (p: number) => void): Promise<void> {
   const st = useStore.getState();
   const text = await f.text();
-  if (onProgress) onProgress(60);
+  if (onProgress) onProgress(40);
   const t0 = performance.now();
-  const d = engine.parseCSV(text);
-  if (!d.t.length) throw new Error('no valid OHLCV rows found');
-  let sym = d.symbol;
-  if (!sym) {
-    const base = f.name.replace(/\.[^.]+$/, '');
-    sym = (base.split(/[_.\-\s]+/)[0] || base).toUpperCase().slice(0, 20) || 'DATA';
+  const groups = engine.parseCSVAll(text);
+  if (!groups.length) throw new Error('no valid OHLCV rows found');
+  const datasets = { ...st.datasets };
+  // largest contract first; enable only it by default (42 contracts enabled
+  // would explode every run) — user ticks more deliberately. Re-uploads keep
+  // existing toggles.
+  groups.sort((a, b) => b.d.t.length - a.d.t.length);
+  groups.forEach((g, ix) => {
+    const sym = g.symbol || symFallback(f.name);
+    const prev = datasets[sym];
+    datasets[sym] = {
+      raw: g.d,
+      label: groups.length > 1 ? `${f.name} · ${g.full || sym}` : f.name,
+      enabled: prev ? prev.enabled !== false : ix === 0,
+    };
+  });
+  const firstSym = groups[0].symbol || symFallback(f.name) || 'DATA';
+  st.set({ datasets, symbol: firstSym });
+  setData(groups[0].d, f.name + ' · real');
+  const secs = ((performance.now() - t0) / 1000).toFixed(1);
+  if (groups.length > 1) {
+    logLine(`loaded ${f.name}: SPLIT ${groups.length} contracts — enabled ${firstSym} (${groups[0].d.t.length} bars); others registered but OFF (tick to include)`);
   }
-  const datasets = { ...st.datasets, [sym]: { raw: d, label: f.name, enabled: true } };
-  st.set({ datasets, symbol: sym });
-  setData(d, f.name + ' · real');
-  logLine(`loaded ${f.name} as ${sym}: ${(d.t.length / 1000).toFixed(0)}k rows in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+  logLine(`loaded ${f.name} as ${firstSym}: ${(groups[0].d.t.length / 1000).toFixed(0)}k rows in ${secs}s`);
   if (onProgress) onProgress(100);
+}
+
+function symFallback(name: string): string {
+  const base = name.replace(/\.[^.]+$/, '');
+  return (base.split(/[_.\-\s]+/)[0] || base).toUpperCase().slice(0, 20) || 'DATA';
 }
 

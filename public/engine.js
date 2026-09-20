@@ -28,32 +28,35 @@ function parseTimeFlex(s){
 //   date,open,high,low,close,volume                      (headered)
 //   SYMBOL,YYYYMMDD,HH:MM,O,H,L,C,VOLUME,OI              (headerless futures)
 //   datetime,open,high,low,close,volume                  (combined stamp)
+//   date,symbol,strike,otype,expiry,O,H,L,C,volume        (multi-contract options)
 // Extra columns (symbol, expiry, OI, …) are detected and ignored — OHLCV only.
-function parseCSV(text) {
+// CRITICAL: files mixing several contracts are SPLIT per contract
+// (parseCSVAll); parseCSV returns the largest contract only and flags the rest.
+function sniffTable(text) {
   const lines = text.split(/\r?\n/);
   const grid=[];
   for (let i=0;i<lines.length;i++) {
     const ln = lines[i].trim();
     if (ln) grid.push(ln.split(',').map(s=>s.trim().replace(/^["']|["']$/g,'')));
   }
-  if (!grid.length) return emptyData();
+  if (!grid.length) return null;
   // ---- header sniff: >=2 known words and mostly non-numeric ----
   const first = grid[0];
-  const known = first.filter(c=>/^(symbol|scrip|instrument|ticker|date|datetime|timestamp|time|day|expiry|open|high|low|close|settle|ltp|volume|vol|qty|quantity|oi|openinterest|open_interest|chginoi)$/i.test(c)).length;
+  const known = first.filter(c=>/^(symbol|scrip|instrument|ticker|date|datetime|timestamp|time|day|expiry|open|high|low|close|settle|ltp|volume|vol|qty|quantity|oi|openinterest|open_interest|chginoi|strike|otype)$/i.test(c)).length;
   const numeric = first.filter(c=>c!==''&&isFinite(+c)).length;
   let header=null, start=0, layout='positional';
   if (known>=2 && numeric<first.length/2){ header=first.map(s=>s.toLowerCase()); start=1; layout='header'; }
   const HF=(re)=>header?header.findIndex(x=>re.test(x)):-1;
-  let symI=-1, dtI=-1, dateI=-1, timeI=-1, oI=-1, hI=-1, lI=-1, cI=-1, vI=-1;
+  const col={symI:-1, dtI:-1, dateI:-1, timeI:-1, oI:-1, hI:-1, lI:-1, cI:-1, vI:-1};
   if (header) {
-    symI=HF(/^(symbol|scrip|instrument|ticker)$/);
-    dtI=HF(/^(datetime|timestamp)$/);
-    dateI=dtI>=0?-1:HF(/^(date|day)$/);
-    timeI=dtI>=0?-1:HF(/^(time)$/);
+    col.symI=HF(/^(symbol|scrip|instrument|ticker)$/);
+    col.dtI=HF(/^(datetime|timestamp)$/);
+    col.dateI=col.dtI>=0?-1:HF(/^(date|day)$/);
+    col.timeI=col.dtI>=0?-1:HF(/^(time)$/);
     // guard: a lone 'time' column holding full stamps (e.g. '2024-01-01 09:15')
-    oI=HF(/^open$/); hI=HF(/^high$/); lI=HF(/^low$/); cI=HF(/^(close|settle|ltp)$/);
-    vI=HF(/^(volume|vol|qty|quantity|traded)$/);
-    if (oI<0||hI<0||lI<0||cI<0) return emptyData(); // not OHLCV at all
+    col.oI=HF(/^open$/); col.hI=HF(/^high$/); col.lI=HF(/^low$/); col.cI=HF(/^(close|settle|ltp)$/);
+    col.vI=HF(/^(volume|vol|qty|quantity|traded)$/);
+    if (col.oI<0||col.hI<0||col.lI<0||col.cI<0) return null; // not OHLCV at all
   } else {
     // ---- positional inference from the first data rows ----
     const probe=grid.slice(0,Math.min(50,grid.length));
@@ -71,51 +74,101 @@ function parseCSV(text) {
       }
       colKind.push(tot?(str/tot>0.5?'STR':dtm/tot>0.5?'DT':date8/tot>0.5?'D8':tm/tot>0.5?'TM':num/tot>0.5?'NUM':'MIX'):'EMPTY');
     }
-    symI=colKind.findIndex(k=>k==='STR');
-    dtI=colKind.findIndex(k=>k==='DT');
-    if(dtI<0){ dateI=colKind.findIndex(k=>k==='D8'); timeI=colKind.findIndex(k=>k==='TM'); }
+    col.symI=colKind.findIndex(k=>k==='STR');
+    col.dtI=colKind.findIndex(k=>k==='DT');
+    if(col.dtI<0){ col.dateI=colKind.findIndex(k=>k==='D8'); col.timeI=colKind.findIndex(k=>k==='TM'); }
     // OHLCV = NUM columns after the stamp columns; volume = next NUM after close
     const nums=[];
     for(let c=0;c<nCols;c++)if(colKind[c]==='NUM')nums.push(c);
-    const ordered=nums.filter(c=>c>Math.max(symI,dtI,dateI,timeI,-1));
+    const ordered=nums.filter(c=>c>Math.max(col.symI,col.dtI,col.dateI,col.timeI,-1));
     const use=ordered.length>=5?ordered:nums.slice(-5);
-    if(use.length<4)return emptyData();
-    oI=use[0];hI=use[1];lI=use[2];cI=use[3];vI=use.length>4?use[4]:-1;
+    if(use.length<4)return null;
+    col.oI=use[0];col.hI=use[1];col.lI=use[2];col.cI=use[3];col.vI=use.length>4?use[4]:-1;
   }
-  const T=[],O=[],H=[],L=[],C=[],V=[];
-  const symCount={};
+  layout=(header?('header['+header.slice(0,9).join(',')+']'):'positional')
+    +(col.symI>=0?'+SYM':'')+(col.dtI>=0?'+DT':(col.dateI>=0?'+D':'')+(col.timeI>=0?'+T':''));
+  return {grid, start, layout, col};
+}
+function symLabel(s){
+  return String(s||'').split(/[_.\-\s]+/)[0].toUpperCase().slice(0,20)||'DATA';
+}
+function extractRows(grid, start, col, onlySym){
+  // onlySym: exact raw symbol value to keep (null = keep all rows)
+  const T=[],O=[],H=[],L=[],C=[],V=[],SYM=[];
   for (let i=start;i<grid.length;i++) {
     const p = grid[i];
     if (p.length < 4) continue;
+    const rawSym=(col.symI>=0&&p[col.symI])?String(p[col.symI]).trim().toUpperCase():'';
+    if(onlySym!=null&&rawSym!==onlySym)continue;
     let t=NaN;
-    if (dtI>=0) t=parseDateFlex(p[dtI]);
-    else if (dateI>=0){
-      const base=parseDateFlex(p[dateI]);
-      if(timeI>=0){const tm=parseTimeFlex(p[timeI]); t=isNaN(base)||!tm?NaN:new Date(new Date(base).getFullYear(),new Date(base).getMonth(),new Date(base).getDate(),tm.h,tm.min,tm.s).getTime();}
+    if (col.dtI>=0) t=parseDateFlex(p[col.dtI]);
+    else if (col.dateI>=0){
+      const base=parseDateFlex(p[col.dateI]);
+      if(col.timeI>=0){const tm=parseTimeFlex(p[col.timeI]); t=isNaN(base)||!tm?NaN:new Date(new Date(base).getFullYear(),new Date(base).getMonth(),new Date(base).getDate(),tm.h,tm.min,tm.s).getTime();}
       else t=base;
     }
-    else if (timeI>=0){
+    else if (col.timeI>=0){
       // lone time column: only usable if it carries a full stamp (has a date part)
-      t=/[-/]/.test(p[timeI]||'')?parseDateFlex(p[timeI]):NaN;
+      t=/[-/]/.test(p[col.timeI]||'')?parseDateFlex(p[col.timeI]):NaN;
     }
     else t=+p[0]; // last resort: epoch in first column
-    const o=+(p[oI]??NaN),h2=+(p[hI]??NaN),l2=+(p[lI]??NaN),c2=+(p[cI]??NaN),v=+(p[vI]??0);
+    const o=+(p[col.oI]??NaN),h2=+(p[col.hI]??NaN),l2=+(p[col.lI]??NaN),c2=+(p[col.cI]??NaN),v=+(p[col.vI]??0);
     if (!isFinite(o)||!isFinite(h2)||!isFinite(l2)||!isFinite(c2)||!isFinite(t)) continue;
-    if(symI>=0&&p[symI]){const s=String(p[symI]).split(/[_.\-\s]+/)[0].toUpperCase().slice(0,20);symCount[s]=(symCount[s]||0)+1;}
-    T.push(t);O.push(o);H.push(h2);L.push(l2);C.push(c2);V.push(v||0);
+    T.push(t);O.push(o);H.push(h2);L.push(l2);C.push(c2);V.push(v||0);SYM.push(rawSym);
   }
-  // sort by time
-  const n=T.length, idx=new Array(n);
+  return {T,O,H,L,C,V,SYM};
+}
+function toData(R){
+  const n=R.T.length, idx=new Array(n);
   for(let i=0;i<n;i++) idx[i]=i;
-  idx.sort((a,b)=>T[a]-T[b]);
-  const out={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n),symbol:null,layout};
-  for(let i=0;i<n;i++){const j=idx[i];out.t[i]=T[j];out.o[i]=O[j];out.h[i]=H[j];out.l[i]=L[j];out.c[i]=C[j];out.v[i]=V[j];}
-  let best=null,bn=0;
-  for(const k of Object.keys(symCount))if(symCount[k]>bn){bn=symCount[k];best=k;}
-  if(best)out.symbol=best;
-  out.layout=(header?('header['+header.slice(0,9).join(',')+']'):'positional')
-    +(symI>=0?'+SYM':'')+(dtI>=0?'+DT':(dateI>=0?'+D':'')+(timeI>=0?'+T':''));
+  idx.sort((a,b)=>R.T[a]-R.T[b]);
+  const out={t:new Float64Array(n),o:new Float64Array(n),h:new Float64Array(n),l:new Float64Array(n),c:new Float64Array(n),v:new Float64Array(n),symbol:null,layout:''};
+  for(let i=0;i<n;i++){const j=idx[i];out.t[i]=R.T[j];out.o[i]=R.O[j];out.h[i]=R.H[j];out.l[i]=R.L[j];out.c[i]=R.C[j];out.v[i]=R.V[j];}
   return out;
+}
+function parseCSV(text) {
+  const tab=sniffTable(text);
+  if(!tab)return emptyData();
+  const R=extractRows(tab.grid, tab.start, tab.col, null);
+  if(!R.T.length)return emptyData();
+  if(tab.col.symI<0){
+    const out=toData(R);out.layout=tab.layout;return out;
+  }
+  // multi-contract file: keep the LARGEST contract only (flag the rest loudly)
+  const counts={};
+  for(const s of R.SYM)counts[s]=(counts[s]||0)+1;
+  const keys=Object.keys(counts).sort((a,b)=>counts[b]-counts[a]);
+  const keep=keys[0]||'';
+  const F={T:[],O:[],H:[],L:[],C:[],V:[],SYM:[]};
+  for(let i=0;i<R.T.length;i++)if(R.SYM[i]===keep){F.T.push(R.T[i]);F.O.push(R.O[i]);F.H.push(R.H[i]);F.L.push(R.L[i]);F.C.push(R.C[i]);F.V.push(R.V[i]);F.SYM.push(R.SYM[i]);}
+  const out=toData(F);
+  out.symbol=symLabel(keep);
+  out.layout=tab.layout;
+  if(keys.length>1)out.mixed={contracts:keys.length, kept:keep, keptRows:F.T.length, dropped:R.T.length-F.T.length};
+  return out;
+}
+// Split a (possibly multi-contract) file into one pure dataset per contract,
+// largest first. Single-symbol files return exactly one entry.
+function parseCSVAll(text) {
+  const tab=sniffTable(text);
+  if(!tab)return [];
+  if(tab.col.symI<0){
+    const R=extractRows(tab.grid, tab.start, tab.col, null);
+    if(!R.T.length)return [];
+    const out=toData(R);out.layout=tab.layout;return [{symbol:null, full:'', d:out}];
+  }
+  const R=extractRows(tab.grid, tab.start, tab.col, null);
+  const groups={};
+  for(let i=0;i<R.T.length;i++){(groups[R.SYM[i]||''] = groups[R.SYM[i]||''] || []).push(i);}
+  const keys=Object.keys(groups).sort((a,b)=>groups[b].length-groups[a].length);
+  return keys.map(k=>{
+    const F={T:[],O:[],H:[],L:[],C:[],V:[],SYM:[]};
+    for(const i of groups[k]){F.T.push(R.T[i]);F.O.push(R.O[i]);F.H.push(R.H[i]);F.L.push(R.L[i]);F.C.push(R.C[i]);F.V.push(R.V[i]);F.SYM.push(R.SYM[i]);}
+    const out=toData(F);
+    out.symbol=symLabel(k);
+    out.layout=tab.layout;
+    return {symbol:out.symbol, full:k, d:out};
+  });
 }
 
 function resample(d, tfMin) {
@@ -1430,7 +1483,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

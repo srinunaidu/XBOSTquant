@@ -32,6 +32,7 @@ export type BoardRow = {
 
 export interface Engine {
   parseCSV(text: string): OHLCV;
+  parseCSVAll(text: string): { symbol: string | null; full: string; d: OHLCV }[];
   resample(d: OHLCV, tfMin: number): OHLCV;
   buildSessionMask(d: OHLCV, start: string | null, end: string | null): Int8Array;
   rsi(close: Float64Array, p: number): Float64Array;
