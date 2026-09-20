@@ -18,8 +18,9 @@ export default function StressPanel() {
     const mc = monteCarloDD(bt.trades, capital, mcN, 42);
     const st = streakStats(bt.trades);
     const heat = heatmap(bt.trades);
+    const bestTime = heat.slice().sort((a,b) => b.pnl - a.pnl).find(h => h.n >= 5) || heat.slice().sort((a,b) => b.pnl - a.pnl)[0] || null;
     const exc = excursionStats(bt.trades);
-    return { mc, st, heat, exc };
+    return { mc, st, heat, bestTime, exc };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [detail, ran, mcN, capital]);
 
@@ -34,10 +35,12 @@ export default function StressPanel() {
       const mc0 = monteCarloDD(bt.trades, s.capital, mcN, 42);
       const st0 = streakStats(bt.trades);
       const heat0 = heatmap(bt.trades);
+      const bestH = heat0.slice().sort((a,b) => b.pnl - a.pnl).find(h => h.n >= 5) || heat0.slice().sort((a,b) => b.pnl - a.pnl)[0] || null;
       const exc0 = excursionStats(bt.trades);
       logLine(`stress [${d.cfg.symbol || ''} ${d.cfg.timeframe}m ${d.cfg.indicator}]: MC${mcN} p5-DD=${mc0 ? mc0.p5.toFixed(1) : '—'}% median=${mc0 ? mc0.p50.toFixed(1) : '—'}% worst=${mc0 ? mc0.worst.toFixed(1) : '—'}%`);
       logLine(`  streaks: maxLoss=${st0.maxLossStreak} P(4)=${(100 * st0.p4).toFixed(1)}% P(5)=${(100 * st0.p5).toFixed(1)}% P(6)=${(100 * st0.p6).toFixed(1)}%`);
       heat0.forEach(h => logLine(`  heat ${h.label}: n=${h.n} WR=${h.wr.toFixed(1)}% pnl=${h.pnl.toFixed(0)}`));
+      if (bestH) logLine(`  bestTime: ${bestH.label} WR=${bestH.wr.toFixed(1)}% n=${bestH.n} pnl=${bestH.pnl.toFixed(0)}`);
       if (exc0) logLine(`  excursion: avgMAE=${fmtMoney(exc0.avgMAE)} avgMFE=${fmtMoney(exc0.avgMFE)}`);
     }, 0);
   };
@@ -45,7 +48,7 @@ export default function StressPanel() {
   return (
     <section className="card p-3">
       <div className="flex flex-wrap items-center gap-2 mb-2">
-        <div className="font-display font-semibold text-[14px] tracking-tight">🧪 Stress Lab <span className="text-zinc-500 font-normal text-xs">· Monte Carlo · heatmap · streaks · MAE/MFE</span></div>
+        <div className="font-display font-semibold text-[14px] tracking-tight">🧪 Stress Lab <span className="text-zinc-500 font-normal text-xs">· Monte Carlo · heatmap · streaks · MAE/MFE · best time</span></div>
         <div className="ml-auto flex items-center gap-2 text-[11px] text-zinc-400">
           <label>MC iters
             <select value={mcN} className="ml-1 num" onChange={e => setMcN(+e.target.value)}>
@@ -57,7 +60,7 @@ export default function StressPanel() {
       </div>
       {!out && <div className="empty-state">Run the lab to shuffle 1,000 trade sequences, slice session heat, and size losing streaks…</div>}
       {out && out.mc && (
-        <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[12px]">
+        <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-[12px]">
           <div className="rounded-lg border border-[#232329] p-2.5">
             <div className="lbl mb-1">MC max-DD dist ({out.mc.iters})</div>
             <div className="num">p5 <span className="neg">{out.mc.p5.toFixed(1)}%</span></div>
@@ -73,6 +76,11 @@ export default function StressPanel() {
             <div className="lbl mb-1">Excursion / trade</div>
             <div className="num">avg MAE {out.exc ? fmtMoney(out.exc.avgMAE) : '—'}</div>
             <div className="num">avg MFE {out.exc ? fmtMoney(out.exc.avgMFE) : '—'}</div>
+          </div>
+          <div className="rounded-lg border border-[#232329] p-2.5">
+            <div className="lbl mb-1">Best time to trade</div>
+            <div className="num">{out.bestTime ? `${out.bestTime.label} · ${out.bestTime.wr.toFixed(1)}% WR · ${out.bestTime.n}t · ${fmtMoney(out.bestTime.pnl)}` : '—'}</div>
+            <div className="text-[10px] text-zinc-500 mt-1">By net pnl (≥5 trades), else best WR.</div>
           </div>
           <div className="rounded-lg border border-[#232329] p-2.5">
             <div className="lbl mb-1">Session heatmap</div>

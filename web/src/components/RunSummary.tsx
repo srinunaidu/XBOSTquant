@@ -72,7 +72,8 @@ export default function RunSummary() {
         <div className="mt-2 text-[11px] num text-zinc-400">
           Stress[best]: MC maxDD p5 {lastRun.stress.mcP5}% · med {lastRun.stress.mcMed}% · worst {lastRun.stress.mcWorst}% ·
           loss streak max {lastRun.stress.maxLossStreak} (P4 {(100 * lastRun.stress.p4).toFixed(1)}% · P5 {(100 * lastRun.stress.p5).toFixed(1)}% · P6 {(100 * lastRun.stress.p6).toFixed(1)}%) ·
-          avgMAE {fmtMoney(lastRun.stress.avgMAE)} · avgMFE {fmtMoney(lastRun.stress.avgMFE)}
+          avgMAE {fmtMoney(lastRun.stress.avgMAE)} · avgMFE {fmtMoney(lastRun.stress.avgMFE)} ·
+          bestTime {lastRun.stress.bestTime ? `${lastRun.stress.bestTime.w} WR${lastRun.stress.bestTime.wr}% n${lastRun.stress.bestTime.n} ${fmtMoney(lastRun.stress.bestTime.pnl)}` : '—'}
         </div>
       )}
     </section>
