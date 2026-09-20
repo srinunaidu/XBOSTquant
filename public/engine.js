@@ -1070,6 +1070,25 @@ function validateLayers(d, o){
     const span=d.t[n-1]-d.t[0];
     out.push({name:'W1 OOS span viable',pass:span>0,warn:false,detail:'split '+o.wfSplit+'/'+(100-o.wfSplit)});
   }
+  // L8 stop/target reachability: with TP/SL armed and enough trades, at least
+  // one of each should bind. Zero binds with TP 1% + avg wins far above it
+  // means either divine trend-following or a price-scale/file-layout problem.
+  if(o.exits){
+    const sig=o.exits.sig, bt=o.exits.bt;
+    if(bt&&bt.trades.length>=20){
+      const tpN=bt.trades.filter(t=>t.reason==='TP').length;
+      const slN=bt.trades.filter(t=>['SL','BE','ATR','CK','TRAIL'].indexOf(t.reason)>=0).length;
+      let avgWin=0,nw=0;
+      for(const t of bt.trades)if(t.pnl>0){avgWin+=t.pnl;nw++;}
+      avgWin=nw?avgWin/nw:0;
+      out.push({name:'L8a targets bind (TP%)',pass:true,warn:tpN===0,
+        detail:tpN+' TP exits / '+bt.trades.length+' trades · avg win ₹'+avgWin.toFixed(0)});
+      out.push({name:'L8b stops bind (SL/BE/ATR/CK/TRAIL)',pass:true,warn:slN===0,
+        detail:slN+' stop exits / '+bt.trades.length+' trades'});
+    } else {
+      out.push({name:'L8 stop/target reachability',pass:true,warn:true,detail:'<20 trades — skipped as inconclusive'});
+    }
+  }
   return out;
 }
 

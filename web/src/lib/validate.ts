@@ -82,6 +82,7 @@ export function runValidation() {
     const layers = engine.validateLayers(d, {
       ml: eff.regimeSource === 'ml', confGate: eff.confGate ?? 0.6,
       wf: st.wfOn, wfSplit: st.wfSplit,
+      exits: { sig, bt },
     });
     for (const c of layers) {
       const tag = c.pass ? (c.warn ? 'WARN' : 'PASS') : 'FAIL';
