@@ -170,7 +170,7 @@ export function stopRun() {
 
 function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, objective: string, topN: number,
   onBatch: (done: number, total: number | string, top: BoardRow[], cur: any, stage: string, pass: number) => void,
-  paramSteps: any, risk: any): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[]; route?: string[] }> {
+  paramSteps: any, risk: any): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[]; route?: string[]; robustnessLogs?: string[] }> {
   return new Promise((resolve, reject) => {
     let w: Worker;
     try { w = new Worker('/worker.js'); } catch (e) { return reject(e); }
@@ -183,7 +183,7 @@ function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, object
       if (m.type === 'progress') onBatch(m.done, m.total, m.top, m.current, m.stage, m.pass);
       else if (m.type === 'done') {
         clearTimeout(timer); w.terminate(); worker = null; rejecter = null;
-        resolve({ top: m.top, refined: m.refined || 0, passes: m.passes || 0, errSamples: m.errSamples || [], ml: m.ml || [], route: m.route || [] });
+        resolve({ top: m.top, refined: m.refined || 0, passes: m.passes || 0, errSamples: m.errSamples || [], ml: m.ml || [], route: m.route || [], robustnessLogs: m.robustnessLogs || [] });
       }
     };
     (w as any).onerror = (e: any) => { clearTimeout(timer); try { w.terminate(); } catch { /* noop */ } worker = null; rejecter = null; reject(e.message || e); };
@@ -409,7 +409,7 @@ export async function runGrid() {
   };
   let top: BoardRow[] = [], refineInfo = '', errSamples: any[] = [], runMode = 'worker', stopped = false;
   let refinedN = 0, passesN = 0;
-  let mlInfo: any[] = [], routeInfo: string[] = [];
+  let mlInfo: any[] = [], routeInfo: string[] = [], robustnessLogs: string[] = [];
   const allRows: BoardRow[] = [];
   useStore.getState()._refineAt = null;
   let doneBase = 0;
@@ -427,6 +427,7 @@ export async function runGrid() {
       refinedN += out.refined || 0; passesN = Math.max(passesN, out.passes || 0);
       mlInfo.push(...(out.ml || []).map((m: any) => ({ ...m, sym })));
       routeInfo.push(...((out as any).route || []).map((n: string) => `[${sym}] ${n}`));
+      robustnessLogs.push(...((out as any).robustnessLogs || []));
       if (useStore.getState().runSeq === mySeq) {
         useStore.getState().set({ board: engine.rankResults(allRows, objective).slice(0, topN) });
       }
@@ -469,6 +470,7 @@ export async function runGrid() {
     const errs = useStore.getState().run.errCount;
     routeInfo.forEach((n: string) => logLine(`  route: ${n}`));
     mlInfo.forEach((m: any) => logLine(`  ML regime ${m.tf}m: train-acc ${(m.trainAcc * 100).toFixed(1)}% in ${m.ms}ms`));
+    if (robustnessLogs.length) robustnessLogs.forEach(l => logLine(l));
     let wfMsg = '';
     if (st.wfOn && !stopped) {
       setRun({ summary: `done · verifying top-200 out-of-sample…` });

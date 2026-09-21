@@ -163,6 +163,7 @@ self.onmessage = async function(e) {
   }
   let ranked = E.rankResults(results, objective);
   // §27 staged robustness: cheap on Top-500, medium on Top-100, full on Top-25
+  let robustnessLogs = [];
   const Rb = (typeof XBOST_ROBUST !== 'undefined' ? XBOST_ROBUST : null);
   if (Rb) {
     const totalCombos = grid.length * (tradeOpts.sym || 'data').length || grid.length;
@@ -181,7 +182,30 @@ self.onmessage = async function(e) {
           const r = await Rb.robustnessFor(d0, cand, Object.assign({}, tradeOpts), null, totalCombos, i + 1);
           cand.robustness = r;
           cand.robustScore = r.final.adjusted;
-        } catch (e) { cand.robustError = String(e && e.message || e); }
+          // cap at 6.8 until full suite is logged (§26 gate)
+          if (!r.paramStability || !r.signalPurity || !r.regimeRobustness || !r.entryPerturbation || !r.worstTradeRemoval || !r.concentration || r.tradeOrder == null) {
+            cand.robustScore = Math.min(cand.robustScore, 6.8);
+          }
+        } catch (e) { cand.robustError = String(e && e.message || e); cand.robustScore = Math.min(cand.robustScore || 0, 6.8); }
+      }
+      // build machine logs for #1 (§26)
+      const top = ranked[0];
+      if (top && top.robustness) {
+        const r = top.robustness;
+        const ps = r.paramStability, ex = r.exitIndependence, sp = r.signalPurity, rg = r.regimeRobustness, tm = r.timeRobustness, en = r.entryPerturbation, inp = r.inputPerturbation, tr = r.tradeOrder, co = r.concentration, wt = r.worstTradeRemoval;
+        robustnessLogs.push(`[ROBUSTNESS START] candidate_id=${top.symbol||''}_${top.timeframe}m_${top.indicator} instrument=${top.symbol||''} timeframe=${top.timeframe}m indicator=${top.indicator} parameters=${JSON.stringify(top.params)} direction=${tradeOpts.direction} entry=${tradeOpts.entry} exit=${top.exit} optimized=true combinations_tested=${totalCombos} candidate_rank=1`);
+        robustnessLogs.push(`[CORE SIGNAL] WR=${r.baseline.winRate.toFixed(2)} trades=${top.m?.totalTrades||0} expectancy=${r.baseline.expectancy.toFixed(4)} profit_factor=${r.baseline.profitFactor.toFixed(2)} sharpe=${r.baseline.sharpe.toFixed(2)} sortino=${r.baseline.sortino?.toFixed(2)||0} max_dd=${r.baseline.maxDD?.toFixed(2)||0} avg_mae=${r.baseline.avgMAE?.toFixed(2)||0} avg_mfe=${r.baseline.avgMFE?.toFixed(2)||0}`);
+        if (ps) robustnessLogs.push(`[PARAMETER STABILITY] neighbors=${ps.neighbors} profitable=${ps.profitable} density=${(ps.density*100).toFixed(1)} median_sharpe=${ps.medianSharpe.toFixed(2)} p5_sharpe=${ps.p5Sharpe.toFixed(2)} worst_sharpe=${ps.worstSharpe.toFixed(2)} best_sharpe=${ps.bestSharpe.toFixed(2)} sd_sharpe=${ps.sdSharpe.toFixed(2)}`);
+        if (ex) robustnessLogs.push(`[EXIT INDEPENDENCE] variants=${ex.variants} profitable=${ex.profitable} median_sharpe=${ex.medianSharpe.toFixed(2)} worst=${ex.worstSharpe.toFixed(2)} best=${ex.bestSharpe.toFixed(2)}`);
+        if (sp) robustnessLogs.push(`[SIGNAL PURITY] indicator_only_sharpe=${sp.indicatorOnly.sharpe.toFixed(2)} regime_sharpe=${sp.regimeSharpe!=null?sp.regimeSharpe.toFixed(2):'NA'} full_sharpe=${sp.full.sharpe.toFixed(2)} purity=${sp.ratio.toFixed(2)}`);
+        if (rg) robustnessLogs.push(`[REGIME ROBUSTNESS] regimes=4 profitable=${rg.profitableRegimes} worst_sharpe=${rg.worstSharpe.toFixed(2)} median_sharpe=${rg.medianSharpe.toFixed(2)}`);
+        if (tm) robustnessLogs.push(`[TIME ROBUSTNESS] windows=4 profitable=${tm.profitableWindows} median_sharpe=${tm.medianSharpe.toFixed(2)} worst=${tm.worstSharpe.toFixed(2)} concentration=${(tm.concentration*100).toFixed(1)}%`);
+        if (en) robustnessLogs.push(`[ENTRY PERTURBATION] variants=${en.variants} profitable=${en.profitable} median_sharpe=${en.medianSharpe.toFixed(2)} worst=${en.worstSharpe.toFixed(2)}`);
+        if (inp) robustnessLogs.push(`[INPUT PERTURBATION] tests=${inp.total} profitable=${inp.profitable} median_sharpe=${inp.medianSharpe.toFixed(2)} worst=${inp.worstSharpe.toFixed(2)}`);
+        if (co) robustnessLogs.push(`[P&L CONCENTRATION] top1=${co.top1Pct.toFixed(1)}% top5=${co.top5Pct.toFixed(1)}% top10=${co.top10Pct.toFixed(1)}% largest=${co.largestWinnerPct.toFixed(1)}%`);
+        if (wt) robustnessLogs.push(`[BEST TRADE REMOVAL] remove1_sharpe=${wt.remove1.sharpe.toFixed(2)} remove3=${wt.remove3.sharpe.toFixed(2)} remove5=${wt.remove5.sharpe.toFixed(2)} remove10=${wt.remove10.sharpe.toFixed(2)}`);
+        robustnessLogs.push(`[MULTIPLE TESTING] total_combinations=${totalCombos} candidate_rank=1 percentile=${(100*(1-1/totalCombos)).toFixed(2)} penalty=${r.final.penalty.toFixed(2)}`);
+        robustnessLogs.push(`[FINAL] raw=${r.final.raw.toFixed(2)} adjusted=${r.final.adjusted.toFixed(2)} cap=${r.final.cap} classification=${r.classification} robustScore=${(top.robustScore||0).toFixed(2)}/10`);
       }
       // re-rank Top-25 by robustness score (§24: robustness first)
       const top25 = ranked.slice(0, 25).sort((a, b) => (b.robustScore || 0) - (a.robustScore || 0));
@@ -189,5 +213,5 @@ self.onmessage = async function(e) {
     }
   }
   self.postMessage({ type:'done', done:total + refined, total: total + refined, top:ranked.slice(0, topN),
-    all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo, route:routeNotices });
+    all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo, route:routeNotices, robustnessLogs:robustnessLogs });
 };
