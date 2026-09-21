@@ -6,6 +6,7 @@ import { useStore } from './store';
 import { fmtMoney, fmtParams } from './format';
 import { enabledSymbols, filterData } from './data';
 import Robust from './robustness';
+import { candidateId, formatCandidateHeader, formatCoreSignal, formatIsOos } from './report';
 
 const IND_TIER: Record<string, string> = {};
 for (const m of IND_META) if (m.n && m.tier) IND_TIER[m.n] = m.tier;
@@ -452,6 +453,14 @@ export async function runGrid() {
     doneBase += grid.length;
   }
   top = engine.rankResults(allRows, objective).slice(0, topN);
+  // Log candidate headers for top 5 (machine-readable, §2)
+  {
+    const totalCombos = grid.length * symData.length;
+    top.slice(0, 5).forEach((r, idx) => {
+      logLine(formatCandidateHeader(r, totalCombos, idx + 1, objective, opts));
+      logLine(formatCoreSignal(r));
+    });
+  }
   useStore.getState().set({ board: top });
   const s3 = useStore.getState();
   if (s3.stoppedFlag) stopped = true;
