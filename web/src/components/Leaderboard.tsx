@@ -21,9 +21,9 @@ const darkTheme = themeQuartz.withParams({
   fontSize: 12,
 });
 
-function rowToObj(r: BoardRow, ix: number, th: number, cost: number) {
+function rowToObj(r: BoardRow, ix: number, th: number, cost: number, signalOnly: boolean) {
   const m = r.m;
-  const gate = engine.paperEligible(r, { scoreThreshold: th, cost });
+  const gate = engine.paperEligible(r, { scoreThreshold: th, cost, allowZeroCost: signalOnly });
   const pss = r.robustness?.paramSensitivity?.pss ?? null;
   const surr = r.robustness?.surrogate?.p ?? null;
   return {
@@ -107,11 +107,17 @@ export default function Leaderboard() {
   const sel = useStore(s => s.sel);
   const paperThreshold = useStore(s => s.paperThreshold);
   const costNow = useStore(s => s.cost);
+  const signalOnly = useStore(s => s.costMode) === 'signal';
 
+  const minTrH = useStore(s => s.minTradesBoard);
   const rows = useMemo(() => {
     const q = boardFilter.toLowerCase();
-    let list = board.filter(r =>
-      !q || (r.symbol + ' ' + r.indicator + ' ' + r.timeframe + ' ' + fmtParams(r.params) + ' ' + (r.exit || '') + (r.carry ? ' carry' : '')).toLowerCase().includes(q));
+    const minTr = useStore.getState().minTradesBoard || 0;
+    let hidden = 0;
+    let list = board.filter(r => {
+      if ((r.m?.totalTrades || 0) < minTr) { hidden++; return false; }
+      return !q || (r.symbol + ' ' + r.indicator + ' ' + r.timeframe + ' ' + fmtParams(r.params) + ' ' + (r.exit || '') + (r.carry ? ' carry' : '')).toLowerCase().includes(q);
+    });
     if (view === 'best') {
       const ranked = engine.rankResults(board, objective);
       const seen = new Set<string>(), out: BoardRow[] = [];
@@ -119,9 +125,9 @@ export default function Leaderboard() {
       const champ = new Set(out);
       list = list.filter(r => champ.has(r)).sort((a, b) => out.indexOf(a) - out.indexOf(b));
     }
-    return list.map((r, i) => rowToObj(r, i, paperThreshold ?? 9.5, costNow));
+    return { rows: list.map((r, i) => rowToObj(r, i, paperThreshold ?? 9.5, costNow, signalOnly)), hidden };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [board, view, boardFilter, objective, paperThreshold, costNow]);
+  }, [board, view, boardFilter, objective, paperThreshold, costNow, signalOnly, minTrH]);
 
   return (
     <section className="card p-3">
@@ -138,13 +144,14 @@ export default function Leaderboard() {
           className="ml-auto !text-xs !py-1.5 px-2 w-52" />
       </div>
       {view === 'best' && <div className="text-[11px] text-green-300 num mb-2">★ One champion row per indicator for the current objective — full details in every column.</div>}
+      {rows.hidden > 0 && view !== 'cmp' && <div className="text-[11px] text-amber-300 num mb-2">⚠ {rows.hidden} thin rows hidden (&lt; {minTrH} trades) — lower the board filter to inspect them.</div>}
       {view === 'cmp' ? (
         <CompareView />
       ) : (
         <div className="ag-theme-xbost" style={{ height: 380, width: '100%' }}>
           <AgGridReact
             theme={darkTheme}
-            rowData={rows}
+            rowData={rows.rows}
             columnDefs={COLS as any}
             rowSelection={{ mode: 'singleRow' }}
             onRowClicked={e => selectRow((e.data as any)._r)}
@@ -153,7 +160,7 @@ export default function Leaderboard() {
           />
         </div>
       )}
-      {!rows.length && view !== 'cmp' && (
+      {!rows.rows.length && view !== 'cmp' && (
         <div className="empty-state">Upload a 1-min CSV to populate terminal strategies…</div>
       )}
     </section>

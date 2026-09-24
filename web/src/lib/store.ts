@@ -80,6 +80,12 @@ type State = {
   bayesRefine: boolean;
   paperThreshold: number;
   lastPaper: { eligible: boolean; reasons: string[] } | null;
+  exchange: string;
+  ivMaxRank: number | null;
+  excludeExpiry: boolean;
+  premiumFloor: number;
+  costMode: string;
+  minTradesBoard: number;
   detail: Detail;
   view: 'all' | 'best' | 'cmp';
   boardFilter: string;
@@ -147,6 +153,12 @@ export const useStore = create<State>((set) => ({
   bayesRefine: true,
   paperThreshold: 9.5,
   lastPaper: null,
+  exchange: 'auto',
+  ivMaxRank: null,
+  excludeExpiry: false,
+  premiumFloor: 0,
+  costMode: 'realistic',
+  minTradesBoard: 0,
   view: 'all',
   boardFilter: '',
   run: { ...initialRun },

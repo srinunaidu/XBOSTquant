@@ -47,12 +47,15 @@ function sniffTable(text) {
   let header=null, start=0, layout='positional';
   if (known>=2 && numeric<first.length/2){ header=first.map(s=>s.toLowerCase()); start=1; layout='header'; }
   const HF=(re)=>header?header.findIndex(x=>re.test(x)):-1;
-  const col={symI:-1, dtI:-1, dateI:-1, timeI:-1, oI:-1, hI:-1, lI:-1, cI:-1, vI:-1};
+  const col={symI:-1, dtI:-1, dateI:-1, timeI:-1, oI:-1, hI:-1, lI:-1, cI:-1, vI:-1, strikeI:-1, otypeI:-1, expiryI:-1};
   if (header) {
     col.symI=HF(/^(symbol|scrip|instrument|ticker)$/);
     col.dtI=HF(/^(datetime|timestamp)$/);
     col.dateI=col.dtI>=0?-1:HF(/^(date|day)$/);
     col.timeI=col.dtI>=0?-1:HF(/^(time)$/);
+    col.strikeI=HF(/^(strike|strikeprice|strike_price)$/);
+    col.otypeI=HF(/^(otype|optiontype|option_type|cp|callput)$/);
+    col.expiryI=HF(/^(expiry|expiration|maturity)$/);
     // guard: a lone 'time' column holding full stamps (e.g. '2024-01-01 09:15')
     col.oI=HF(/^open$/); col.hI=HF(/^high$/); col.lI=HF(/^low$/); col.cI=HF(/^(close|settle|ltp)$/);
     col.vI=HF(/^(volume|vol|qty|quantity|traded)$/);
@@ -92,9 +95,24 @@ function sniffTable(text) {
 function symLabel(s){
   return String(s||'').split(/[_.\-\s]+/)[0].toUpperCase().slice(0,20)||'DATA';
 }
+function parseExpiryFlex(s){
+  // Expiry stamps: 29SEP2026 / 29-Sep-2026 / 2026-09-29 / epoch s|ms.
+  if(s==null||s==='')return NaN;
+  const t=String(s).trim().toUpperCase();
+  if(/^\d+$/.test(t)){ const v=+t; return v<1e12?v*1000:v; }
+  const m=t.match(/^(\d{1,2})[-\s]?([A-Z]{3})[-\s]?(\d{2,4})$/);
+  if(m){
+    const mon={JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11}[m[2]];
+    if(mon==null)return NaN;
+    let y=+m[3]; if(y<100)y+=2000;
+    return new Date(y,mon,+m[1]).getTime();
+  }
+  const v=Date.parse(t);
+  return isNaN(v)?NaN:v;
+}
 function extractRows(grid, start, col, onlySym){
   // onlySym: exact raw symbol value to keep (null = keep all rows)
-  const T=[],O=[],H=[],L=[],C=[],V=[],SYM=[];
+  const T=[],O=[],H=[],L=[],C=[],V=[],SYM=[],STRIKE=[],OTYPE=[],EXP=[];
   for (let i=start;i<grid.length;i++) {
     const p = grid[i];
     if (p.length < 4) continue;
@@ -115,8 +133,12 @@ function extractRows(grid, start, col, onlySym){
     const o=+(p[col.oI]??NaN),h2=+(p[col.hI]??NaN),l2=+(p[col.lI]??NaN),c2=+(p[col.cI]??NaN),v=+(p[col.vI]??0);
     if (!isFinite(o)||!isFinite(h2)||!isFinite(l2)||!isFinite(c2)||!isFinite(t)) continue;
     T.push(t);O.push(o);H.push(h2);L.push(l2);C.push(c2);V.push(v||0);SYM.push(rawSym);
+    STRIKE.push(col.strikeI>=0?+(p[col.strikeI]??NaN):NaN);
+    const ot=col.otypeI>=0?String(p[col.otypeI]||'').trim().toUpperCase():'';
+    OTYPE.push(/^(C|CE|CALL)$/.test(ot)?'CE':/^(P|PE|PUT)$/.test(ot)?'PE':'');
+    EXP.push(col.expiryI>=0?parseExpiryFlex(p[col.expiryI]):NaN);
   }
-  return {T,O,H,L,C,V,SYM};
+  return {T,O,H,L,C,V,SYM,STRIKE,OTYPE,EXP};
 }
 function toData(R){
   const n=R.T.length, idx=new Array(n);
@@ -139,16 +161,30 @@ function parseCSV(text) {
   for(const s of R.SYM)counts[s]=(counts[s]||0)+1;
   const keys=Object.keys(counts).sort((a,b)=>counts[b]-counts[a]);
   const keep=keys[0]||'';
-  const F={T:[],O:[],H:[],L:[],C:[],V:[],SYM:[]};
-  for(let i=0;i<R.T.length;i++)if(R.SYM[i]===keep){F.T.push(R.T[i]);F.O.push(R.O[i]);F.H.push(R.H[i]);F.L.push(R.L[i]);F.C.push(R.C[i]);F.V.push(R.V[i]);F.SYM.push(R.SYM[i]);}
+  const F={T:[],O:[],H:[],L:[],C:[],V:[],SYM:[],STRIKE:[],OTYPE:[],EXP:[]};
+  for(let i=0;i<R.T.length;i++)if(R.SYM[i]===keep){F.T.push(R.T[i]);F.O.push(R.O[i]);F.H.push(R.H[i]);F.L.push(R.L[i]);F.C.push(R.C[i]);F.V.push(R.V[i]);F.SYM.push(R.SYM[i]);F.STRIKE.push(R.STRIKE[i]);F.OTYPE.push(R.OTYPE[i]);F.EXP.push(R.EXP[i]);}
   const out=toData(F);
   out.symbol=symLabel(keep);
   out.layout=tab.layout;
+  out.contract=contractOf(F);
   if(keys.length>1)out.mixed={contracts:keys.length, kept:keep, keptRows:F.T.length, dropped:R.T.length-F.T.length};
   return out;
 }
 // Split a (possibly multi-contract) file into one pure dataset per contract,
 // largest first. Single-symbol files return exactly one entry.
+// Contract-level meta for one (already single-contract) row set: strike /
+// option type / expiry taken from the first row carrying them. Futures and
+// plain equity files yield {strike:null,...} — callers must null-check.
+function contractOf(F){
+  const c={strike:null, otype:'', expiry:'', expiryMs:NaN};
+  for(let i=0;i<(F.T||[]).length;i++){
+    if(c.strike==null&&isFinite(F.STRIKE[i]))c.strike=F.STRIKE[i];
+    if(!c.otype&&F.OTYPE[i])c.otype=F.OTYPE[i];
+    if(!isFinite(c.expiryMs)&&isFinite(F.EXP[i])){c.expiryMs=F.EXP[i];c.expiry=new Date(F.EXP[i]).toISOString().slice(0,10);}
+    if(c.strike!=null&&c.otype&&isFinite(c.expiryMs))break;
+  }
+  return c;
+}
 function parseCSVAll(text) {
   const tab=sniffTable(text);
   if(!tab)return [];
@@ -162,11 +198,12 @@ function parseCSVAll(text) {
   for(let i=0;i<R.T.length;i++){(groups[R.SYM[i]||''] = groups[R.SYM[i]||''] || []).push(i);}
   const keys=Object.keys(groups).sort((a,b)=>groups[b].length-groups[a].length);
   return keys.map(k=>{
-    const F={T:[],O:[],H:[],L:[],C:[],V:[],SYM:[]};
-    for(const i of groups[k]){F.T.push(R.T[i]);F.O.push(R.O[i]);F.H.push(R.H[i]);F.L.push(R.L[i]);F.C.push(R.C[i]);F.V.push(R.V[i]);F.SYM.push(R.SYM[i]);}
+    const F={T:[],O:[],H:[],L:[],C:[],V:[],SYM:[],STRIKE:[],OTYPE:[],EXP:[]};
+    for(const i of groups[k]){F.T.push(R.T[i]);F.O.push(R.O[i]);F.H.push(R.H[i]);F.L.push(R.L[i]);F.C.push(R.C[i]);F.V.push(R.V[i]);F.SYM.push(R.SYM[i]);F.STRIKE.push(R.STRIKE[i]);F.OTYPE.push(R.OTYPE[i]);F.EXP.push(R.EXP[i]);}
     const out=toData(F);
     out.symbol=symLabel(k);
     out.layout=tab.layout;
+    out.contract=contractOf(F);
     return {symbol:out.symbol, full:k, d:out};
   });
 }
@@ -1291,6 +1328,79 @@ function validateLayers(d, o){
 
 // ---------- backtest ----------
 function timeToMin(s){const[a,b]=s.split(':').map(Number);return a*60+b;}
+// ---------- Exchange-aware sessions ----------
+// NSE equity/F&O 09:15–15:30 IST; MCX commodities 09:00–23:30; NCDEX 09:00–21:00.
+// detectExchange sniffs the symbol; resolveSession returns {exchange,start,end}
+// with explicit user times winning over the preset (custom choice is kept).
+const EXCHANGE_SESSIONS={
+  NSE:{start:'09:15',end:'15:30'}, MCX:{start:'09:00',end:'23:30'}, NCDEX:{start:'09:00',end:'21:00'},
+};
+const MCX_PREFIX=['CRUDEOIL','CRUDE','GOLD','SILVER','COPPER','ZINC','LEAD','NICKEL','ALUMINIUM','NATURALGAS','COTTON','CPO','MENTHAOIL','CARDAMOM','CASTORSEED','DHANIYA','GUARGUM','GUARSEED','JEERA','KAPAS','MUSTARD','PEPPER','RBDPALMOLEIN','RUBBER','SOYBEAN','SOYOIL','SUNFLOWEROIL','WHEAT','BARLEY','BAJRA','CHANA','MOONG','URAD','TURMERIC','CORIANDER'];
+const NCDEX_PREFIX=['CASTOR','GUAR','CHANA','SOYA','BARLEY','WHEAT'];
+function detectExchange(symbol){
+  const s=String(symbol||'').toUpperCase().replace(/[^A-Z]/g,'');
+  for(const p of MCX_PREFIX)if(s.indexOf(p)===0)return 'MCX';
+  for(const p of NCDEX_PREFIX)if(s.indexOf(p)===0)return 'NCDEX';
+  return 'NSE';
+}
+function resolveSession(exchange, startStr, endStr){
+  const ex=EXCHANGE_SESSIONS[exchange]?exchange:'NSE';
+  const preset=EXCHANGE_SESSIONS[ex];
+  return {exchange:ex, start:startStr||preset.start, end:endStr||preset.end, preset:startStr||endStr?false:true};
+}
+
+// ---------- IV-rank proxy (realized-vol percentile, OHLCV-only) ----------
+// No IV feed exists in the CSVs, so this proxies implied expensiveness with
+// realized-vol percentile: rv = 20-bar log-return stdev (annualised), ranked
+// against its trailing history (default ≈252 sessions of 1m bars, clamped to
+// file length, min 500 bars or insufficient). High rank = expensive vol
+// (avoid buying), low rank = cheap vol. HONEST LIMITS: needs a long file;
+// options Greeks (gamma/vanna) need OI data we do not have.
+function ivRankSeries(c, rvLen, histBars){
+  const n=c.length, out=new Float64Array(n).fill(NaN);
+  rvLen=Math.max(5,Math.round(rvLen||20));
+  histBars=Math.max(500,Math.round(histBars||252*300));
+  const H=Math.min(histBars,n);
+  if(n<Math.max(60,rvLen+10))return {ivRank:out, insufficient:true};
+  const rv=new Float64Array(n).fill(NaN);
+  for(let i=rvLen;i<n;i++){
+    let m=0; for(let j=i-rvLen+1;j<=i;j++)m+=Math.log(c[j]/Math.max(1e-12,c[j-1]));
+    m/=rvLen; let s=0; for(let j=i-rvLen+1;j<=i;j++){const r=Math.log(c[j]/Math.max(1e-12,c[j-1]))-m;s+=r*r;}
+    rv[i]=Math.sqrt(s/Math.max(1,rvLen-1))*Math.sqrt(252*375);
+  }
+  for(let i=0;i<n;i++){
+    if(isNaN(rv[i]))continue;
+    const s0=Math.max(rvLen,i-H+1);
+    if(i-s0<100)continue; // need history depth for a meaningful percentile
+    let lo=0,eq=0,tot=0;
+    for(let j=s0;j<=i;j++){ if(isNaN(rv[j]))continue; tot++; if(rv[j]<rv[i])lo++; if(rv[j]===rv[i])eq++; }
+    out[i]=tot?(lo+0.5*eq)/tot:NaN;
+  }
+  let valid=0; for(let i=0;i<n;i++)if(!isNaN(out[i]))valid++;
+  return {ivRank:out, insufficient:valid<50};
+}
+function ivRankMask(d, maxRank, rvLen, histBars){
+  // 1 = ivRank ≤ maxRank (cheap enough to trade), 0 = too expensive.
+  // maxRank==null/≥1 disables (all-pass). NaN rank (warmup) passes — never
+  // silently zero a backtest for missing history.
+  const n=d.c.length, out=new Int8Array(n).fill(1);
+  if(maxRank==null||!(maxRank<1))return {mask:out, insufficient:false};
+  const rr=ivRankSeries(d.c, rvLen, histBars);
+  for(let i=0;i<n;i++)if(!isNaN(rr.ivRank[i])&&rr.ivRank[i]>maxRank)out[i]=0;
+  return {mask:out, insufficient:rr.insufficient};
+}
+// ---------- Expiry-day mask ----------
+// 0 on bars sharing the contract's expiry calendar date (gamma-risk zone),
+// 1 elsewhere. No contract meta or excludeExpiry=false → all-pass.
+function buildExpiryMask(d, excludeExpiry){
+  const n=d.c.length, out=new Int8Array(n).fill(1);
+  const ex=d.contract&&isFinite(d.contract.expiryMs)?d.contract.expiryMs:null;
+  if(!excludeExpiry||ex==null)return out;
+  const ed=new Date(ex);
+  const ey=ed.getFullYear(), em=ed.getMonth(), eday=ed.getDate();
+  for(let i=0;i<n;i++){const t=new Date(d.t[i]);out[i]=(t.getFullYear()===ey&&t.getMonth()===em&&t.getDate()===eday)?0:1;}
+  return out;
+}
 
 // Precompute once per timeframe (NOT per combo): 1 if bar is inside session, else 0.
 // Building this costs ~1M Date() calls — callers must cache it across grid combos.
@@ -1443,7 +1553,7 @@ function backtest(d, sigPos, opts){
         // (no point burning 1M-bar loops for a dead parameter set).
         if(liveEq<=0){ruined=true;for(let j=i;j<n;j++)eqMtm[j]=liveEq;lastExitBar=i;break;}
         // immediate re-entry on flip (mask already enforced via tgt)
-        if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined){
+        if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&(!opts.premiumFloor||!(fillPx<opts.premiumFloor))){
           position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;
           hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
         }
@@ -1453,7 +1563,8 @@ function backtest(d, sigPos, opts){
       }
     } else {
       const allowEntry=!trigOnly||(edge&&i>lastExitBar);
-      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry){
+      const premOk=!opts.premiumFloor||!(fillPx<opts.premiumFloor); // options: never buy dust (sub-floor premium)
+      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry&&premOk){
         position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;
         hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
       }
@@ -1854,11 +1965,14 @@ function paperEligible(row, o){
   o=o||{};
   const th=o.scoreThreshold==null?9.5:o.scoreThreshold;
   const minN=o.minTrades==null?200:o.minTrades;
-  const reasons=[];
-  if(row==null||row.m==null) return {eligible:false, reasons:['no result row']};
+  const reasons=[], warnings=[];
+  if(row==null||row.m==null) return {eligible:false, reasons:['no result row'], warnings};
   if(!(row.m.netPnL>0)) reasons.push(`netPnL ${row.m.netPnL} ≤ 0`);
   if(!(row.m.totalTrades>=minN)) reasons.push(`trades ${row.m.totalTrades} < ${minN}`);
-  if(o.cost!=null&&!(o.cost>0)) reasons.push('zero-cost run (set realistic cost/trade)');
+  if(o.cost!=null&&!(o.cost>0)){
+    if(o.allowZeroCost) warnings.push('signal-only run (costs zeroed — size positions for real friction before trading)');
+    else reasons.push('zero-cost run (set realistic cost/trade)');
+  }
   if(row.robustScore==null) reasons.push('no robustness score (worker path required)');
   else if(!(row.robustScore>=th)) reasons.push(`robustScore ${(row.robustScore||0).toFixed(2)} < ${th}`);
   const rb=row.robustness||{};
@@ -1872,7 +1986,7 @@ function paperEligible(row, o){
     if(row.survived==null) reasons.push('no OOS verdict (enable walk-forward)');
     else if(!row.survived) reasons.push('OOS not survived');
   }
-  return {eligible:reasons.length===0, reasons};
+  return {eligible:reasons.length===0, reasons, warnings};
 }
 // demoteKnifeEdge: stable re-rank pushing knife-edge rows (pssOf(row) ≥ 0.5)
 // below every clean row. Rows with unknown PSS keep position (never punished
@@ -1901,7 +2015,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

@@ -5,7 +5,7 @@ const TIERS_META: Record<string, string> = {};
 for (const m of IND_META) if (m.n && m.tier) TIERS_META[m.n] = m.tier;
 import { useStore } from '../lib/store';
 import { estimateCombos } from '../lib/runner';
-import { applyDateFilter, loadFile } from '../lib/data';
+import { applyDateFilter, loadFile, selectATM } from '../lib/data';
 import { downloadLog } from '../lib/export';
 import { runValidation } from '../lib/validate';
 
@@ -56,6 +56,21 @@ export default function Sidebar() {
           <div><label className="lbl">Capital ₹</label>
             <input type="number" value={st.capital} className="w-full mt-1 num" onChange={e => set({ capital: +e.target.value || 100000 })} /></div>
         </div>
+        <div className="grid grid-cols-2 gap-2 mb-2">
+          <div><label className="lbl">Exchange (sessions)</label>
+            <select value={st.exchange} className="w-full mt-1" onChange={e => {
+              const ex = e.target.value;
+              const sess = (engine as any).resolveSession(ex === 'auto' ? (engine as any).detectExchange(st.symbol) : ex, null, null);
+              set({ exchange: ex, sessStart: sess.start, sessEnd: sess.end });
+            }}>
+              <option value="auto">Auto (from symbol)</option>
+              <option value="NSE">NSE 09:15–15:30</option>
+              <option value="MCX">MCX 09:00–23:30</option>
+              <option value="NCDEX">NCDEX 09:00–21:00</option>
+            </select></div>
+          <div><label className="lbl">Effective</label>
+            <div className="w-full mt-1 num text-[12px] text-emerald-300 py-1.5">{(engine as any).resolveSession(st.exchange === 'auto' ? (engine as any).detectExchange(st.symbol) : st.exchange, null, null).exchange}</div></div>
+        </div>
         <div className="text-[10px] text-zinc-500 mt-1.5">Active symbol follows the file you upload; toggle symbols below to include them in runs.</div>
         <div className="grid grid-cols-2 gap-2 mt-2">
           <div><label className="lbl">From</label>
@@ -89,6 +104,9 @@ export default function Sidebar() {
         <div className="grid grid-cols-2 gap-2 mt-2">
           <Num id="topN" label="Top-N board" value={st.topN} onChange={(v: number) => set({ topN: v || 500 })} />
           <Num id="cap" label="Max combos cap" value={st.cap} onChange={(v: number) => set({ cap: v || 60000 })} />
+        </div>
+        <div className="grid grid-cols-2 gap-2 mt-2">
+          <Num id="minTr" label="Hide rows < N trades" value={st.minTradesBoard} onChange={(v: number) => set({ minTradesBoard: Math.max(0, v || 0) })} />
         </div>
         <div className="grid grid-cols-2 gap-2 mt-2">
           <div><label className="lbl">Grid sampler</label>
@@ -176,6 +194,26 @@ function DatasetList() {
           </div>
         );
       })}
+      <AtmSelect />
+    </div>
+  );
+}
+
+function AtmSelect() {
+  const [msg, setMsg] = React.useState<string | null>(null);
+  const [legs, setLegs] = React.useState(1);
+  return (
+    <div className="flex items-center gap-1.5 pt-1">
+      <button className="btn-ghost btn-xs flex-1" title="Enable only ATM±N contracts vs the underlying dataset"
+        onClick={() => {
+          const r = selectATM(legs);
+          setMsg(r.enabled.length ? `ATM±${legs}: ${r.enabled.length} on` : `ATM select: ${r.reason}`);
+        }}>
+        🎯 ATM ± select
+      </button>
+      <input type="number" value={legs} min={0} max={5} className="w-12 num"
+        onChange={e => setLegs(Math.min(5, Math.max(0, +e.target.value || 1)))} title="legs each side" />
+      {msg && <span className="text-[10px] text-zinc-500">{msg}</span>}
     </div>
   );
 }
@@ -255,6 +293,27 @@ function ExecSection() {
         {!(st.cost > 0) && (
           <div className="text-[11px] text-red-400 mt-1">⚠ cost = 0 — paper gate will BLOCK every row. Pick a preset.</div>
         )}
+      </div>
+      <div className="mt-1.5">
+        <div className="lbl mb-1">Cost mode</div>
+        <div className="flex gap-3 text-xs">
+          {[['realistic', 'Realistic (costs applied)'], ['signal', 'Signal-only (cost=0) ⚠']].map(([v, l]) => (
+            <label key={v} className="flex items-center gap-1"><input type="radio" checked={st.costMode === v} onChange={() => set({ costMode: v })} /> {l}</label>
+          ))}
+        </div>
+        <div className="text-[10px] text-zinc-500 mt-1">Signal-only is for research — paper gate warns and never fully passes on costs.</div>
+      </div>
+      <div className="mt-1.5 rounded-lg border border-purple-900 bg-purple-950/20 p-2">
+        <div className="lbl mb-1.5">Options structure filters</div>
+        <div className="grid grid-cols-2 gap-1.5">
+          <Num label="Premium floor ₹" value={st.premiumFloor} onChange={(v: number) => set({ premiumFloor: Math.max(0, v || 0) })} />
+          <Num label="Max IV-rank (0-1)" value={st.ivMaxRank ?? 1} onChange={(v: number) => set({ ivMaxRank: v >= 1 ? null : Math.min(0.99, Math.max(0.05, v || 1)) })} />
+        </div>
+        <label className="flex items-center gap-2 text-[11px] text-zinc-300 mt-1.5 cursor-pointer">
+          <input type="checkbox" checked={st.excludeExpiry} onChange={() => set({ excludeExpiry: !st.excludeExpiry })} />
+          Exclude expiry-day bars (gamma-risk zone)
+        </label>
+        <div className="text-[10px] text-zinc-500 mt-1">Floor skips sub-₹ entries · IV-rank ≤ max only (needs long file) · expiry needs an expiry column.</div>
       </div>
       <div className="mt-2 rounded-lg border border-amber-900 bg-amber-950/20 p-2">
         <div className="lbl mb-1.5">Exit logic — searched dimensions</div>

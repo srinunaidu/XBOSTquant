@@ -75,8 +75,16 @@ export const HEAT_BUCKETS = [
   { label: '14:00–15:30', from: 840, to: 930 },
 ];
 
-export function heatmap(trades: Trade[]) {
-  return HEAT_BUCKETS.map(b => {
+// MCX commodities trade 09:00–23:30 — NSE buckets would misattribute.
+export const HEAT_BUCKETS_MCX = [
+  { label: '09:00–12:00', from: 540, to: 720 },
+  { label: '12:00–15:30', from: 720, to: 930 },
+  { label: '15:30–19:00', from: 930, to: 1140 },
+  { label: '19:00–23:30', from: 1140, to: 1410 },
+];
+
+export function heatmap(trades: Trade[], buckets = HEAT_BUCKETS) {
+  return buckets.map(b => {
     const ts = trades.filter(t => {
       const dt = new Date(t.exitTime);
       const m = dt.getHours() * 60 + dt.getMinutes();

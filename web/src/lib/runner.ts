@@ -4,7 +4,7 @@ import engine, { type BoardRow, type OHLCV } from './engine';
 import { EXIT_LBL, IND_META } from './config';
 import { useStore } from './store';
 import { fmtMoney, fmtParams } from './format';
-import { enabledSymbols, filterData } from './data';
+import { enabledSymbols, filterData, dataHealth } from './data';
 import Robust from './robustness';
 import { candidateId, formatCandidateHeader, formatCoreSignal, formatIsOos } from './report';
 
@@ -100,13 +100,24 @@ export function tradeOpts(): Record<string, any> {
     direction = 'Long';
     logLine('options desk: buy-only enforced (direction forced Long — no short premium)');
   }
+  // Exchange-aware sessions: explicit exchange wins, else auto-detect from
+  // the active symbol (MCX commodities trade 09:00–23:30, not NSE hours).
+  const ex = s.exchange && s.exchange !== 'auto' ? s.exchange : engine.detectExchange(s.symbol);
+  const sess = engine.resolveSession(ex, s.useSession ? s.sessStart : null, s.useSession ? s.sessEnd : null);
+  let cost = s.cost;
+  if (s.costMode === 'signal') {
+    if (cost > 0) logLine('cost mode: SIGNAL-ONLY — costs zeroed for research (paper gate will warn, not pass)');
+    cost = 0;
+  }
   return {
     direction,
-    sessionStart: s.useSession ? s.sessStart : null,
-    sessionEnd: s.useSession ? s.sessEnd : null,
+    exchange: sess.exchange,
+    sessionStart: sess.start, sessionEnd: sess.end,
     slPct: s.slFix, tpPct: s.tpFix, trailPct: s.trail,
     capital: s.capital, qty: s.qty, lotSize: s.lot,
-    cost: s.cost,
+    cost, costMode: s.costMode,
+    premiumFloor: s.premiumFloor || 0, excludeExpiry: !!s.excludeExpiry,
+    ivMaxRank: s.ivMaxRank,
     beTrigger: s.beTrigger, beLock: s.beLock,
     atrTrailPeriod: s.atrP, atrTrailMult: s.atrM,
     ckPeriod: s.ckP, ckMult: s.ckM,
@@ -254,7 +265,16 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
   const getTF = (tf: number) => {
     if (!tfCache || tfCache.tf !== tf) {
       const d = engine.resample(data, tf);
-      tfCache = { tf, d, maskIn: engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd), maskCarry: new Int8Array(d.c.length).fill(1) };
+      let mi = engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd);
+      mi = engine.combineMasks(mi, engine.buildExpiryMask(d, opts.excludeExpiry)) as Int8Array;
+      if (opts.ivMaxRank != null && opts.ivMaxRank < 1) {
+        const ivm = engine.ivRankMask(d, opts.ivMaxRank, 20, 75600);
+        logLine(ivm.insufficient
+          ? `  route: ${tf}m IV-rank insufficient history — filter inactive`
+          : `  route: ${tf}m IV-rank filter ≤${opts.ivMaxRank}`);
+        mi = engine.combineMasks(mi, ivm.mask) as Int8Array;
+      }
+      tfCache = { tf, d, maskIn: mi, maskCarry: new Int8Array(d.c.length).fill(1) };
     }
     return tfCache;
   };
@@ -399,7 +419,10 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
       const k = tf + 'f' + fi;
       if (!tfCache[k]) {
         const d = engine.resample(foldData(fi) as any, tf);
-        tfCache[k] = { d, maskIn: engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd), maskCarry: new Int8Array(d.c.length).fill(1) };
+        let mi = engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd);
+        mi = engine.combineMasks(mi, engine.buildExpiryMask(d, opts.excludeExpiry)) as Int8Array;
+        if (opts.ivMaxRank != null && opts.ivMaxRank < 1) mi = engine.combineMasks(mi, engine.ivRankMask(d, opts.ivMaxRank, 20, 75600).mask) as Int8Array;
+        tfCache[k] = { d, maskIn: mi, maskCarry: new Int8Array(d.c.length).fill(1) };
         wfRouteCaches[k] = {};
       }
       return tfCache[k];
@@ -497,7 +520,11 @@ export async function runGrid() {
   let lastRender = 0;
   const setRun = (p: Partial<typeof st.run>) => useStore.getState().set({ run: { ...useStore.getState().run, ...p } });
   setRun({ running: true, done: 0, total: grandTotal, stage: 'grid', pass: 0, perSec: 0, eta: '', current: 'warming up…', errCount: 0, refined: 0, passes: 0, summary: `0 / ${grandTotal}` });
-  logLine(`run start: ${syms.map(([s, d]) => `${s} ${(d.t.length / 1000).toFixed(0)}k`).join(' + ')} bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote}${samplerNote}${v2Note}${purgeNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}x${symData.length}sym`);
+  logLine(`run start: ${syms.map(([s, d]) => `${s} ${(d.t.length / 1000).toFixed(0)}k`).join(' + ')} bars ex=${opts.exchange}(${opts.sessionStart}→${opts.sessionEnd})` + ` objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote}${samplerNote}${v2Note}${purgeNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost}${opts.costMode === 'signal' ? '(SIGNAL-ONLY)' : ''}${opts.premiumFloor ? ` premFloor=${opts.premiumFloor}` : ''}${opts.ivMaxRank != null && opts.ivMaxRank < 1 ? ` ivRank≤${opts.ivMaxRank}` : ''}${opts.excludeExpiry ? ' noExpiryDay' : ''} grid=${grid.length}x${symData.length}sym`);
+  try {
+    const dh = dataHealth();
+    logLine(`  data health: ${dh.symbols} symbols · ${(dh.bars / 1000).toFixed(0)}k bars · ${dh.sessions} sessions · ${dh.spanDays}d span${dh.contracts ? ` · ${dh.contracts} contracts/${dh.expiries.length} expiries` : ''} — ` + dh.verdicts.map(v => `${v.ok ? 'PASS' : 'FAIL'} ${v.label} (${v.detail})`).join(' · '));
+  } catch { /* best-effort */ }
   const onBatch = (done: number, total: number | string, top: BoardRow[], current: any, stage: string, pass: number) => {
     if (useStore.getState().runSeq !== mySeq) return;
     if (stage === 'refine' && !useStore.getState()._refineAt) useStore.getState().set({ _refineAt: performance.now() });
@@ -648,10 +675,10 @@ export async function runGrid() {
       try {
         const det = detailFor(best);
         if (det && det.bt.trades.length) {
-          const { monteCarloDD, streakStats, heatmap, excursionStats } = await import('./stress');
+          const { monteCarloDD, streakStats, heatmap, excursionStats, HEAT_BUCKETS_MCX } = await import('./stress');
           const mc = monteCarloDD(det.bt.trades, opts.capital, 1000, 42);
           const sk = streakStats(det.bt.trades);
-          const ht = heatmap(det.bt.trades);
+          const ht = heatmap(det.bt.trades, opts.exchange === 'MCX' ? HEAT_BUCKETS_MCX : undefined);
           const ex = excursionStats(det.bt.trades);
           // best window: highest net pnl among windows with ≥5 trades, else best WR
           const rankedH = ht.slice().sort((a,b) => b.pnl - a.pnl);
@@ -711,9 +738,9 @@ export async function runGrid() {
   if (bd.length && !s4.userPickedSeq) selectRow(bd[0], true);
   // PAPER verdict for the champion (logged every run, regardless of adaptive).
   if (bd.length && !stopped) {
-    const gate = engine.paperEligible(bd[0], { scoreThreshold: s4.paperThreshold ?? 9.5, cost: opts.cost });
+    const gate = engine.paperEligible(bd[0], { scoreThreshold: s4.paperThreshold ?? 9.5, cost: opts.cost, allowZeroCost: opts.costMode === 'signal' });
     useStore.getState().set({ lastPaper: gate });
-    if (gate.eligible) logLine(`PAPER: ELIGIBLE — [${bd[0].symbol}] ${bd[0].timeframe}m ${bd[0].indicator} passed all gates`);
+    if (gate.eligible) logLine(`PAPER: ELIGIBLE — [${bd[0].symbol}] ${bd[0].timeframe}m ${bd[0].indicator} passed all gates${(gate.warnings || []).length ? ' (warnings: ' + (gate.warnings || []).join('; ') + ')' : ''}`);
     else logLine(`PAPER: BLOCKED — ${gate.reasons.join(' · ')}`);
   }
   // Adaptive tier escalation: Tier-A best must clear the HARD gate
@@ -801,6 +828,10 @@ export function detailFor(r: BoardRow) {
   eff.sessionMask = engine.combineMasks(
     eff.carry ? new Int8Array(d.c.length).fill(1) : engine.buildSessionMask(d, eff.sessionStart, eff.sessionEnd),
     engine.buildWindowMask(d.t, eff.tradeWindows));
+  eff.sessionMask = engine.combineMasks(eff.sessionMask, engine.buildExpiryMask(d, eff.excludeExpiry));
+  if (eff.ivMaxRank != null && eff.ivMaxRank < 1) {
+    eff.sessionMask = engine.combineMasks(eff.sessionMask, engine.ivRankMask(d, eff.ivMaxRank, 20, 75600).mask);
+  }
   const bt = engine.backtest(d, sig.pos, eff);
   return { cfg: r, data: d, sig, bt };
 }

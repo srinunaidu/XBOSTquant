@@ -48,6 +48,20 @@ async function runGridSearch(msg) {
       tfCache={tf, d, maskIn:E.buildSessionMask(d, tradeOpts.sessionStart, tradeOpts.sessionEnd),
         maskCarry:new Int8Array(d.c.length).fill(1), win:E.buildWindowMask(d.t, tradeOpts.tradeWindows),
         reg:E.regimeSeries(d, {}), ml:null};
+      // Structural masks: expiry-day exclusion + IV-rank cheap-vol filter.
+      // ANDed into the intraday mask once per TF (carry legs bypass all).
+      let mi=tfCache.maskIn;
+      mi=E.combineMasks(mi, E.buildExpiryMask(d, tradeOpts.excludeExpiry));
+      if(tradeOpts.ivMaxRank!=null&&tradeOpts.ivMaxRank<1){
+        const ivm=E.ivRankMask(d, tradeOpts.ivMaxRank, 20, 75600);
+        if(ivm.insufficient) routeNotices.push(tf+'m: IV-rank insufficient history — filter inactive (needs a longer file)');
+        else{
+          let blocked=0; for(let i=0;i<ivm.mask.length;i++) if(!ivm.mask[i]) blocked++;
+          routeNotices.push(tf+'m: IV-rank filter ≤'+tradeOpts.ivMaxRank+' blocks '+(100*blocked/ivm.mask.length).toFixed(1)+'% of bars');
+        }
+        mi=E.combineMasks(mi, ivm.mask);
+      }
+      tfCache.maskIn=mi;
     }
     return tfCache;
   }

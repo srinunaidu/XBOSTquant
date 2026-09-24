@@ -2,7 +2,7 @@ import { useState } from 'react';
 import Header from '../components/Header';
 import { useStore } from '../lib/store';
 import { useNavigate } from '../lib/router';
-import { loadFile } from '../lib/data';
+import { loadFile, dataHealth } from '../lib/data';
 import { BUILD_INFO } from '../lib/buildinfo';
 
 // A dataset belongs to the Options Lab if its contract key or source label
@@ -88,6 +88,7 @@ export default function Home() {
           {loadPct !== null && <div className="prog mt-2"><div style={{ width: `${loadPct}%` }} /></div>}
           {alert && <div className="alert-err mt-2" role="alert"><span>⚠</span><span>{alert}</span></div>}
           <DatasetChips />
+          <DataHealth />
         </section>
 
         {/* tiles */}
@@ -137,6 +138,23 @@ export default function Home() {
           <div className="mt-1">XBOST terminal · real 1-min OHLCV → grid search · For research, not investment advice.</div>
         </footer>
       </main>
+    </div>
+  );
+}
+
+function DataHealth() {
+  const datasets = useStore(s => s.datasets);
+  const names = Object.keys(datasets);
+  if (!names.length) return null;
+  const h = dataHealth();
+  return (
+    <div className="flex flex-wrap gap-1.5 mt-2">
+      {h.verdicts.map((v, i) => (
+        <span key={i} title={v.detail}
+          className={`text-[10px] num px-2 py-0.5 rounded-full border ${v.ok ? 'text-emerald-300 border-emerald-800 bg-emerald-950/40' : 'text-red-300 border-red-900 bg-red-950/30'}`}>
+          {v.ok ? '●' : '○'} {v.label} · {v.detail}
+        </span>
+      ))}
     </div>
   );
 }

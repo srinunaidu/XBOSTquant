@@ -6,6 +6,7 @@ export type OHLCV = {
   t: Float64Array; o: Float64Array; h: Float64Array;
   l: Float64Array; c: Float64Array; v: Float64Array;
   symbol?: string | null; layout?: string;
+  contract?: { strike: number | null; otype: string; expiry: string; expiryMs: number } | null;
 };
 
 export type Metrics = {
@@ -60,8 +61,15 @@ export interface Engine {
   itrend(close: Float64Array, alpha?: number): { trend: Float64Array; trig: Float64Array };
   adaptivePeriod(base: number, cycle: number | null, min?: number, max?: number): number;
   rankResults(rows: BoardRow[], objective: string): BoardRow[];
-  paperEligible(row: BoardRow, o?: { scoreThreshold?: number; requireWF?: boolean; minTrades?: number; cost?: number }): { eligible: boolean; reasons: string[] };
+  paperEligible(row: BoardRow, o?: { scoreThreshold?: number; requireWF?: boolean; minTrades?: number; cost?: number; allowZeroCost?: boolean }): { eligible: boolean; reasons: string[]; warnings?: string[] };
   demoteKnifeEdge(ranked: BoardRow[], pssOf: (r: BoardRow) => number | null): BoardRow[];
+  parseExpiryFlex(s: any): number;
+  detectExchange(symbol: string): string;
+  resolveSession(exchange: string, startStr?: string | null, endStr?: string | null): { exchange: string; start: string; end: string; preset: boolean };
+  EXCHANGE_SESSIONS: Record<string, { start: string; end: string }>;
+  ivRankSeries(c: Float64Array, rvLen?: number, histBars?: number): { ivRank: Float64Array; insufficient: boolean };
+  ivRankMask(d: OHLCV, maxRank?: number | null, rvLen?: number, histBars?: number): { mask: Int8Array; insufficient: boolean };
+  buildExpiryMask(d: OHLCV, excludeExpiry?: boolean): Int8Array;
   objectiveValue(m: Metrics, objective: string): number;
   paramNeighbors(row: any, steps: any, riskSteps: any): any[];
   cfgKey(c: any): string;

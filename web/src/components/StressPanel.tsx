@@ -1,8 +1,15 @@
 import { useMemo, useState } from 'react';
 import { useStore } from '../lib/store';
 import { fmtMoney } from '../lib/format';
-import { heatmap, monteCarloDD, streakStats, excursionStats } from '../lib/stress';
+import { heatmap, HEAT_BUCKETS_MCX, monteCarloDD, streakStats, excursionStats } from '../lib/stress';
+import engine from '../lib/engine';
 import { logLine } from '../lib/runner';
+
+// Exchange-aware heat buckets: MCX sessions differ from NSE.
+export function bucketsFor(symbol: string | undefined, exchange: string | undefined) {
+  const ex = exchange && exchange !== 'auto' ? exchange : engine.detectExchange(symbol || '');
+  return ex === 'MCX' ? HEAT_BUCKETS_MCX : undefined;
+}
 
 // Post-run stress lab for the SELECTED strategy: Monte-Carlo drawdown
 // distribution, session heatmap, loss-streak/ruin odds, MAE/MFE, regime splits.
@@ -15,9 +22,10 @@ export default function StressPanel() {
   const out = useMemo(() => {
     if (!detail || !ran) return null;
     const { bt } = detail;
+    const bk = bucketsFor(detail.cfg.symbol, useStore.getState().exchange);
     const mc = monteCarloDD(bt.trades, capital, mcN, 42);
     const st = streakStats(bt.trades);
-    const heat = heatmap(bt.trades);
+    const heat = heatmap(bt.trades, bk);
     const bestTime = heat.slice().sort((a,b) => b.pnl - a.pnl).find(h => h.n >= 5) || heat.slice().sort((a,b) => b.pnl - a.pnl)[0] || null;
     const exc = excursionStats(bt.trades);
     return { mc, st, heat, bestTime, exc };
@@ -41,7 +49,7 @@ export default function StressPanel() {
       const { bt } = d;
       const mc0 = monteCarloDD(bt.trades, s.capital, mcN, 42);
       const st0 = streakStats(bt.trades);
-      const heat0 = heatmap(bt.trades);
+      const heat0 = heatmap(bt.trades, bucketsFor(d.cfg.symbol, s.exchange));
       const bestH = heat0.slice().sort((a,b) => b.pnl - a.pnl).find(h => h.n >= 5) || heat0.slice().sort((a,b) => b.pnl - a.pnl)[0] || null;
       const exc0 = excursionStats(bt.trades);
       logLine(`stress [${d.cfg.symbol || ''} ${d.cfg.timeframe}m ${d.cfg.indicator}]: MC${mcN} p5-DD=${mc0 ? mc0.p5.toFixed(1) : '—'}% median=${mc0 ? mc0.p50.toFixed(1) : '—'}% worst=${mc0 ? mc0.worst.toFixed(1) : '—'}%`);

@@ -386,3 +386,85 @@ test('demoteKnifeEdge: stable, unknowns keep position', () => {
   const out = E.demoteKnifeEdge(rows, pss);
   assert.deepEqual(out.map(r => r.id), ['c1', 'u1', 'c2', 'k1', 'k2']);
 });
+
+test('contract meta: strike/otype/expiry plumbed per contract', () => {
+  const fs = require('fs');
+  const groups = E.parseCSVAll(fs.readFileSync('./public/nifty_options.csv', 'utf8'));
+  assert.ok(groups.length >= 40, 'contracts=' + groups.length);
+  const c0 = groups[0].d.contract;
+  assert.ok(c0 && isFinite(c0.strike) && (c0.otype === 'CE' || c0.otype === 'PE'), JSON.stringify(c0));
+  assert.ok(isFinite(c0.expiryMs), 'expiry parsed');
+  assert.equal(E.parseExpiryFlex('29SEP2026'), c0.expiryMs);
+  assert.ok(isNaN(E.parseExpiryFlex('garbage')));
+});
+
+test('exchange sessions: detect + resolve, MCX hours cover crude', () => {
+  assert.equal(E.detectExchange('CRUDEOIL25JULFUT'), 'MCX');
+  assert.equal(E.detectExchange('GOLDM'), 'MCX');
+  assert.equal(E.detectExchange('NIFTY29SEP2623500PE'), 'NSE');
+  assert.equal(E.detectExchange('HDFCBANK'), 'NSE');
+  assert.deepEqual([E.resolveSession('MCX').start, E.resolveSession('MCX').end], ['09:00', '23:30']);
+  assert.deepEqual([E.resolveSession('NSE').start, E.resolveSession('NSE').end], ['09:15', '15:30']);
+  const custom = E.resolveSession('MCX', '10:00', '20:00');
+  assert.equal(custom.preset, false, 'explicit times win over preset');
+  assert.equal(custom.start, '10:00');
+});
+
+test('expiry mask: all-pass without meta, excludes expiry day', () => {
+  const fs = require('fs');
+  const groups = E.parseCSVAll(fs.readFileSync('./public/nifty_options.csv', 'utf8'));
+  const d = E.resample(groups[0].d, 5);
+  const off = E.buildExpiryMask(d, false);
+  assert.ok([...off].every(v => v === 1), 'flag off = all-pass');
+  const on = E.buildExpiryMask(d, true);
+  // sample ends 09-18, expiry 09-29 → nothing excluded (would bite on expiry-week data)
+  assert.ok([...on].every(v => v === 1));
+  // synthetic: expiry day inside the data
+  const d2 = { t: Float64Array.from(d.t), o: d.o, h: d.h, l: d.l, c: d.c, v: d.v, contract: { strike: 1, otype: 'CE', expiry: '', expiryMs: d.t[100] } };
+  const m2 = E.buildExpiryMask(d2, true);
+  assert.equal(m2[100], 0, 'expiry-day bar excluded');
+  assert.equal(m2[0], 1);
+});
+
+test('ivRank: insufficient on short files, mask all-pass when disabled', () => {
+  const short = new Float64Array(100).map((_, i) => 100 + Math.sin(i));
+  const r = E.ivRankSeries(short, 20, 75600);
+  assert.equal(r.insufficient, true);
+  const n = 2000, c = new Float64Array(n);
+  let s = 0;
+  for (let i = 0; i < n; i++) { s += (i % 7 - 3) * 0.02; c[i] = 100 + s; }
+  const d = { t: Float64Array.from(c.map((_, i) => i)), o: c, h: c, l: c, c, v: new Float64Array(n).fill(10) };
+  const mOff = E.ivRankMask(d, null, 20, 75600);
+  assert.ok([...mOff.mask].every(v => v === 1), 'null rank = all-pass');
+  const mOn = E.ivRankMask(d, 0.5, 20, 75600);
+  assert.equal(mOn.insufficient, false);
+  const blocked = [...mOn.mask].filter(v => !v).length;
+  assert.ok(blocked > 0 && blocked < n, `blocks some bars: ${blocked}/${n}`);
+});
+
+test('premiumFloor: gates dust entries, zero disables', () => {
+  const fs = require('fs');
+  const groups = E.parseCSVAll(fs.readFileSync('./public/nifty_options.csv', 'utf8'));
+  const d = E.resample(groups[0].d, 5);
+  const mask = new Int8Array(d.c.length).fill(1);
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 21 } });
+  const base = { direction: 'Long', capital: 100000, cost: 2, slPct: 0, tpPct: 0, carry: true, sessionMask: mask, fill: 'close', qty: 1, lotSize: 75 };
+  const n0 = E.backtest(d, sig.pos, base).metrics.totalTrades;
+  const n50 = E.backtest(d, sig.pos, Object.assign({}, base, { premiumFloor: 50 })).metrics.totalTrades;
+  const nHuge = E.backtest(d, sig.pos, Object.assign({}, base, { premiumFloor: 100000 })).metrics.totalTrades;
+  assert.ok(n0 > 0, 'baseline trades');
+  assert.ok(n50 <= n0 && nHuge === 0, `floor gates: ${n0}/${n50}/${nHuge}`);
+});
+
+test('paperEligible: signal-only downgrades cost to warning', () => {
+  const row = {
+    m: { netPnL: 5000, totalTrades: 300 }, robustScore: 9.6,
+    robustness: { surrogate: { p: 0.005 }, paramSensitivity: { knifeEdge: false, pss: 0.2 } },
+    survived: true,
+  };
+  const strict = E.paperEligible(row, { cost: 0 });
+  assert.equal(strict.eligible, false, 'zero cost blocks by default');
+  const sig = E.paperEligible(row, { cost: 0, allowZeroCost: true });
+  assert.equal(sig.eligible, true, JSON.stringify(sig.reasons));
+  assert.ok((sig.warnings || []).length > 0, 'warning recorded');
+});
