@@ -3,6 +3,7 @@ import Header from '../components/Header';
 import { useStore } from '../lib/store';
 import { useNavigate } from '../lib/router';
 import { loadFile } from '../lib/data';
+import { BUILD_INFO } from '../lib/buildinfo';
 
 // A dataset belongs to the Options Lab if its contract key or source label
 // looks like an option contract (…CE / …PE suffix, OPTION token, or an
@@ -126,7 +127,14 @@ export default function Home() {
         </div>
 
         <footer className="text-center text-[11px] text-zinc-600 pb-6">
-          XBOST terminal · real 1-min OHLCV → grid search · For research, not investment advice.
+          <div className="num">
+            v{BUILD_INFO.version} · commit {BUILD_INFO.commit} · updated{' '}
+            {new Date(BUILD_INFO.builtAt).toLocaleString('en-IN', {
+              timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric',
+              hour: '2-digit', minute: '2-digit', hour12: false,
+            })} IST
+          </div>
+          <div className="mt-1">XBOST terminal · real 1-min OHLCV → grid search · For research, not investment advice.</div>
         </footer>
       </main>
     </div>
