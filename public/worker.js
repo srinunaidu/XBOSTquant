@@ -224,7 +224,13 @@ async function runGridSearch(msg) {
         const cand = ranked[i];
         const d0 = getTF(cand.timeframe).d;
         try {
-          const r = await Rb.robustnessFor(d0, cand, Object.assign({}, tradeOpts), null, totalCombos, i + 1);
+          // Same execution the board ranked: candidate SL/TP/exit/carry are
+          // applied inside robustnessFor via effOptsFor; the regime tradeMask
+          // must travel in baseOpts (it is data-derived, not serializable).
+          const rbo = Object.assign({}, tradeOpts);
+          const tm = tradeMaskFor(cand);
+          if (tm) rbo.tradeMask = tm;
+          const r = await Rb.robustnessFor(d0, cand, rbo, null, totalCombos, i + 1);
           cand.robustness = r;
           cand.robustScore = r.final.adjusted;
           // cap at 6.8 until full suite is logged (§26 gate)

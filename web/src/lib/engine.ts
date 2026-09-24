@@ -28,7 +28,7 @@ export type BoardRow = {
   exit: string; carry: boolean; refined?: boolean; m: Metrics; err?: string;
   symbol: string;
   oosNet?: number; oosWR?: number; oosN?: number; survived?: boolean | null;
-  oosFolds?: { net: number; wr: number; n: number; skipped: boolean }[];
+  oosFolds?: { net: number; wr: number; n: number; sharpe?: number; skipped: boolean }[];
   robustScore?: number; robustness?: any;
   oosSharpe?: number | null; oosDegr?: number | null;
 };

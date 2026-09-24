@@ -46,13 +46,36 @@ function extendMetrics(trades){
   };
 }
 let _cache=new Map();
+function maskKey(m){
+  if(!m) return 'null';
+  let s=0; const step=Math.max(1,Math.floor(m.length/512));
+  for(let i=0;i<m.length;i+=step) s=(s+m[i]*(i+1))|0;
+  return m.length+':'+s;
+}
 function cachedBacktest(d, indicator, params, opts){
-  const k=[indicator, JSON.stringify(params), JSON.stringify([opts.slPct,opts.tpPct,opts.exit,opts.carry,opts.direction,opts.fill,opts.entry])].join('|');
+  const k=[indicator, JSON.stringify(params), JSON.stringify([opts.slPct,opts.tpPct,opts.trailPct,opts.exit,opts.carry,opts.direction,opts.fill,opts.entry]), maskKey(opts.sessionMask), maskKey(opts.tradeMask)].join('|');
   if(_cache.has(k)) return _cache.get(k);
   const bt=E().backtest(d, E().buildSignals(d,{indicator,params}).pos, opts);
   _cache.set(k,bt); return bt;
 }
 function clearCache(){ _cache=new Map(); }
+// Effective execution for a candidate: the EXACT config the board ranked
+// (candidate SL/TP/trail/exit/carry + CK bridge + rebuilt session mask),
+// never the fallback defaults. Every evidence function must evaluate through
+// this, or board vs robustness numbers diverge (phantom-metric class bug).
+function effOptsFor(candidate, baseOpts, d){
+  const eff=Object.assign({}, baseOpts);
+  if(candidate.slPct!=null) eff.slPct=candidate.slPct;
+  if(candidate.tpPct!=null) eff.tpPct=candidate.tpPct;
+  if(candidate.trailPct!=null) eff.trailPct=candidate.trailPct;
+  eff.exit=candidate.exit||'fixed'; eff.carry=!!candidate.carry;
+  try {
+    const E2=E();
+    if(E2.exitOptsFromParams){ const xo=E2.exitOptsFromParams(candidate.indicator, candidate.params||{}); if(xo){ eff.ckPeriod=xo.ckPeriod; eff.ckMult=xo.ckMult; } }
+    if(E2.sessionMaskFor && d) eff.sessionMask=E2.sessionMaskFor(d, eff);
+  } catch(e){ /* keep base masks on helper failure */ }
+  return eff;
+}
 function paramNeighborValues(key,val,step){
   const vals=new Set(); for(const d of [-3,-2,-1,0,1,2,3]){ let v=+(val+d*step).toFixed(4); if(!isFinite(v)||v<=0) continue;
     if(['period','fast','slow','signal','k','d','emaPeriod','atrPeriod','adxPeriod','maPeriod','lookback','rsiPeriod','streakPeriod','rankPeriod','erPeriod','bbPeriod','kcPeriod','chopPeriod'].includes(key)) if(!Number.isInteger(v)||v<2) continue;
@@ -262,28 +285,29 @@ function leakageAudit(d){
 }
 async function robustnessFor(d, candidate, baseOpts, datasets, totalCombos, rank){
   clearCache();
-  const baselineBt=E().backtest(d,E().buildSignals(d,{indicator:candidate.indicator,params:candidate.params}).pos,baseOpts);
+  const eff=effOptsFor(candidate, baseOpts, d);
+  const baselineBt=E().backtest(d,E().buildSignals(d,{indicator:candidate.indicator,params:candidate.params}).pos,eff);
   const baseline=Object.assign({},baselineBt.metrics,extendMetrics(baselineBt.trades));
   const trades=baselineBt.trades;
   const conc=concentrationMetrics(trades), worst=worstTradeRemoval(trades), distr=distributionQuality(trades), clustering=clusteringMetrics(trades);
-  const param=paramStability(d,candidate.indicator,candidate.params,baseOpts);
-  const exit=exitIndependence(d,candidate.indicator,candidate.params,baseOpts);
-  const purity=signalPurity(d,candidate.indicator,candidate.params,baseOpts);
-  const direction=directionRobustness(d,candidate.indicator,candidate.params,baseOpts);
-  const time=timeRobustness(d,candidate.indicator,candidate.params,baseOpts);
-  const regime=regimeRobustness(d,candidate.indicator,candidate.params,baseOpts);
-  const entry=entryPerturbation(d,candidate.indicator,candidate.params,baseOpts);
-  const input=inputPerturbation(d,candidate.indicator,candidate.params,baseOpts);
-  const jitter=jitterResilience(d,candidate.indicator,candidate.params,baseOpts);
-  const order=tradeOrderRobustness(trades,baseOpts.capital||100000);
-  const removalRegime=regimeRemoval(d,candidate.indicator,candidate.params,baseOpts);
-  let cross=null; if(datasets&&datasets.length>1){ const other=datasets.find(x=>x.d!==d); if(other) cross=crossMarketTransfer(d,other.d,candidate.indicator,candidate.params,baseOpts,candidate.symbol||'A',other.symbol||'B'); }
+  const param=paramStability(d,candidate.indicator,candidate.params,eff);
+  const exit=exitIndependence(d,candidate.indicator,candidate.params,eff);
+  const purity=signalPurity(d,candidate.indicator,candidate.params,eff);
+  const direction=directionRobustness(d,candidate.indicator,candidate.params,eff);
+  const time=timeRobustness(d,candidate.indicator,candidate.params,eff);
+  const regime=regimeRobustness(d,candidate.indicator,candidate.params,eff);
+  const entry=entryPerturbation(d,candidate.indicator,candidate.params,eff);
+  const input=inputPerturbation(d,candidate.indicator,candidate.params,eff);
+  const jitter=jitterResilience(d,candidate.indicator,candidate.params,eff);
+  const order=tradeOrderRobustness(trades,eff.capital||100000);
+  const removalRegime=regimeRemoval(d,candidate.indicator,candidate.params,eff);
+  let cross=null; if(datasets&&datasets.length>1){ const other=datasets.find(x=>x.d!==d); if(other) cross=crossMarketTransfer(d,other.d,candidate.indicator,candidate.params,eff,candidate.symbol||'A',other.symbol||'B'); }
   const walkForward={survived: rank&&rank<=25?1:0};
   const bootstrap=bootstrapCI(trades, 1000);
   const deflated=deflatedSharpe(baseline.sharpe, trades.length, totalCombos);
   const leakage=leakageAudit(d);
   const sampleGate=sampleSizeGate(trades.length);
-  const sens=paramSensitivity(d,candidate.indicator,candidate.params,baseOpts);
+  const sens=paramSensitivity(d,candidate.indicator,candidate.params,eff);
   const blockboot=blockBootstrapCI(trades, 20, 500, (rank||1)*7919+13);
   const surr=surrogateTest(trades, 100, (rank||1)*104729+7);
   const nParams=freeParamCount(candidate);
@@ -438,7 +462,7 @@ function freeParamCount(candidate){
   if(candidate&&candidate.trailPct)c+=1;
   return c;
 }
-const api={extendMetrics,paramStability,exitIndependence,signalPurity,directionRobustness,regimeRobustness,timeRobustness,entryPerturbation,inputPerturbation,jitterResilience,tradeOrderRobustness,concentrationMetrics,worstTradeRemoval,regimeRemoval,crossMarketTransfer,clusteringMetrics,distributionQuality,bootstrapCI,blockBootstrapCI,surrogateTest,paramSensitivity,freeParamCount,deflatedSharpe,multipleTestingPenalty,sampleSizeGate,leakageAudit,robustnessFor,clearCache,WEIGHTS,classify,subScores,finalScore};
+const api={extendMetrics,paramStability,exitIndependence,signalPurity,directionRobustness,regimeRobustness,timeRobustness,entryPerturbation,inputPerturbation,jitterResilience,tradeOrderRobustness,concentrationMetrics,worstTradeRemoval,regimeRemoval,crossMarketTransfer,clusteringMetrics,distributionQuality,bootstrapCI,blockBootstrapCI,surrogateTest,paramSensitivity,freeParamCount,effOptsFor,deflatedSharpe,multipleTestingPenalty,sampleSizeGate,leakageAudit,robustnessFor,clearCache,WEIGHTS,classify,subScores,finalScore};
 if(typeof module!=='undefined'&&module.exports) module.exports=api;
 root.XBOST_ROBUST=api;
 })(typeof self!=='undefined'?self:this);

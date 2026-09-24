@@ -26,7 +26,8 @@ export function formatCandidateHeader(r: BoardRow, totalCombos: number, rank: nu
   lines.push(`exit_model=${r.exit || 'fixed'}`);
   lines.push(`SL=${r.slPct}%`);
   lines.push(`TP=${r.tpPct}%`);
-  lines.push(`trade_count=${r.m?.totalTrades ?? 0}`);
+    lines.push(`trade_count=${r.m?.totalTrades ?? 0}`);
+    lines.push(`sample_tier=${sampleTier(r.m?.totalTrades ?? 0)}`);
   lines.push(`WR=${(r.m?.winRate ?? 0).toFixed(2)}%`);
   lines.push(`expectancy=${(r.m?.expectancy ?? 0).toFixed(4)}`);
   lines.push(`PF=${(r.m?.profitFactor ?? 0).toFixed(2)}`);
@@ -44,21 +45,36 @@ export function formatCandidateHeader(r: BoardRow, totalCombos: number, rank: nu
   return lines.join('\n');
 }
 
+export function sampleTier(n: number): string {
+  if (n < 30) return 'INSUFFICIENT';
+  if (n < 100) return 'LOW_SAMPLE';
+  if (n < 200) return 'STANDARD';
+  return 'PAPER_READY';
+}
+
 export function formatCoreSignal(r: any) {
-  const m = r.m || r.baseline || {};
+  // SINGLE SOURCE: every headline number comes from the board metrics (r.m).
+  // wins/losses are derived from WR x n (rounded) so they can never disagree
+  // with the traded count. Robustness-baseline detail (MAE/MFE, payoff, DD
+  // attribution) is appended separately and labelled as such — it now runs
+  // the identical candidate config, so the two agree by construction.
+  const m = r.m || {};
+  const n = m.totalTrades ?? 0;
+  const wins = Math.round((m.winRate ?? 0) * n / 100);
   const ext = r.robustness?.baseline || {};
   return [
     'CORE SIGNAL QUALITY',
-    `trades=${m.totalTrades ?? 0}`,
-    `wins=${r.robustness?.baseline?.wins?.length ?? 'NA'}`,
-    `losses=${r.robustness?.baseline?.losses?.length ?? 'NA'}`,
+    `trades=${n}`,
+    `wins=${wins}`,
+    `losses=${n - wins}`,
     `WR=${(m.winRate ?? 0).toFixed(2)}%`,
+    `sample_tier=${sampleTier(n)}`,
     `avg_winner=${(ext.avgWinner ?? 0).toFixed(2)}`,
     `median_winner=${(ext.medianWinner ?? 0).toFixed(2)}`,
     `avg_loser=${(ext.avgLoser ?? 0).toFixed(2)}`,
     `median_loser=${(ext.medianLoser ?? 0).toFixed(2)}`,
-    `expectancy=${(ext.expectancy ?? m.expectancy ?? 0).toFixed(4)}`,
-    `profit_factor=${(ext.profitFactor ?? m.profitFactor ?? 0).toFixed(2)}`,
+    `expectancy=${(m.expectancy ?? 0).toFixed(4)}`,
+    `profit_factor=${(m.profitFactor ?? 0).toFixed(2)}`,
     `payoff_ratio=${(ext.payoffRatio ?? 0).toFixed(2)}`,
     `Sharpe=${(m.sharpe ?? 0).toFixed(2)}`,
     `Sortino=${(m.sortino ?? 0).toFixed(2)}`,

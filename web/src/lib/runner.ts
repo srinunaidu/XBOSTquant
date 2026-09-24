@@ -419,7 +419,7 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
       const sig = engine.buildSignals(tfc.d, { indicator: r.indicator, params: r.params });
       const bt = engine.backtest(tfc.d, sig.pos, eff);
       const n = bt.metrics.totalTrades;
-      return { net: bt.metrics.netPnL, wr: bt.metrics.winRate, n, skipped: n < 5 };
+      return { net: bt.metrics.netPnL, wr: bt.metrics.winRate, n, sharpe: bt.metrics.sharpe, skipped: n < 5 };
     };
     for (const r of bySym[sym]) {
       if (useStore.getState().runSeq !== mySeq) return 'aborted';
@@ -438,11 +438,13 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
     }
     const symRows = bySym[sym];
     const symSurv = symRows.filter(r => r.survived).length;
-    const foldNets = symRows.flatMap(r => (r.oosFolds || []).filter(f => !f.skipped).map(f => f.net));
-    const foldWin = foldNets.length ? foldNets.filter(x => x > 0).length : 0;
-    logLine(`  WF [${sym}]: ${symSurv}/${symRows.length} survived OOS (${N_FOLDS} folds: ${foldWin}/${foldNets.length} fold-wins)`);
+    const liveFolds = symRows.flatMap(r => (r.oosFolds || []).filter(f => !f.skipped));
+    const foldWin = liveFolds.filter(x => x.net > 0).length;
+    const thinFolds = symRows.flatMap(r => (r.oosFolds || []).filter(f => f.skipped)).length;
+    const foldShr = liveFolds.length ? ` mean_fold_sharpe=${(liveFolds.reduce((a, f) => a + (f.sharpe || 0), 0) / liveFolds.length).toFixed(2)}` : '';
+    logLine(`  WF [${sym}]: ${symSurv}/${symRows.length} rows survived OOS (${N_FOLDS} folds/row: ${foldWin}/${liveFolds.length} fold-wins${thinFolds ? `, ${thinFolds} thin-skipped(<5 trades)` : ''}${foldShr})`);
   }
-  return `WF ${st.wfSplit}/${100 - st.wfSplit}: ${surv}/${total} survived OOS`;
+  return `WF ${st.wfSplit}/${100 - st.wfSplit}: ${surv}/${total} rows survived OOS`;
 }
 
 export async function runGrid() {

@@ -67,3 +67,32 @@ test('paramSensitivity: thin samples skip (curvature meaningless), Sharpe winsor
   assert.equal(s.skipped, true, 'thin EMA run must skip, got pss=' + s.pss);
   assert.equal(s.knifeEdge, false, 'skip never reports knife-edge');
 });
+
+test('effOptsFor mirrors board execution; baseline reproduces board metrics', () => {
+  const fs = require('fs');
+  const groups = E.parseCSVAll(fs.readFileSync('./public/nifty_options.csv', 'utf8'));
+  const d = E.resample(groups[0].d, 5);
+  const mask = new Int8Array(d.c.length).fill(1);
+  const baseOpts = {
+    direction: 'Both', capital: 100000, cost: 60, slPct: 0.8, tpPct: 1.6,
+    carry: false, sessionMask: mask, fill: 'next', entry: 'trigger', qty: 1, lotSize: 75,
+  };
+  // Board-style evaluation with an optimized (non-default) config
+  const cand = { indicator: 'Bollinger', params: { period: 20, mult: 2 }, slPct: 2.5, tpPct: 1, exit: 'breakeven', carry: true };
+  const sig = E.buildSignals(d, { indicator: cand.indicator, params: cand.params });
+  const boardBt = E.backtest(d, sig.pos, Object.assign({}, baseOpts, {
+    slPct: cand.slPct, tpPct: cand.tpPct, exit: cand.exit, carry: cand.carry,
+    sessionMask: E.sessionMaskFor(d, Object.assign({}, baseOpts, { carry: true })),
+  }));
+  // Robustness-style evaluation through effOptsFor must match exactly
+  R.clearCache();
+  const eff = R.effOptsFor(cand, baseOpts, d);
+  assert.equal(eff.slPct, 2.5, 'candidate SL applied');
+  assert.equal(eff.tpPct, 1, 'candidate TP applied');
+  assert.equal(eff.exit, 'breakeven', 'candidate exit applied');
+  assert.equal(eff.carry, true, 'candidate carry applied');
+  const rb = E.backtest(d, E.buildSignals(d, { indicator: cand.indicator, params: cand.params }).pos, eff);
+  for (const k of ['netPnL', 'winRate', 'totalTrades', 'profitFactor', 'sharpe', 'expectancy']) {
+    assert.ok(Math.abs(rb.metrics[k] - boardBt.metrics[k]) < 1e-9, `${k}: robust=${rb.metrics[k]} board=${boardBt.metrics[k]}`);
+  }
+});
