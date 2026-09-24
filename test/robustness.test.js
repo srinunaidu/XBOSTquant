@@ -59,3 +59,11 @@ test('freeParamCount: signal params + active risk knobs', () => {
   assert.equal(R.freeParamCount({ params: { period: 20 } }), 1);
   assert.equal(R.freeParamCount({ params: {} }), 0);
 });
+
+test('paramSensitivity: thin samples skip (curvature meaningless), Sharpe winsorized', () => {
+  const d = bars(120, i => { const p = 100 + i * 0.05; return [p, p + 0.2, p - 0.2, p, 500]; });
+  const opts = { direction: 'Both', sessionMask: ones(120), slPct: 0, tpPct: 0, capital: 100000, qty: 1, lotSize: 1, cost: 0 };
+  const s = R.paramSensitivity(d, 'EMA', { period: 21 }, opts);
+  assert.equal(s.skipped, true, 'thin EMA run must skip, got pss=' + s.pss);
+  assert.equal(s.knifeEdge, false, 'skip never reports knife-edge');
+});

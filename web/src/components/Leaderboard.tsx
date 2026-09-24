@@ -21,8 +21,11 @@ const darkTheme = themeQuartz.withParams({
   fontSize: 12,
 });
 
-function rowToObj(r: BoardRow, ix: number) {
+function rowToObj(r: BoardRow, ix: number, th: number, cost: number) {
   const m = r.m;
+  const gate = engine.paperEligible(r, { scoreThreshold: th, cost });
+  const pss = r.robustness?.paramSensitivity?.pss ?? null;
+  const surr = r.robustness?.surrogate?.p ?? null;
   return {
     ix: ix + 1, sym: r.symbol || '', tf: r.timeframe + 'm', ind: r.indicator + (r.refined ? ' 🔁' : ''),
     params: fmtParams(r.params),
@@ -33,6 +36,10 @@ function rowToObj(r: BoardRow, ix: number) {
     oos: r.oosNet == null ? null : r.oosNet,
     oosWR: r.oosWR == null ? null : r.oosWR,
     surv: r.survived == null ? '' : r.survived ? '✓' : '✗',
+    rscr: r.robustScore ?? null,
+    surr, pss,
+    paper: gate.eligible ? 'PAPER' : '—',
+    paperWhy: gate.eligible ? '' : gate.reasons.join('; '),
     _r: r,
   };
 }
@@ -68,6 +75,27 @@ const COLS = [
     field: 'surv', headerName: 'Surv', width: 60,
     cellStyle: (p: any) => ({ color: p.value === '✓' ? '#22ff88' : p.value === '✗' ? '#fb4d6d' : '#5b5b66' }),
   },
+  {
+    field: 'rscr', headerName: 'R-Scr', width: 76, type: 'rightAligned',
+    valueFormatter: (p: any) => (p.value == null ? '' : (+p.value).toFixed(1)),
+    cellStyle: (p: any) => (p.value == null ? {} : { color: p.value >= 9.5 ? '#22ff88' : p.value >= 6.5 ? '#fbbf24' : '#fb4d6d' }),
+  },
+  {
+    field: 'surr', headerName: 'Surr p', width: 78, type: 'rightAligned',
+    valueFormatter: (p: any) => (p.value == null ? '' : (+p.value).toFixed(3)),
+    cellStyle: (p: any) => (p.value == null ? {} : { color: p.value < 0.01 ? '#22ff88' : '#fb4d6d' }),
+  },
+  {
+    field: 'pss', headerName: 'PSS', width: 84, type: 'rightAligned',
+    valueFormatter: (p: any) => (p.value == null ? '' : (+p.value).toFixed(2)),
+    cellStyle: (p: any) => (p.value == null ? {} : { color: p.value >= 0.5 ? '#fb4d6d' : '#22ff88' }),
+  },
+  {
+    field: 'paper', headerName: 'Paper', width: 78,
+    cellStyle: (p: any) => (p.value === 'PAPER'
+      ? { color: '#04120a', background: '#22ff88', fontWeight: 800 }
+      : { color: '#5b5b66' }),
+  },
 ];
 
 export default function Leaderboard() {
@@ -77,6 +105,8 @@ export default function Leaderboard() {
   const boardFilter = useStore(s => s.boardFilter);
   const objective = useStore(s => s.objective);
   const sel = useStore(s => s.sel);
+  const paperThreshold = useStore(s => s.paperThreshold);
+  const costNow = useStore(s => s.cost);
 
   const rows = useMemo(() => {
     const q = boardFilter.toLowerCase();
@@ -89,9 +119,9 @@ export default function Leaderboard() {
       const champ = new Set(out);
       list = list.filter(r => champ.has(r)).sort((a, b) => out.indexOf(a) - out.indexOf(b));
     }
-    return list.map(rowToObj);
+    return list.map((r, i) => rowToObj(r, i, paperThreshold ?? 9.5, costNow));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [board, view, boardFilter, objective]);
+  }, [board, view, boardFilter, objective, paperThreshold, costNow]);
 
   return (
     <section className="card p-3">

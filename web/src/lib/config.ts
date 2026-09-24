@@ -66,6 +66,15 @@ export const DEFAULT_RANGES: Record<string, Record<string, [number, number, numb
 export const TFS = [1, 2, 3, 4, 5, 7, 10, 15];
 export const EXIT_LBL: Record<string, string> = { fixed: 'FIX', breakeven: 'BE', atr: 'ATR', ck: 'CK' };
 
+// Realistic per-trade cost/lot presets (brokerage + STT + charges, per lot).
+// Zero-cost runs can never pass the paper gate — pick a preset before running.
+export const COST_PRESETS: Record<string, { cost: number; lot: number; label: string }> = {
+  NIFTY_FUT: { cost: 20, lot: 75, label: 'Nifty futures · ₹20/lot' },
+  BANKNIFTY_FUT: { cost: 40, lot: 25, label: 'BankNifty futures · ₹40/lot' },
+  NIFTY_OPT: { cost: 60, lot: 75, label: 'Nifty options · ₹60/lot' },
+  BANKNIFTY_OPT: { cost: 60, lot: 25, label: 'BankNifty options · ₹60/lot' },
+};
+
 export type ExecOpts = {
   direction: string; sessionStart: string | null; sessionEnd: string | null;
   slPct: number; tpPct: number; trailPct: number; capital: number;

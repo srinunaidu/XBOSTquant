@@ -78,6 +78,8 @@ type State = {
   routerPersist: number;
   routerHyst: number;
   bayesRefine: boolean;
+  paperThreshold: number;
+  lastPaper: { eligible: boolean; reasons: string[] } | null;
   detail: Detail;
   view: 'all' | 'best' | 'cmp';
   boardFilter: string;
@@ -130,19 +132,21 @@ export const useStore = create<State>((set) => ({
   regimeSource: 'rules',
   granularity: 'day',
   confGate: 60,
-  wfOn: false,
+  wfOn: true,
   wfSplit: 70,
   tradeWindows: ['b1', 'b2', 'b3', 'b4'],
   detail: null,
   instrumentMode: null,
-  gridMode: 'cartesian',
-  haltonN: 256,
+  gridMode: 'halton',
+  haltonN: 512,
   purgeBars: 0,
   embargoBars: 0,
   routerV2: false,
   routerPersist: 5,
   routerHyst: 2,
   bayesRefine: true,
+  paperThreshold: 9.5,
+  lastPaper: null,
   view: 'all',
   boardFilter: '',
   run: { ...initialRun },
@@ -156,4 +160,11 @@ export const useStore = create<State>((set) => ({
 
 export function resetRun(): RunState {
   return { ...initialRun };
+}
+
+// Automation hook: exposes read/getState for headless verification and
+// agent-driven runs (Playwright). No new privilege — everything reachable
+// here is already reachable by clicking the UI; server APIs stay auth-gated.
+if (typeof window !== 'undefined') {
+  (window as any).__XBOST__ = { getState: useStore.getState, setState: useStore.setState };
 }

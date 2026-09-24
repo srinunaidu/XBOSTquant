@@ -105,7 +105,8 @@ export function runValidation() {
         eff8.exit = sel.exit || 'fixed'; eff8.carry = !!sel.carry;
         eff8.sessionMask = new Int8Array(d8.c.length).fill(1);
         const sens = Robust.paramSensitivity(d8, sel.indicator, sel.params, eff8);
-        ok('L8 PSS no knife-edge (pss<0.5)', !sens.knifeEdge, `pss=${sens.pss} base_sharpe=${sens.baseSharpe}`);
+        if (sens.skipped) { out.push(`SKIP L8-PSS (n=${sens.baseTrades}<30 — curvature meaningless on thin samples)`); skip++; }
+        else ok('L8 PSS no knife-edge (pss<0.5)', !sens.knifeEdge, `pss=${sens.pss} base_sharpe=${sens.baseSharpe}`);
         const bb = Robust.blockBootstrapCI(st.detail.bt.trades, 20, 500, 99);
         if (!bb.nSamples) { out.push('SKIP L8-blockboot (<10 trades on slice)'); skip++; }
         else ok('L8 block-bootstrap Sharpe lower>0', bb.sharpe[0] > 0, `CI=[${bb.sharpe}] n=${bb.nSamples}`);

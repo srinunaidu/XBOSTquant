@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import engine from '../lib/engine';
-import { DEFAULT_RANGES, EXIT_LBL, IND_META, TFS } from '../lib/config';
+import { DEFAULT_RANGES, EXIT_LBL, IND_META, TFS, COST_PRESETS } from '../lib/config';
 const TIERS_META: Record<string, string> = {};
 for (const m of IND_META) if (m.n && m.tier) TIERS_META[m.n] = m.tier;
 import { useStore } from '../lib/store';
@@ -242,6 +242,19 @@ function ExecSection() {
         <div><label className="lbl">Cost / trade ₹</label><input type="number" step="1" value={st.cost} className="w-full mt-1 num" onChange={e => set({ cost: +e.target.value || 0 })} /></div>
         <div><label className="lbl">Qty (× lot)</label><input type="number" value={st.qty} className="w-full mt-1 num" onChange={e => set({ qty: +e.target.value || 1 })} /></div>
         <div><label className="lbl">Lot size</label><input type="number" value={st.lot} className="w-full mt-1 num" onChange={e => set({ lot: +e.target.value || 1 })} /></div>
+      </div>
+      <div className="mt-1.5">
+        <div className="lbl mb-1">Cost preset (zero-cost runs can never pass the paper gate)</div>
+        <div className="grid grid-cols-2 gap-1">
+          {Object.entries(COST_PRESETS).map(([k, p]) => (
+            <button key={k} className="btn-ghost btn-xs" title={p.label}
+              onClick={() => set({ cost: p.cost, lot: p.lot })}>
+              {k.replace('_', ' ')} ₹{p.cost}×{p.lot}</button>
+          ))}
+        </div>
+        {!(st.cost > 0) && (
+          <div className="text-[11px] text-red-400 mt-1">⚠ cost = 0 — paper gate will BLOCK every row. Pick a preset.</div>
+        )}
       </div>
       <div className="mt-2 rounded-lg border border-amber-900 bg-amber-950/20 p-2">
         <div className="lbl mb-1.5">Exit logic — searched dimensions</div>

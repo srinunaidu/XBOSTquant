@@ -355,3 +355,34 @@ test('bayesianRefine: deterministic EI proposals, all fresh, snapped to step', (
   }
   assert.deepEqual(E.bayesianRefine(rows.slice(0, 3), {}, 8), [], 'needs ≥6 rows');
 });
+
+test('paperEligible: passes a clean champion, blocks the reviewed failure', () => {
+  const good = {
+    m: { netPnL: 5000, totalTrades: 300 }, robustScore: 9.6,
+    robustness: { surrogate: { p: 0.005 }, paramSensitivity: { knifeEdge: false, pss: 0.2 } },
+    survived: true,
+  };
+  const g = E.paperEligible(good, { cost: 20 });
+  assert.equal(g.eligible, true, JSON.stringify(g.reasons));
+  // The reviewed run: ITrend 5.76 / surr 0.78 / PSS 85968 / no OOS / zero cost
+  const bad = {
+    m: { netPnL: 1368, totalTrades: 317 }, robustScore: 5.76,
+    robustness: { surrogate: { p: 0.78 }, paramSensitivity: { knifeEdge: true, pss: 85968 } },
+    survived: null,
+  };
+  const b = E.paperEligible(bad, { cost: 0 });
+  assert.equal(b.eligible, false);
+  assert.ok(b.reasons.length >= 5, b.reasons.join(' | '));
+  assert.ok(b.reasons.some(r => r.includes('surrogate')), 'names surrogate');
+  assert.ok(b.reasons.some(r => r.includes('knife-edge')), 'names PSS');
+  // Missing evidence alone blocks (never silently passes)
+  const noEv = { m: { netPnL: 100, totalTrades: 500 }, survived: true };
+  assert.equal(E.paperEligible(noEv, { cost: 20 }).eligible, false);
+});
+
+test('demoteKnifeEdge: stable, unknowns keep position', () => {
+  const rows = [{ id: 'k1', m: {} }, { id: 'c1', m: {} }, { id: 'u1', m: {} }, { id: 'k2', m: {} }, { id: 'c2', m: {} }];
+  const pss = r => ({ k1: 0.9, c1: 0.1, u1: null, k2: 3.2, c2: 0.4 }[r.id]);
+  const out = E.demoteKnifeEdge(rows, pss);
+  assert.deepEqual(out.map(r => r.id), ['c1', 'u1', 'c2', 'k1', 'k2']);
+});

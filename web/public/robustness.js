@@ -313,20 +313,30 @@ function paramSensitivity(d, indicator, params, baseOpts, eps){
   // backtests — cheap). pss = mean curvature; knifeEdge = pss > 0.5.
   eps=eps||0.05;
   const keys=Object.keys(params||{}).filter(k=>typeof params[k]==='number'&&isFinite(params[k]));
-  const base=cachedBacktest(d,indicator,params,baseOpts).metrics.sharpe;
-  const per={}; let sum=0;
+  const baseBt=cachedBacktest(d,indicator,params,baseOpts);
+  const baseN=baseBt.metrics.totalTrades;
+  if(!keys.length) return {pss:0, knifeEdge:false, skipped:false, baseSharpe:+baseBt.metrics.sharpe.toFixed(3), baseTrades:baseN, perParam:{}, parameters_locked:true, reoptimized:false};
+  if(baseN<30) return {pss:null, knifeEdge:false, skipped:true, baseSharpe:+baseBt.metrics.sharpe.toFixed(3), baseTrades:baseN, perParam:{}, parameters_locked:true, reoptimized:false};
+  const clamp=v=>Math.max(-100,Math.min(100,v));
+  const base=clamp(baseBt.metrics.sharpe);
+  const per={}; let sum=0, counted=0;
   for(const k of keys){
     const b=params[k], h=Math.max(Math.abs(b)*eps, 1e-9);
     const up=Object.assign({},params), dn=Object.assign({},params);
     up[k]=b+h; dn[k]=b-h;
-    const sUp=cachedBacktest(d,indicator,up,baseOpts).metrics.sharpe;
-    const sDn=cachedBacktest(d,indicator,dn,baseOpts).metrics.sharpe;
+    const bUp=cachedBacktest(d,indicator,up,baseOpts), bDn=cachedBacktest(d,indicator,dn,baseOpts);
+    if(bUp.metrics.totalTrades<10||bDn.metrics.totalTrades<10){
+      per[k]={base:b, skipped:'thin-neighbor'}; continue;
+    }
+    const sUp=clamp(bUp.metrics.sharpe);
+    const sDn=clamp(bDn.metrics.sharpe);
     const curv=Math.abs(sUp-2*base+sDn)/(h*h);
     per[k]={base:b, up:sUp, down:sDn, curvature:+curv.toFixed(4)};
-    sum+=curv;
+    sum+=curv; counted++;
   }
-  const pss=keys.length?sum/keys.length:0;
-  return {pss:+pss.toFixed(4), knifeEdge:pss>0.5, baseSharpe:+base.toFixed(3), perParam:per, parameters_locked:true, reoptimized:false};
+  if(!counted) return {pss:null, knifeEdge:false, skipped:true, baseSharpe:+baseBt.metrics.sharpe.toFixed(3), baseTrades:baseN, perParam:per, parameters_locked:true, reoptimized:false};
+  const pss=sum/counted;
+  return {pss:+pss.toFixed(4), knifeEdge:pss>0.5, skipped:false, baseSharpe:+baseBt.metrics.sharpe.toFixed(3), baseTrades:baseN, perParam:per, parameters_locked:true, reoptimized:false};
 }
 function blockBootstrapCI(trades, block, iters, seed){
   // Block bootstrap over the trade-PnL series (preserves autocorrelation —
@@ -408,7 +418,7 @@ function surrogateTest(trades, nSurr, seed){
   nSurr=Math.max(20,Math.round(nSurr||100));
   const pnls=(trades||[]).map(t=>t.pnl);
   const n=pnls.length;
-  if(n<20) return {p:1, nSurr:0, observedSharpe:0, note:'insufficient trades'};
+  if(n<20) return {p:1, nSurr:0, observedSharpe:0, skipped:true, note:'insufficient trades'};
   const mu=mean(pnls), sdv=sd(pnls,mu)||1e-9;
   const obs=mu/sdv*Math.sqrt(252);
   const rnd=_rng(seed==null?777:seed);
@@ -418,7 +428,7 @@ function surrogateTest(trades, nSurr, seed){
     const m2=mean(surr), sd2=sd(surr,m2)||1e-9;
     if(m2/sd2*Math.sqrt(252)>=obs)beat++;
   }
-  return {p:+(beat/nSurr).toFixed(4), nSurr, observedSharpe:+obs.toFixed(3), parameters_locked:true, reoptimized:false};
+  return {p:+(beat/nSurr).toFixed(4), nSurr, observedSharpe:+obs.toFixed(3), skipped:false, parameters_locked:true, reoptimized:false};
 }
 function freeParamCount(candidate){
   // Total free parameters: numeric signal params + active risk/exit knobs.

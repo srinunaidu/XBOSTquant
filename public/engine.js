@@ -1845,6 +1845,48 @@ function buildGrid(selected, risk, dims){
   return combos;
 }
 
+// ---------- Paper-trading gate + knife-edge demotion ----------
+// paperEligible: the HARD gate. A row is paper-tradable only if every check
+// passes; otherwise reasons[] names each failure. Pure + unit-tested.
+// o: {scoreThreshold (def 9.5), requireWF (def true), minTrades (def 200),
+//     cost (run cost/trade — must be > 0: zero-cost runs can never pass)}.
+function paperEligible(row, o){
+  o=o||{};
+  const th=o.scoreThreshold==null?9.5:o.scoreThreshold;
+  const minN=o.minTrades==null?200:o.minTrades;
+  const reasons=[];
+  if(row==null||row.m==null) return {eligible:false, reasons:['no result row']};
+  if(!(row.m.netPnL>0)) reasons.push(`netPnL ${row.m.netPnL} ≤ 0`);
+  if(!(row.m.totalTrades>=minN)) reasons.push(`trades ${row.m.totalTrades} < ${minN}`);
+  if(o.cost!=null&&!(o.cost>0)) reasons.push('zero-cost run (set realistic cost/trade)');
+  if(row.robustScore==null) reasons.push('no robustness score (worker path required)');
+  else if(!(row.robustScore>=th)) reasons.push(`robustScore ${(row.robustScore||0).toFixed(2)} < ${th}`);
+  const rb=row.robustness||{};
+  if(rb.surrogate==null) reasons.push('no surrogate evidence');
+  else if(rb.surrogate.skipped) reasons.push(`surrogate skipped (n<20)`);
+  else if(!(rb.surrogate.p<0.01)) reasons.push(`surrogate p=${rb.surrogate.p} ≥ 0.01`);
+  if(rb.paramSensitivity==null) reasons.push('no PSS evidence');
+  else if(rb.paramSensitivity.skipped) reasons.push(`PSS skipped (n=${rb.paramSensitivity.baseTrades}<30)`);
+  else if(rb.paramSensitivity.knifeEdge) reasons.push(`knife-edge PSS=${rb.paramSensitivity.pss}`);
+  if(o.requireWF!==false){
+    if(row.survived==null) reasons.push('no OOS verdict (enable walk-forward)');
+    else if(!row.survived) reasons.push('OOS not survived');
+  }
+  return {eligible:reasons.length===0, reasons};
+}
+// demoteKnifeEdge: stable re-rank pushing knife-edge rows (pssOf(row) ≥ 0.5)
+// below every clean row. Rows with unknown PSS keep position (never punished
+// for missing evidence — the paper gate handles absence separately).
+function demoteKnifeEdge(ranked, pssOf){
+  const clean=[], edge=[];
+  for(const r of ranked){
+    let p=null;
+    try{ p=pssOf(r); }catch(e){ p=null; }
+    if(p!=null&&isFinite(p)&&p>=0.5)edge.push(r);else clean.push(r);
+  }
+  return clean.concat(edge);
+}
+
 function rankResults(rows, objective){
   // Do-nothing rows (0 trades: flat signals, warmup-only, unavailable legs)
   // always rank BELOW traded rows — otherwise a 0/0/0 row tops losing boards.
@@ -1859,7 +1901,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

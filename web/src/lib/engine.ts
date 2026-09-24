@@ -27,7 +27,9 @@ export type BoardRow = {
   slPct: number; tpPct: number; trailPct: number;
   exit: string; carry: boolean; refined?: boolean; m: Metrics; err?: string;
   symbol: string;
-  oosNet?: number; oosWR?: number; oosN?: number; survived?: boolean;
+  oosNet?: number; oosWR?: number; oosN?: number; survived?: boolean | null;
+  oosFolds?: { net: number; wr: number; n: number; skipped: boolean }[];
+  robustScore?: number; robustness?: any;
   oosSharpe?: number | null; oosDegr?: number | null;
 };
 
@@ -58,6 +60,8 @@ export interface Engine {
   itrend(close: Float64Array, alpha?: number): { trend: Float64Array; trig: Float64Array };
   adaptivePeriod(base: number, cycle: number | null, min?: number, max?: number): number;
   rankResults(rows: BoardRow[], objective: string): BoardRow[];
+  paperEligible(row: BoardRow, o?: { scoreThreshold?: number; requireWF?: boolean; minTrades?: number; cost?: number }): { eligible: boolean; reasons: string[] };
+  demoteKnifeEdge(ranked: BoardRow[], pssOf: (r: BoardRow) => number | null): BoardRow[];
   objectiveValue(m: Metrics, objective: string): number;
   paramNeighbors(row: any, steps: any, riskSteps: any): any[];
   cfgKey(c: any): string;

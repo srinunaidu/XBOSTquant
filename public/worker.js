@@ -236,9 +236,9 @@ self.onmessage = async function(e) {
         if (inp) robustnessLogs.push(`[INPUT PERTURBATION] tests=${inp.total} profitable=${inp.profitable} median_sharpe=${inp.medianSharpe.toFixed(2)} worst=${inp.worstSharpe.toFixed(2)}`);
         if (co) robustnessLogs.push(`[P&L CONCENTRATION] top1=${co.top1Pct.toFixed(1)}% top5=${co.top5Pct.toFixed(1)}% top10=${co.top10Pct.toFixed(1)}% largest=${co.largestWinnerPct.toFixed(1)}%`);
         if (wt) robustnessLogs.push(`[BEST TRADE REMOVAL] remove1_sharpe=${wt.remove1.sharpe.toFixed(2)} remove3=${wt.remove3.sharpe.toFixed(2)} remove5=${wt.remove5.sharpe.toFixed(2)} remove10=${wt.remove10.sharpe.toFixed(2)}`);
-        if (r.paramSensitivity) robustnessLogs.push(`[PARAM SENSITIVITY] pss=${r.paramSensitivity.pss} knife_edge=${r.paramSensitivity.knifeEdge ? 'YES' : 'no'} base_sharpe=${r.paramSensitivity.baseSharpe}`);
+        if (r.paramSensitivity) robustnessLogs.push(`[PARAM SENSITIVITY] ${r.paramSensitivity.skipped ? `SKIPPED (n=${r.paramSensitivity.baseTrades}<30)` : `pss=${r.paramSensitivity.pss} knife_edge=${r.paramSensitivity.knifeEdge ? 'YES' : 'no'} base_sharpe=${r.paramSensitivity.baseSharpe}`}`);
         if (r.blockBootstrap) robustnessLogs.push(`[BLOCK BOOTSTRAP] sharpe_CI=[${r.blockBootstrap.sharpe}] wr_CI=[${r.blockBootstrap.wr}] pf_CI=[${r.blockBootstrap.pf}] n=${r.blockBootstrap.nSamples}`);
-        if (r.surrogate) robustnessLogs.push(`[SURROGATE] p=${r.surrogate.p} observed_sharpe=${r.surrogate.observedSharpe} n=${r.surrogate.nSurr} (edge real iff p<0.01)`);
+        if (r.surrogate) robustnessLogs.push(`[SURROGATE] ${r.surrogate.skipped ? 'SKIPPED (<20 trades)' : `p=${r.surrogate.p} observed_sharpe=${r.surrogate.observedSharpe} n=${r.surrogate.nSurr}`} (edge real iff p<0.01)`);
         if (r.freeParams != null) robustnessLogs.push(`[PARAM COUNT] free_params=${r.freeParams} (cap 8)`);
         robustnessLogs.push(`[MULTIPLE TESTING] total_combinations=${totalCombos} candidate_rank=1 percentile=${(100*(1-1/totalCombos)).toFixed(2)} penalty=${r.final.penalty.toFixed(2)}`);
         robustnessLogs.push(`[FINAL] raw=${r.final.raw.toFixed(2)} adjusted=${r.final.adjusted.toFixed(2)} cap=${r.final.cap} classification=${r.classification} robustScore=${(top.robustScore||0).toFixed(2)}/10`);
