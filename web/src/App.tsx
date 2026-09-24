@@ -6,6 +6,7 @@ import Sidebar from './components/Sidebar';
 import MainView from './components/MainView';
 import Login from './pages/Login';
 import Users from './pages/Users';
+import Home from './pages/Home';
 
 function route() {
   return location.hash.replace(/^#\/?/, '');
@@ -36,11 +37,20 @@ export default function App() {
     return <Users />;
   }
 
+  const isTerminal = r === 'futures' || r === 'options';
+  if (isTerminal) {
+    set({ instrumentMode: r });
+  }
+
   const toggleSb = () => {
     const hide = !useStore.getState().sbHide;
     set({ sbHide: hide });
     try { localStorage.setItem('xbost_sb', hide ? 'hide' : 'show'); } catch { /* noop */ }
   };
+
+  if (!isTerminal) {
+    return <Home />;
+  }
 
   return (
     <div className={`min-h-screen${sbHide ? ' sb-hide-w' : ''}`}>

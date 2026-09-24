@@ -69,6 +69,7 @@ type State = {
   wfSplit: number;
   tradeWindows: string[];
   adaptive: boolean;
+  instrumentMode: 'futures' | 'options' | null;
   detail: Detail;
   view: 'all' | 'best' | 'cmp';
   boardFilter: string;
@@ -125,6 +126,7 @@ export const useStore = create<State>((set) => ({
   wfSplit: 70,
   tradeWindows: ['b1', 'b2', 'b3', 'b4'],
   detail: null,
+  instrumentMode: null,
   view: 'all',
   boardFilter: '',
   run: { ...initialRun },
