@@ -7,7 +7,19 @@ try { importScripts('robustness.js'); } catch(e) {}
 self.onmessage = async function(e) {
   const msg = e.data;
   if (msg.type !== 'run') return;
+  try {
+    await runGridSearch(msg);
+  } catch (err) {
+    // NEVER hang silently: the runner treats this as a failed worker and
+    // surfaces the message (previously any throw = infinite "warming up").
+    self.postMessage({ type: 'error', message: String((err && err.message) || err).slice(0, 500) });
+  }
+};
+
+async function runGridSearch(msg) {
   const E = self.XBOST_ENGINE;
+  if (!E) throw new Error('XBOST_ENGINE missing in worker (engine.js failed to load)');
+  if (!msg.grid || !msg.grid.length) throw new Error('empty grid — nothing to search (check indicator selection)');
   const d1m = {
     t: new Float64Array(msg.t),
     o: new Float64Array(msg.o),
@@ -144,6 +156,7 @@ self.onmessage = async function(e) {
   const stepsByInd = msg.paramSteps || {};
   const riskSteps = {sl: msg.slStep || 0, tp: msg.tpStep || 0};
   let pool = E.rankResults(results, objective).slice(0, 20);
+  if (!pool.length) throw new Error('no evaluable combos — every configuration errored (see combo errors)');
   let best = E.objectiveValue(pool[0].m, objective);
   let pass = 0, refined = 0;
   let improved = true;
@@ -250,4 +263,4 @@ self.onmessage = async function(e) {
   }
   self.postMessage({ type:'done', done:total + refined, total: total + refined, top:ranked.slice(0, topN),
     all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo, route:routeNotices, robustnessLogs:robustnessLogs });
-};
+}

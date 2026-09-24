@@ -194,7 +194,7 @@ export function stopRun() {
   if (rejecter) { const r = rejecter; rejecter = null; r(new Error('stopped by user')); }
   useStore.getState().set({ stoppedFlag: true });
   seq++;
-  useStore.getState().runSeq = seq;
+  useStore.getState().set({ runSeq: seq });
 }
 
 function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, objective: string, topN: number,
@@ -207,15 +207,34 @@ function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, object
     const d = gData;
     const timer = window.setTimeout(() => { try { w.terminate(); } catch { /* noop */ } rejecter = null; reject(new Error('worker timeout')); }, 1000 * 60 * 30);
     rejecter = reject;
+    // Heartbeat watchdog: a healthy worker posts progress every batch (25
+    // combos). 90s of silence = wedged worker → fail loud into fallback
+    // instead of hanging on "warming up" forever.
+    let heartBeat = window.setTimeout(() => { }, 0);
+    const pulse = () => {
+      clearTimeout(heartBeat);
+      heartBeat = window.setTimeout(() => {
+        clearTimeout(timer);
+        try { w.terminate(); } catch { /* noop */ }
+        worker = null; rejecter = null;
+        reject(new Error('worker heartbeat lost (no progress for 90s) — failing over to main-thread run'));
+      }, 90000);
+    };
+    const settle = () => { clearTimeout(timer); clearTimeout(heartBeat); };
+    pulse();
     w.onmessage = (e: MessageEvent) => {
       const m = e.data;
-      if (m.type === 'progress') onBatch(m.done, m.total, m.top, m.current, m.stage, m.pass);
+      if (m.type === 'progress') { pulse(); onBatch(m.done, m.total, m.top, m.current, m.stage, m.pass); }
+      else if (m.type === 'error') {
+        settle(); try { w.terminate(); } catch { /* noop */ } worker = null; rejecter = null;
+        reject(new Error('worker: ' + (m.message || 'unknown error')));
+      }
       else if (m.type === 'done') {
-        clearTimeout(timer); w.terminate(); worker = null; rejecter = null;
+        settle(); w.terminate(); worker = null; rejecter = null;
         resolve({ top: m.top, refined: m.refined || 0, passes: m.passes || 0, errSamples: m.errSamples || [], ml: m.ml || [], route: m.route || [], robustnessLogs: m.robustnessLogs || [] });
       }
     };
-    (w as any).onerror = (e: any) => { clearTimeout(timer); try { w.terminate(); } catch { /* noop */ } worker = null; rejecter = null; reject(e.message || e); };
+    (w as any).onerror = (e: any) => { settle(); try { w.terminate(); } catch { /* noop */ } worker = null; rejecter = null; reject(e.message || e); };
     w.postMessage({
       type: 'run', symbol: sym, t: d.t, o: d.o, h: d.h, l: d.l, c: d.c, v: d.v,
       grid, tradeOpts: opts, objective, topN, paramSteps: paramSteps || {},
@@ -467,7 +486,10 @@ export async function runGrid() {
   const purgeNote = (opts.purgeBars || opts.embargoBars) ? ` purge${opts.purgeBars}/emb${opts.embargoBars}` : '';
   const grandTotal = grid.length * symData.length;
   const mySeq = seq + 1; seq = mySeq;
-  st.runSeq = mySeq;
+  // NOTE: never mutate a captured snapshot (st.* = …) — any set() in between
+  // (e.g. logLine) replaces the state object and silently drops the write,
+  // which used to wedge runs at "warming up" forever. Always use set().
+  useStore.getState().set({ runSeq: mySeq });
   st.set({ alert: null });
   const t0 = performance.now();
   let lastRender = 0;
@@ -476,7 +498,7 @@ export async function runGrid() {
   logLine(`run start: ${syms.map(([s, d]) => `${s} ${(d.t.length / 1000).toFixed(0)}k`).join(' + ')} bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote}${samplerNote}${v2Note}${purgeNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}x${symData.length}sym`);
   const onBatch = (done: number, total: number | string, top: BoardRow[], current: any, stage: string, pass: number) => {
     if (useStore.getState().runSeq !== mySeq) return;
-    if (stage === 'refine' && !useStore.getState()._refineAt) useStore.getState()._refineAt = performance.now();
+    if (stage === 'refine' && !useStore.getState()._refineAt) useStore.getState().set({ _refineAt: performance.now() });
     const pct = typeof done === 'number' && typeof total === 'number' ? ((done / total) * 100).toFixed(1) : '—';
     const el = (performance.now() - t0) / 1000;
     const perSec = (typeof done === 'number' ? done : 0) / Math.max(0.5, el);
@@ -497,7 +519,7 @@ export async function runGrid() {
   let refinedN = 0, passesN = 0;
   let mlInfo: any[] = [], routeInfo: string[] = [], robustnessLogs: string[] = [];
   const allRows: BoardRow[] = [];
-  useStore.getState()._refineAt = null;
+  useStore.getState().set({ _refineAt: null });
   let doneBase = 0;
   for (const [sym, sData] of symData) {
     if (useStore.getState().runSeq !== mySeq || useStore.getState().stoppedFlag) break;
@@ -582,9 +604,13 @@ export async function runGrid() {
   useStore.getState().set({ board: top });
   const s3 = useStore.getState();
   if (s3.stoppedFlag) stopped = true;
-  s3.stoppedFlag = false;
+  useStore.getState().set({ stoppedFlag: false });
   worker = null;
-  if (s3.runSeq !== mySeq && !stopped) return;
+  if (s3.runSeq !== mySeq && !stopped) {
+    // Stale run superseded — never leave the switch stuck on "running".
+    setRun({ running: false, summary: 'superseded by a newer run' });
+    return;
+  }
   const secs = (performance.now() - t0) / 1000;
   const gridSecs = s3._refineAt ? (s3._refineAt - t0) / 1000 : secs;
   const tested = doneBase;
@@ -779,7 +805,7 @@ export function detailFor(r: BoardRow) {
 
 export function selectRow(r: BoardRow, auto?: boolean) {
   const st = useStore.getState();
-  if (!auto) st.userPickedSeq = st.runSeq || 0;
+  if (!auto) useStore.getState().set({ userPickedSeq: st.runSeq || 0 });
   const det = detailFor(r);
   if (!det) return;
   useStore.getState().set({ sel: r, detail: det });
