@@ -252,3 +252,106 @@ test('multi-contract files split per contract (no strike mixing)', () => {
   const one = E.parseCSV(rows.join('\n'));
   assert.ok(one.mixed && one.mixed.contracts === 2 && one.mixed.dropped > 0);
 });
+
+test('hilbertDC: cycle period bounded [6,50], mode binary, causal', () => {
+  const n = 600, c = new Float64Array(n);
+  for (let i = 0; i < n; i++) c[i] = 100 + 10 * Math.sin(2 * Math.PI * i / 20);
+  const hc = E.hilbertDC(c);
+  const valid = [];
+  for (let i = 0; i < n; i++) if (!isNaN(hc.period[i])) valid.push(hc.period[i]);
+  assert.ok(valid.length > n * 0.8, 'valid=' + valid.length);
+  assert.ok(valid.every(v => v >= 6 && v <= 50), 'bounded');
+  assert.ok([...hc.mode].every(v => v === 0 || v === 1), 'binary mode');
+  const med = valid.sort((a, b) => a - b)[Math.floor(valid.length / 2)];
+  assert.ok(Math.abs(med - 20) < 6, 'median~20, got ' + med.toFixed(1));
+  // causality: output at t identical whether series ends at t or later
+  const hc2 = E.hilbertDC(c.slice(0, 300));
+  assert.equal(hc2.period[299].toFixed(9), hc.period[299].toFixed(9));
+});
+
+test('itrend: zero-lag line, trigger = 1-bar lag, fires both sides', () => {
+  const n = 400, c = new Float64Array(n);
+  for (let i = 0; i < n; i++) c[i] = 100 + i * 0.2 + 3 * Math.sin(2 * Math.PI * i / 30);
+  const t = E.itrend(c, 0.07);
+  let lag = 0, tot = 0;
+  for (let i = 60; i < n; i++) {
+    if (isNaN(t.trend[i]) || isNaN(t.trig[i])) continue;
+    tot++;
+    if (Math.abs(t.trig[i] - t.trend[i - 1]) < 1e-9) lag++;
+  }
+  assert.ok(tot > 300 && lag === tot, `trigger lags 1 bar: ${lag}/${tot}`);
+  const sig = E.buildSignals(
+    { t: Float64Array.from(c.map((_, i) => i)), o: c, h: c, l: c, c, v: new Float64Array(n).fill(100) },
+    { indicator: 'ITrend', params: {} });
+  const longs = sig.pos.filter(x => x === 1).length, shorts = sig.pos.filter(x => x === -1).length;
+  assert.ok(longs > 50 && shorts > 50, `both sides: L=${longs} S=${shorts}`);
+});
+
+test('adaptive indicators: trade, warmup-quarantined, base fallback', () => {
+  const n = 400, c = new Float64Array(n);
+  for (let i = 0; i < n; i++) c[i] = 100 + 8 * Math.sin(2 * Math.PI * i / 18) + (i % 7) * 0.3;
+  const d = { t: Float64Array.from(c.map((_, i) => i)), o: c, h: c, l: c, c, v: new Float64Array(n).fill(100) };
+  for (const ind of ['AdaptRSI', 'AdaptBB']) {
+    const s = E.buildSignals(d, { indicator: ind, params: {} });
+    let first = -1;
+    for (let i = 0; i < n; i++) if (s.pos[i] !== 0) { first = i; break; }
+    assert.ok(first >= 10, `${ind} first=${first}`);
+    assert.ok(s.pos.filter(x => x !== 0).length > 20, `${ind} trades`);
+  }
+  assert.equal(E.adaptivePeriod(14, 20, 2, 50), 10);
+  assert.equal(E.adaptivePeriod(14, NaN, 2, 50), 14);
+});
+
+test('smoothRegime: persistence + hysteresis suppress flicker', () => {
+  const r = E.smoothRegime(Int8Array.from([0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1]), 5, 2);
+  assert.deepEqual([...r.slice(0, 12)].every(v => v === 0), true, 'short runs suppressed');
+  assert.equal(r[17], 1, 'sustained run confirmed');
+  const m = E.applyMaskPersistence(Int8Array.from([1, 1, 0, 1, 0, 0, 1, 1, 1, 1]), 3);
+  assert.deepEqual([...m], [0, 0, 0, 0, 0, 0, 1, 1, 1, 1]);
+});
+
+test('halton: deterministic, uniform, grid builder covers space', () => {
+  const a = E.haltonSequence(16, 3), b = E.haltonSequence(16, 3);
+  assert.deepEqual(a, b, 'deterministic');
+  assert.ok(a.every(row => row.every(v => v >= 0 && v < 1)), 'unit cube');
+  assert.ok(Math.abs(a[0][0] - 0.5) < 1e-12 && Math.abs(a[0][1] - 1 / 3) < 1e-12, 'radical-inverse bases');
+  const grid = E.buildHaltonGrid(
+    [{ indicator: 'RSI', ranges: { period: { min: 8, max: 20, step: 2 } }, timeframes: [5] }],
+    { sl: [1], tp: [2] }, { exits: ['fixed'], carry: [false] }, 32);
+  assert.ok(grid.length <= 32 && grid.length >= 4, 'bounded, got ' + grid.length);
+  assert.equal(new Set(grid.map(c => E.cfgKey(c))).size, grid.length, 'deduped');
+  const periods = new Set(grid.map(c => c.params.period));
+  assert.ok(periods.size >= 4, 'covers axis, got ' + [...periods]);
+  assert.ok(grid.every(c => c.slPct === 1 && c.tpPct === 2 && c.timeframe === 5));
+});
+
+test('purgedFolds: train/test disjoint with purge + embargo gaps', () => {
+  const folds = E.purgedFolds(1000, 5, 100, 50);
+  assert.equal(folds.length, 5);
+  for (const f of folds) {
+    assert.ok(f.test[0] - f.train[1] >= 100, 'purge gap');
+    assert.ok(f.test[1] <= 1000, 'within range');
+    assert.ok(f.test[1] - f.test[0] > 0, 'non-empty test');
+  }
+  // folds nest (expanding train) and test windows do not overlap train
+  for (let i = 1; i < folds.length; i++) assert.ok(folds[i].train[1] > folds[i - 1].train[1]);
+});
+
+test('bayesianRefine: deterministic EI proposals, all fresh, snapped to step', () => {
+  const rows = [];
+  for (let i = 0; i < 10; i++) rows.push({
+    indicator: 'RSI', timeframe: 5, params: { period: 8 + i * 2, mult: 2 },
+    exit: 'fixed', carry: false, m: { sharpe: Math.sin(i) * 2 - 1, totalTrades: 50 },
+  });
+  const p1 = E.bayesianRefine(rows, { RSI: { period: 2 } }, 8);
+  const p2 = E.bayesianRefine(rows, { RSI: { period: 2 } }, 8);
+  assert.deepEqual(p1, p2, 'deterministic');
+  assert.ok(p1.length > 0 && p1.length <= 8);
+  const seen = new Set(rows.map(r => JSON.stringify(r.params)));
+  for (const c of p1) {
+    assert.ok(!seen.has(JSON.stringify(c.params)), 'fresh: ' + JSON.stringify(c.params));
+    assert.ok(Number.isInteger(c.params.period), 'snapped to step');
+    assert.equal(c.refined, true);
+  }
+  assert.deepEqual(E.bayesianRefine(rows.slice(0, 3), {}, 8), [], 'needs ≥6 rows');
+});

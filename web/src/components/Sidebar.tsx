@@ -90,6 +90,23 @@ export default function Sidebar() {
           <Num id="topN" label="Top-N board" value={st.topN} onChange={(v: number) => set({ topN: v || 500 })} />
           <Num id="cap" label="Max combos cap" value={st.cap} onChange={(v: number) => set({ cap: v || 60000 })} />
         </div>
+        <div className="grid grid-cols-2 gap-2 mt-2">
+          <div><label className="lbl">Grid sampler</label>
+            <select value={st.gridMode} className="w-full mt-1" onChange={e => set({ gridMode: e.target.value as any })}>
+              <option value="cartesian">Cartesian (exhaustive)</option>
+              <option value="halton">Halton (low-discrepancy) ★</option>
+            </select></div>
+          <Num id="haltonN" label="Halton points" value={st.haltonN} onChange={(v: number) => set({ haltonN: v || 256 })} />
+        </div>
+        <label className="flex items-center gap-2 text-[11px] text-emerald-300 mt-2 cursor-pointer">
+          <input type="checkbox" checked={st.bayesRefine} onChange={e => set({ bayesRefine: e.target.checked })} />
+          Bayesian EI refine pass (GP over top-40, +24 proposals)
+        </label>
+        <div className="grid grid-cols-2 gap-2 mt-2">
+          <Num id="purge" label="WF purge bars" value={st.purgeBars} onChange={(v: number) => set({ purgeBars: Math.max(0, v || 0) })} />
+          <Num id="embargo" label="WF embargo bars" value={st.embargoBars} onChange={(v: number) => set({ embargoBars: Math.max(0, v || 0) })} />
+        </div>
+        <div className="text-[10px] text-zinc-500 mt-1">Halton covers the same space as Cartesian with N quasi-random points (deterministic). Purge/embargo gaps stop IS structure leaking into OOS.</div>
         <div className="flex items-center gap-2 mt-2">
           <label className="flex items-center gap-2 text-[11px] text-zinc-300 cursor-pointer">
             <input type="checkbox" checked={st.wfOn} onChange={() => set({ wfOn: !st.wfOn })} />
@@ -207,6 +224,10 @@ function ExecSection() {
           <label key={d} className="flex items-center gap-1"><input type="radio" checked={st.direction === d} onChange={() => set({ direction: d })} /> {d}</label>
         ))}
       </div>
+      <button className="btn-ghost btn-xs w-full mb-1" title="Options desk preset: buy-only (Long), trigger entries, next-bar fill"
+        onClick={() => set({ direction: 'Long', entry: 'trigger', fill: 'next' })}>
+        ⚡ Options buy-only preset (Long · trigger · next-bar)
+      </button>
       <label className="lbl">Entries</label>
       <select value={st.entry} className="w-full mt-1 mb-1" onChange={e => set({ entry: e.target.value })}>
         <option value="trigger">Signal trigger only (no auto re-entry)</option>
@@ -291,6 +312,16 @@ function RegimeSection() {
         <input type="checkbox" checked={regimeOn} onChange={() => set({ regimeOn: !regimeOn })} />
         Route entries by regime (trend / range / high-vol)
       </label>
+      <label className="flex items-center gap-2 text-[11px] text-emerald-300 mt-1.5 cursor-pointer">
+        <input type="checkbox" checked={useStore(s => s.routerV2)} onChange={e => set({ routerV2: e.target.checked })} />
+        Router v2 — persistence + hysteresis (anti flip-flop) ★
+      </label>
+      {useStore(s => s.routerV2) && (
+        <div className="grid grid-cols-2 gap-2 mt-1.5">
+          <Num label="Persist bars" value={useStore(s => s.routerPersist)} onChange={(v: number) => set({ routerPersist: Math.max(1, v || 5) })} />
+          <Num label="Hysteresis +" value={useStore(s => s.routerHyst)} onChange={(v: number) => set({ routerHyst: Math.max(0, v || 0) })} />
+        </div>
+      )}
       <div className="flex gap-3 text-xs mt-1.5">
         <label className="flex items-center gap-1"><input type="radio" checked={granularity === 'day'} onChange={() => set({ granularity: 'day' })} /> Day labels ★</label>
         <label className="flex items-center gap-1"><input type="radio" checked={granularity === 'bar'} onChange={() => set({ granularity: 'bar' })} /> Per-bar (adv)</label>

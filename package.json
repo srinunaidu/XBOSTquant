@@ -8,7 +8,7 @@
   ],
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test/engine.test.js",
+    "test": "node --test test/",
     "build:web": "npm run build -w web",
     "dev:web": "npm run dev -w web",
     "test:web": "npm run test -w web"

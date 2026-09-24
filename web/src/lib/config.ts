@@ -24,6 +24,9 @@ export const IND_META: IndMeta[] = [
   { cat: 'D · Combinatorial presets (multi-leg)' },
   {tier: 'A', n: 'SqueezeBreak', d: '★P Squeeze + volume + CK stops', on: true }, {tier: 'B', n: 'TrendRegime', d: '★P Chop gate + ST + MACD', on: false },
   {tier: 'A', n: 'VWAPRev', d: '★P VWAP fade + CMO trigger', on: true },
+  { cat: 'E · Regime-first DSP (Ehlers) + cycle-adaptive' },
+  {tier: 'A', n: 'ITrend', d: '★ Ehlers InstantTrend vs trigger', on: true }, {tier: 'A', n: 'AdaptRSI', d: '★ cycle-adaptive RSI (Hilbert)', on: true },
+  {tier: 'B', n: 'AdaptBB', d: '★ cycle-adaptive Bollinger (Hilbert)', on: false }, {tier: 'C', n: 'HilbertDC', d: '★ dominant-cycle overlay (no trades)', on: false },
 ];
 
 export const DEFAULT_RANGES: Record<string, Record<string, [number, number, number]>> = {
@@ -54,6 +57,10 @@ export const DEFAULT_RANGES: Record<string, Record<string, [number, number, numb
   SqueezeBreak: { period: [14, 21, 7], bbMult: [2, 2.5, 0.5], kcMult: [1.5, 2, 0.5], volMult: [1.5, 2.5, 1], ckMult: [2, 3, 1] },
   TrendRegime: { chopPeriod: [10, 20, 10], gate: [50, 60, 10], stMult: [2, 3, 1], macdFast: [8, 12, 4] },
   VWAPRev: { sd1: [1, 2, 1], sd2: [2, 3, 1], cmoPeriod: [5, 9, 4], cmoOS: [-50, -30, 20], cmoOB: [30, 50, 20] },
+  HilbertDC: {},
+  ITrend: { alpha: [0.03, 0.15, 0.02] },
+  AdaptRSI: { baseLen: [8, 20, 2], oversold: [20, 30, 10], overbought: [70, 80, 10] },
+  AdaptBB: { baseLen: [15, 30, 5], mult: [1.5, 2.5, 0.5] },
 };
 
 export const TFS = [1, 2, 3, 4, 5, 7, 10, 15];

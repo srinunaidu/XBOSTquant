@@ -85,7 +85,9 @@ export function buildDims() {
 
 export function estimateCombos(): number {
   try {
+    const st = useStore.getState();
     const { sels } = buildSelection();
+    if (st.gridMode === 'halton') return engine.buildHaltonGrid(sels, buildRisk(), buildDims(), st.haltonN).length;
     return engine.buildGrid(sels, buildRisk(), buildDims()).length;
   } catch { return 0; }
 }
@@ -105,6 +107,8 @@ export function tradeOpts(): Record<string, any> {
     fill: s.fill, entry: s.entry,
     regimeOn: s.regimeOn, regimeSource: s.regimeSource,
     granularity: s.granularity, confGate: (s.confGate ?? 60) / 100,
+    routerV2: s.routerV2, routerPersist: s.routerPersist, routerHyst: s.routerHyst,
+    purgeBars: s.purgeBars, embargoBars: s.embargoBars,
   };
 }
 
@@ -137,7 +141,17 @@ export function routingFor(cache: Record<number, any>, tf: number, d: any, cfg: 
       }
     }
     if (!rt.dayReg) return { mask: null as Int8Array | null, notices: notes };
-    return { mask: engine.dayRegimeMask(d, rt.dayReg, cfg.indicator, gate).mask, notices: notes };
+    let dayReg = rt.dayReg;
+    if (opts.routerV2) {
+      // Router v2: persistence + hysteresis on day labels before masking.
+      const vk = 'v2_' + (opts.routerPersist ?? 5) + '_' + (opts.routerHyst ?? 2);
+      if (!c.daySm || c.daySm.k !== vk) {
+        c.daySm = { k: vk, pred: Array.from(engine.smoothRegime(Int8Array.from(dayReg.pred), opts.routerPersist ?? 5, opts.routerHyst ?? 2)) };
+      }
+      dayReg = { ...dayReg, pred: c.daySm.pred };
+      if (!c.v2Noted) { c.v2Noted = true; notes.push(`${tf}m: router-v2 persistence ${opts.routerPersist ?? 5}+${opts.routerHyst ?? 2} smoothing ${dayReg.pred.length} day labels`); }
+    }
+    return { mask: engine.dayRegimeMask(d, dayReg, cfg.indicator, gate).mask, notices: notes };
   }
   if (!c.reg) c.reg = engine.regimeSeries(d, {});
   if (opts.regimeSource === 'ml' && !c.ml) {
@@ -146,7 +160,15 @@ export function routingFor(cache: Record<number, any>, tf: number, d: any, cfg: 
     notes.push(`${tf}m: bar-ML train-acc ${(100 * r.trainAcc).toFixed(1)}%`);
   }
   const regs = opts.regimeSource === 'ml' ? c.ml.pred : c.reg;
-  return { mask: engine.regimeMask(Array.isArray(regs) ? Int8Array.from(regs) : regs, cfg.indicator), notices: notes };
+  let regArr = Array.isArray(regs) ? Int8Array.from(regs) : regs;
+  if (opts.routerV2) {
+    const vk = 'v2_' + (opts.routerPersist ?? 5) + '_' + (opts.routerHyst ?? 2);
+    if (!c.regSm || c.regSm.k !== vk) {
+      c.regSm = { k: vk, arr: engine.smoothRegime(regArr, opts.routerPersist ?? 5, opts.routerHyst ?? 2) };
+    }
+    regArr = c.regSm.arr;
+  }
+  return { mask: engine.regimeMask(regArr, cfg.indicator), notices: notes };
 }
 
 export function logLine(s: string) {
@@ -193,6 +215,7 @@ function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, object
       grid, tradeOpts: opts, objective, topN, paramSteps: paramSteps || {},
       slStep: risk && risk.sl ? stepsOf(risk.sl) : 0,
       tpStep: risk && risk.tp ? stepsOf(risk.tp) : 0,
+      useBayes: (useStore.getState() as any).bayesRefine !== false,
     });
   });
 }
@@ -280,6 +303,22 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
     const nowBest = engine.objectiveValue(pool[0].m, objective);
     if (nowBest > best + 1e-9) { best = nowBest; improved = true; }
   }
+  // Bayesian EI pass (GP over evaluated top rows, deterministic proposals).
+  if ((useStore.getState() as any).bayesRefine !== false && !useStore.getState().stoppedFlag) {
+    try {
+      const cands = engine.bayesianRefine(engine.rankResults(res, objective).slice(0, 40), paramSteps || {}, 24)
+        .filter((nb: any) => !tested.has(engine.cfgKey(nb)));
+      for (const nb of cands) tested.add(engine.cfgKey(nb));
+      for (let j = 0; j < cands.length; j++) {
+        if (useStore.getState().runSeq !== mySeq) return { top: engine.rankResults(res, objective).slice(0, topN), refined, passes: pass, stopped: true };
+        try { res.push(testCfg(cands[j], grid.length + refined, true)); }
+        catch { const s = useStore.getState(); s.set({ run: { ...s.run, errCount: s.run.errCount + 1 } }); }
+        refined++;
+      }
+      if (cands.length) logLine(`  bayes: +${cands.length} EI proposals evaluated (fallback path)`);
+      pass++;
+    } catch { /* best-effort */ }
+  }
   return { top: engine.rankResults(res, objective).slice(0, topN), refined, passes: pass, stopped: false };
 }
 
@@ -310,7 +349,14 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
     const splitT = data.t[0] + (st.wfSplit / 100) * (data.t[data.t.length - 1] - data.t[0]);
     let si = 0;
     while (si < data.t.length && data.t[si] < splitT) si++;
-    const pick = (a: Float64Array) => a.slice(si);
+    // Purged WF: skip purgeBars after the split (indicator warmup/ATR windows
+    // must not leak IS structure into OOS), drop embargoBars off the tail.
+    const purge = Math.max(0, Math.round(st.purgeBars || 0));
+    const embargo = Math.max(0, Math.round(st.embargoBars || 0));
+    si = Math.min(data.t.length - 1, si + purge);
+    const ei = Math.max(si + 50, data.t.length - embargo);
+    if (purge || embargo) logLine(`  WF [${sym}]: purged ${purge} bars @ split, embargo ${embargo} bars @ tail`);
+    const pick = (a: Float64Array) => a.slice(si, ei);
     const oos = { t: pick(data.t), o: pick(data.o), h: pick(data.h), l: pick(data.l), c: pick(data.c), v: pick(data.v) };
     if (oos.t.length < 50) continue;
     const tfCache: Record<number, any> = {};
@@ -355,7 +401,9 @@ export async function runGrid() {
   if (!sels.length) { st.set({ alert: 'No indicators selected — enable at least one strategy.' }); return; }
   const risk = buildRisk();
   const dims = buildDims();
-  let grid = engine.buildGrid(sels, risk, dims);
+  let grid = st.gridMode === 'halton'
+    ? engine.buildHaltonGrid(sels, risk, dims, st.haltonN)
+    : engine.buildGrid(sels, risk, dims);
   grid.forEach((c: any) => { c._sk = c.timeframe + '|' + c.indicator + '|' + JSON.stringify(c.params); });
   grid.sort((a: any, b: any) => (a._sk < b._sk ? -1 : 1));
   if (grid.length > st.cap) {
@@ -366,6 +414,7 @@ export async function runGrid() {
   if (!grid.length) { st.set({ alert: 'Empty grid — check parameter ranges.' }); return; }
   const objective = st.objective, topN = st.topN;
   const opts = tradeOpts();
+  const useBayes = st.bayesRefine;
   // Per-symbol execution data (WF in-sample slice when enabled; detail views
   // stay full-data). Single-symbol runs behave exactly as before.
   const symData: [string, OHLCV][] = syms.map(([sym, d]) => {
@@ -380,6 +429,9 @@ export async function runGrid() {
     return [sym, d];
   });
   const wfNote = st.wfOn ? ` WF ${st.wfSplit}/${100 - st.wfSplit}` : '';
+  const samplerNote = st.gridMode === 'halton' ? ` halton${st.haltonN}` : ' cartesian';
+  const v2Note = opts.routerV2 ? ` routerv2(${opts.routerPersist}+${opts.routerHyst})` : '';
+  const purgeNote = (opts.purgeBars || opts.embargoBars) ? ` purge${opts.purgeBars}/emb${opts.embargoBars}` : '';
   const grandTotal = grid.length * symData.length;
   const mySeq = seq + 1; seq = mySeq;
   st.runSeq = mySeq;
@@ -388,7 +440,7 @@ export async function runGrid() {
   let lastRender = 0;
   const setRun = (p: Partial<typeof st.run>) => useStore.getState().set({ run: { ...useStore.getState().run, ...p } });
   setRun({ running: true, done: 0, total: grandTotal, stage: 'grid', pass: 0, perSec: 0, eta: '', current: 'warming up…', errCount: 0, refined: 0, passes: 0, summary: `0 / ${grandTotal}` });
-  logLine(`run start: ${syms.map(([s, d]) => `${s} ${(d.t.length / 1000).toFixed(0)}k`).join(' + ')} bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}x${symData.length}sym`);
+  logLine(`run start: ${syms.map(([s, d]) => `${s} ${(d.t.length / 1000).toFixed(0)}k`).join(' + ')} bars objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote}${samplerNote}${v2Note}${purgeNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost} grid=${grid.length}x${symData.length}sym`);
   const onBatch = (done: number, total: number | string, top: BoardRow[], current: any, stage: string, pass: number) => {
     if (useStore.getState().runSeq !== mySeq) return;
     if (stage === 'refine' && !useStore.getState()._refineAt) useStore.getState()._refineAt = performance.now();

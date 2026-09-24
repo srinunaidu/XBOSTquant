@@ -283,6 +283,10 @@ async function robustnessFor(d, candidate, baseOpts, datasets, totalCombos, rank
   const deflated=deflatedSharpe(baseline.sharpe, trades.length, totalCombos);
   const leakage=leakageAudit(d);
   const sampleGate=sampleSizeGate(trades.length);
+  const sens=paramSensitivity(d,candidate.indicator,candidate.params,baseOpts);
+  const blockboot=blockBootstrapCI(trades, 20, 500, (rank||1)*7919+13);
+  const surr=surrogateTest(trades, 100, (rank||1)*104729+7);
+  const nParams=freeParamCount(candidate);
   const subs=subScores({baseline,paramStability:param,density:param,exit,purity,direction,regime,time,entry,input,order,conc,worst,cross,walk:walkForward});
   const scored=finalScore(subs,totalCombos,rank);
   let finalAdj=Math.min(scored.adjusted, sampleGate.maxScore);
@@ -293,13 +297,138 @@ async function robustnessFor(d, candidate, baseOpts, datasets, totalCombos, rank
     entryPerturbation:entry,inputPerturbation:input,jitterResilience:jitter,
     tradeOrder:order,concentration:conc,worstTradeRemoval:worst,
     regimeRemoval:removalRegime,crossMarket:cross,clustering,distribution:distr,
-    bootstrap, deflatedSharpe:deflated, leakageAudit:leakage, sampleGate,
+    bootstrap, blockBootstrap:blockboot, surrogate:surr, paramSensitivity:sens, freeParams:nParams,
+    deflatedSharpe:deflated, leakageAudit:leakage, sampleGate,
     subs, final:{raw:scored.raw, adjusted:finalAdj, penalty:scored.penalty, cap:Math.min(scored.cap, sampleGate.maxScore)}, classification,
     log:{paramStability:param,exitIndependence:exit,signalPurity:purity,regime:regime,time:time,entry:entry,input:input,concentration:conc,worstTrade:worst,crossMarket:cross},
     parameters_locked:true, reoptimized:false,
   };
 }
-const api={extendMetrics,paramStability,exitIndependence,signalPurity,directionRobustness,regimeRobustness,timeRobustness,entryPerturbation,inputPerturbation,jitterResilience,tradeOrderRobustness,concentrationMetrics,worstTradeRemoval,regimeRemoval,crossMarketTransfer,clusteringMetrics,distributionQuality,bootstrapCI,deflatedSharpe,multipleTestingPenalty,sampleSizeGate,leakageAudit,robustnessFor,clearCache,WEIGHTS,classify,subScores,finalScore};
+// ---------- Anti-overfit extensions (upgrade spec §6) ----------
+// Deterministic PRNG (mulberry32) so CIs/surrogates are reproducible/loggable.
+function _rng(seed){ let a=(seed==null?42:seed)>>>0; return function(){ a|=0;a=(a+0x6D2B79F5)|0; let t=Math.imul(a^(a>>>15),1|a); t=(t+Math.imul(t^(t>>>7),61|t))^t; return ((t^(t>>>14))>>>0)/4294967296; }; }
+function paramSensitivity(d, indicator, params, baseOpts, eps){
+  // Parameter Sensitivity Surface: 2nd-order curvature of Sharpe at the
+  // candidate point, per free param, via ±eps relative bumps (cached
+  // backtests — cheap). pss = mean curvature; knifeEdge = pss > 0.5.
+  eps=eps||0.05;
+  const keys=Object.keys(params||{}).filter(k=>typeof params[k]==='number'&&isFinite(params[k]));
+  const base=cachedBacktest(d,indicator,params,baseOpts).metrics.sharpe;
+  const per={}; let sum=0;
+  for(const k of keys){
+    const b=params[k], h=Math.max(Math.abs(b)*eps, 1e-9);
+    const up=Object.assign({},params), dn=Object.assign({},params);
+    up[k]=b+h; dn[k]=b-h;
+    const sUp=cachedBacktest(d,indicator,up,baseOpts).metrics.sharpe;
+    const sDn=cachedBacktest(d,indicator,dn,baseOpts).metrics.sharpe;
+    const curv=Math.abs(sUp-2*base+sDn)/(h*h);
+    per[k]={base:b, up:sUp, down:sDn, curvature:+curv.toFixed(4)};
+    sum+=curv;
+  }
+  const pss=keys.length?sum/keys.length:0;
+  return {pss:+pss.toFixed(4), knifeEdge:pss>0.5, baseSharpe:+base.toFixed(3), perParam:per, parameters_locked:true, reoptimized:false};
+}
+function blockBootstrapCI(trades, block, iters, seed){
+  // Block bootstrap over the trade-PnL series (preserves autocorrelation —
+  // i.i.d. resampling understates streak risk). Deterministic via seed.
+  block=Math.max(1,Math.round(block||20)); iters=Math.max(50,Math.round(iters||1000));
+  const pnls=(trades||[]).map(t=>t.pnl);
+  const n=pnls.length;
+  if(n<10) return {sharpe:[0,0], wr:[0,0], pf:[0,0], netPnL:[0,0], nSamples:0, note:'insufficient trades'};
+  const rnd=_rng(seed==null?1234:seed);
+  const S={sharpe:[],wr:[],pf:[],netPnL:[]};
+  const nBlocks=Math.ceil(n/block);
+  for(let k=0;k<iters;k++){
+    const s=[];
+    for(let b=0;b<nBlocks&&s.length<n;b++){
+      const start=Math.floor(rnd()*n);
+      for(let j=0;j<block&&s.length<n;j++)s.push(pnls[(start+j)%n]);
+    }
+    const mu=mean(s), sdv=sd(s,mu)||1e-9;
+    S.sharpe.push(mu/sdv*Math.sqrt(252));
+    S.wr.push(s.filter(x=>x>0).length/s.length*100);
+    const gp=s.filter(x=>x>0).reduce((a,x)=>a+x,0), gl=-s.filter(x=>x<0).reduce((a,x)=>a+x,0);
+    S.pf.push(gl>0?gp/gl:(gp>0?99.99:0));
+    S.netPnL.push(s.reduce((a,x)=>a+x,0)*n/s.length);
+  }
+  const q=(a,p)=>percentile(a,p);
+  return {sharpe:[+q(S.sharpe,0.025).toFixed(3),+q(S.sharpe,0.975).toFixed(3)],
+    wr:[+q(S.wr,0.025).toFixed(2),+q(S.wr,0.975).toFixed(2)],
+    pf:[+q(S.pf,0.025).toFixed(3),+q(S.pf,0.975).toFixed(3)],
+    netPnL:[+q(S.netPnL,0.025).toFixed(0),+q(S.netPnL,0.975).toFixed(0)],
+    nSamples:iters, parameters_locked:true, reoptimized:false};
+}
+// Radix-2 Cooley–Tukey FFT (iterative, real input zero-padded to pow2).
+function _fft(re, im){
+  const n=re.length;
+  for(let i=1,j=0;i<n;i++){ let b=n>>1; for(;j&b;b>>=1)j^=b; j^=b;
+    if(i<j){ const tr=re[i];re[i]=re[j];re[j]=tr; const ti=im[i];im[i]=im[j];im[j]=ti; } }
+  for(let len=2;len<=n;len<<=1){
+    const ang=-2*Math.PI/len, wr=Math.cos(ang), wi=Math.sin(ang);
+    for(let i=0;i<n;i+=len){
+      let cr=1, ci=0;
+      for(let j=0;j<len/2;j++){
+        const ur=re[i+j], ui=im[i+j];
+        const vr=re[i+j+len/2]*cr-im[i+j+len/2]*ci, vi=re[i+j+len/2]*ci+im[i+j+len/2]*cr;
+        re[i+j]=ur+vr; im[i+j]=ui+vi; re[i+j+len/2]=ur-vr; im[i+j+len/2]=ui-vi;
+        const nr=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=nr;
+      }
+    }
+  }
+}
+function _ifft(re, im){
+  for(let i=0;i<im.length;i++)im[i]=-im[i];
+  _fft(re,im);
+  const n=re.length;
+  for(let i=0;i<n;i++){re[i]/=n;im[i]/=n;}
+}
+function _phaseRandomize(pnls, rnd){
+  const n0=pnls.length;
+  let n=1;while(n<n0)n<<=1;
+  const re=new Float64Array(n), im=new Float64Array(n);
+  const mu=mean(pnls);
+  for(let i=0;i<n0;i++)re[i]=pnls[i]-mu;
+  _fft(re,im);
+  // Randomize phases, preserve magnitudes; keep DC + Nyquist fixed.
+  for(let k=1;k<n/2;k++){
+    const mag=Math.sqrt(re[k]*re[k]+im[k]*im[k]);
+    const ph=rnd()*2*Math.PI;
+    re[k]=mag*Math.cos(ph);im[k]=mag*Math.sin(ph);
+    re[n-k]=re[k];im[n-k]=-im[k];
+  }
+  _ifft(re,im);
+  const out=new Array(n0);
+  for(let i=0;i<n0;i++)out[i]=re[i]+mu;
+  return out;
+}
+function surrogateTest(trades, nSurr, seed){
+  // Phase-randomized surrogates preserve the return spectrum/autocorrelation
+  // but destroy time-structure edge. p = fraction of surrogates with Sharpe
+  // ≥ observed. Real edge ⇒ p < 0.01; noise ⇒ p ≈ 0.5.
+  nSurr=Math.max(20,Math.round(nSurr||100));
+  const pnls=(trades||[]).map(t=>t.pnl);
+  const n=pnls.length;
+  if(n<20) return {p:1, nSurr:0, observedSharpe:0, note:'insufficient trades'};
+  const mu=mean(pnls), sdv=sd(pnls,mu)||1e-9;
+  const obs=mu/sdv*Math.sqrt(252);
+  const rnd=_rng(seed==null?777:seed);
+  let beat=0;
+  for(let s=0;s<nSurr;s++){
+    const surr=_phaseRandomize(pnls,rnd);
+    const m2=mean(surr), sd2=sd(surr,m2)||1e-9;
+    if(m2/sd2*Math.sqrt(252)>=obs)beat++;
+  }
+  return {p:+(beat/nSurr).toFixed(4), nSurr, observedSharpe:+obs.toFixed(3), parameters_locked:true, reoptimized:false};
+}
+function freeParamCount(candidate){
+  // Total free parameters: numeric signal params + active risk/exit knobs.
+  let c=0;
+  for(const k of Object.keys((candidate&&candidate.params)||{})) if(typeof candidate.params[k]==='number') c++;
+  if(candidate&&(candidate.slPct!=null||candidate.tpPct!=null))c+=2;
+  if(candidate&&candidate.trailPct)c+=1;
+  return c;
+}
+const api={extendMetrics,paramStability,exitIndependence,signalPurity,directionRobustness,regimeRobustness,timeRobustness,entryPerturbation,inputPerturbation,jitterResilience,tradeOrderRobustness,concentrationMetrics,worstTradeRemoval,regimeRemoval,crossMarketTransfer,clusteringMetrics,distributionQuality,bootstrapCI,blockBootstrapCI,surrogateTest,paramSensitivity,freeParamCount,deflatedSharpe,multipleTestingPenalty,sampleSizeGate,leakageAudit,robustnessFor,clearCache,WEIGHTS,classify,subScores,finalScore};
 if(typeof module!=='undefined'&&module.exports) module.exports=api;
 root.XBOST_ROBUST=api;
 })(typeof self!=='undefined'?self:this);

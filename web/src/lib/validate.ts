@@ -1,5 +1,6 @@
 // Live-data validation (L1–L7) + session log. Port of the validated routine.
 import engine from './engine';
+import Robust from './robustness';
 import { useStore } from './store';
 import { logLine, tradeOpts } from './runner';
 
@@ -89,6 +90,35 @@ export function runValidation() {
       out.push(`${tag} ${c.name} :: ${c.detail}`);
       if (c.pass) { if (c.warn) skip++; else pass++; }
       else fail++;
+    }
+    // L8: anti-overfit gate on the SELECTED candidate (viewed slice, session
+    // filter off — probes pure signal properties: curvature, surrogate edge,
+    // param count). Needs a leaderboard row selected.
+    if (!st.sel || !st.detail || !st.detail.bt.trades.length) {
+      out.push('SKIP L8 anti-overfit (click a leaderboard row first)'); skip++;
+    } else {
+      try {
+        const sel = st.sel, d8 = st.detail.data;
+        const eff8: any = tradeOpts();
+        eff8.slPct = sel.slPct; eff8.tpPct = sel.tpPct;
+        if (sel.trailPct != null) eff8.trailPct = sel.trailPct;
+        eff8.exit = sel.exit || 'fixed'; eff8.carry = !!sel.carry;
+        eff8.sessionMask = new Int8Array(d8.c.length).fill(1);
+        const sens = Robust.paramSensitivity(d8, sel.indicator, sel.params, eff8);
+        ok('L8 PSS no knife-edge (pss<0.5)', !sens.knifeEdge, `pss=${sens.pss} base_sharpe=${sens.baseSharpe}`);
+        const bb = Robust.blockBootstrapCI(st.detail.bt.trades, 20, 500, 99);
+        if (!bb.nSamples) { out.push('SKIP L8-blockboot (<10 trades on slice)'); skip++; }
+        else ok('L8 block-bootstrap Sharpe lower>0', bb.sharpe[0] > 0, `CI=[${bb.sharpe}] n=${bb.nSamples}`);
+        if (st.detail.bt.trades.length < 20) { out.push('SKIP L8-surrogate (<20 trades on slice)'); skip++; }
+        else {
+          const su = Robust.surrogateTest(st.detail.bt.trades, 100, 99);
+          ok('L8 surrogate edge real (p<0.01)', su.p < 0.01, `p=${su.p} obs_sharpe=${su.observedSharpe}`);
+        }
+        const np = Robust.freeParamCount(sel);
+        ok('L8 free params ≤ 8', np <= 8, `n=${np}`);
+      } catch (e: any) {
+        out.push('SKIP L8 anti-overfit (engine error: ' + (e?.message || e) + ')'); skip++;
+      }
     }
     out.push('');
     out.push(`LIVE VALIDATION: ${pass} passed, ${fail} failed${skip ? `, ${skip} skipped (thin file)` : ''} — ${st.symbol}, real data only.`);

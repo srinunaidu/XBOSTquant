@@ -48,6 +48,15 @@ export interface Engine {
   };
   expandRange(min: number, max: number, step: number): number[];
   buildGrid(selected: any[], risk: any, dims: any): any[];
+  buildHaltonGrid(selected: any[], risk: any, dims: any, nPoints?: number): any[];
+  haltonSequence(nPoints: number, dims: number): number[][];
+  purgedFolds(n: number, nSplits?: number, purgeBars?: number, embargoBars?: number): { train: [number, number]; test: [number, number] }[];
+  bayesianRefine(rows: BoardRow[], stepsByInd?: Record<string, Record<string, number>>, nPropose?: number): any[];
+  smoothRegime(regimes: Int8Array, persist?: number, hysteresis?: number): Int8Array;
+  applyMaskPersistence(mask: Int8Array, minBars?: number): Int8Array;
+  hilbertDC(close: Float64Array): { period: Float64Array; mode: Int8Array };
+  itrend(close: Float64Array, alpha?: number): { trend: Float64Array; trig: Float64Array };
+  adaptivePeriod(base: number, cycle: number | null, min?: number, max?: number): number;
   rankResults(rows: BoardRow[], objective: string): BoardRow[];
   objectiveValue(m: Metrics, objective: string): number;
   paramNeighbors(row: any, steps: any, riskSteps: any): any[];

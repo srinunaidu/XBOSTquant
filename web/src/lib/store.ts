@@ -70,6 +70,14 @@ type State = {
   tradeWindows: string[];
   adaptive: boolean;
   instrumentMode: 'futures' | 'options' | null;
+  gridMode: 'cartesian' | 'halton';
+  haltonN: number;
+  purgeBars: number;
+  embargoBars: number;
+  routerV2: boolean;
+  routerPersist: number;
+  routerHyst: number;
+  bayesRefine: boolean;
   detail: Detail;
   view: 'all' | 'best' | 'cmp';
   boardFilter: string;
@@ -127,6 +135,14 @@ export const useStore = create<State>((set) => ({
   tradeWindows: ['b1', 'b2', 'b3', 'b4'],
   detail: null,
   instrumentMode: null,
+  gridMode: 'cartesian',
+  haltonN: 256,
+  purgeBars: 0,
+  embargoBars: 0,
+  routerV2: false,
+  routerPersist: 5,
+  routerHyst: 2,
+  bayesRefine: true,
   view: 'all',
   boardFilter: '',
   run: { ...initialRun },

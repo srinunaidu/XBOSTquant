@@ -53,17 +53,31 @@ self.onmessage = async function(e) {
       const rt = dd.dayRT;
       noteTF(cfg.timeframe, rt.notices);
       if(!rt.dayReg) return null;
+      let dayReg = rt.dayReg;
+      if(tradeOpts.routerV2){
+        const vk = 'v2_' + (tradeOpts.routerPersist || 5) + '_' + (tradeOpts.routerHyst || 2);
+        if(!dd.dayRTv2 || dd.dayRTv2.k !== vk){
+          dd.dayRTv2 = {k: vk, pred: Array.from(E.smoothRegime(Int8Array.from(dayReg.pred), tradeOpts.routerPersist || 5, tradeOpts.routerHyst || 2))};
+        }
+        dayReg = Object.assign({}, dayReg, {pred: dd.dayRTv2.pred});
+      }
       if(!routeSeen[cfg.timeframe + 'fb']){
         routeSeen[cfg.timeframe + 'fb'] = 1;
         let fbD = 0; const total = rt.dayReg.pred.length;
         for(let s = 0; s < total; s++) if(rt.dayReg.pred[s] < 0 || (rt.dayReg.conf && rt.dayReg.conf[s] < gate)) fbD++;
         routeNotices.push(cfg.timeframe + 'm: ' + fbD + '/' + total + ' fallback days (unrouted, counted)');
       }
-      return E.dayRegimeMask(dd.d, rt.dayReg, cfg.indicator, gate).mask;
+      return E.dayRegimeMask(dd.d, dayReg, cfg.indicator, gate).mask;
     }
     // bar mode (advanced): per-bar regimes; ML trains lazily once per TF
     const regs = tradeOpts.regimeSource === 'ml' ? getML(cfg.timeframe).pred : dd.reg;
-    return E.regimeMask(Array.isArray(regs) ? Int8Array.from(regs) : regs, cfg.indicator);
+    let regArr = Array.isArray(regs) ? Int8Array.from(regs) : regs;
+    if(tradeOpts.routerV2){
+      const vk = 'v2b_' + (tradeOpts.routerPersist || 5) + '_' + (tradeOpts.routerHyst || 2);
+      if(!dd.regSm || dd.regSm.k !== vk) dd.regSm = {k: vk, arr: E.smoothRegime(regArr, tradeOpts.routerPersist || 5, tradeOpts.routerHyst || 2)};
+      regArr = dd.regSm.arr;
+    }
+    return E.regimeMask(regArr, cfg.indicator);
   }
   function getML(tf){
     const tfc = getTF(tf);
@@ -161,6 +175,24 @@ self.onmessage = async function(e) {
     const nowBest = E.objectiveValue(pool[0].m, objective);
     if (nowBest > best + 1e-9) { best = nowBest; improved = true; }
   }
+  // ---------- stage 3: Bayesian EI proposals (GP over evaluated top rows) ----------
+  if (msg.useBayes !== false) {
+    try {
+      const cands = E.bayesianRefine(E.rankResults(results, objective).slice(0, 40), stepsByInd, 24)
+        .filter(nb => !tested.has(E.cfgKey(nb)));
+      for (const nb of cands) tested.add(E.cfgKey(nb));
+      for (let j = 0; j < cands.length; j++) {
+        results.push(testCfg(cands[j], total + refined, true));
+        refined++;
+      }
+      if (cands.length) {
+        const ranked = E.rankResults(results, objective).slice(0, topN);
+        self.postMessage({ type:'progress', stage:'bayes', done: total + refined, total: total + '+refine+bayes',
+          top: ranked, errCount: errCount, pass: pass,
+          current:{ indicator:'EI', timeframe:'—', params:{proposals: cands.length}, slPct:0, tpPct:0, exit:'fixed', carry:false } });
+      }
+    } catch (e) { /* best-effort */ }
+  }
   let ranked = E.rankResults(results, objective);
   // §27 staged robustness: cheap on Top-500, medium on Top-100, full on Top-25
   let robustnessLogs = [];
@@ -204,6 +236,10 @@ self.onmessage = async function(e) {
         if (inp) robustnessLogs.push(`[INPUT PERTURBATION] tests=${inp.total} profitable=${inp.profitable} median_sharpe=${inp.medianSharpe.toFixed(2)} worst=${inp.worstSharpe.toFixed(2)}`);
         if (co) robustnessLogs.push(`[P&L CONCENTRATION] top1=${co.top1Pct.toFixed(1)}% top5=${co.top5Pct.toFixed(1)}% top10=${co.top10Pct.toFixed(1)}% largest=${co.largestWinnerPct.toFixed(1)}%`);
         if (wt) robustnessLogs.push(`[BEST TRADE REMOVAL] remove1_sharpe=${wt.remove1.sharpe.toFixed(2)} remove3=${wt.remove3.sharpe.toFixed(2)} remove5=${wt.remove5.sharpe.toFixed(2)} remove10=${wt.remove10.sharpe.toFixed(2)}`);
+        if (r.paramSensitivity) robustnessLogs.push(`[PARAM SENSITIVITY] pss=${r.paramSensitivity.pss} knife_edge=${r.paramSensitivity.knifeEdge ? 'YES' : 'no'} base_sharpe=${r.paramSensitivity.baseSharpe}`);
+        if (r.blockBootstrap) robustnessLogs.push(`[BLOCK BOOTSTRAP] sharpe_CI=[${r.blockBootstrap.sharpe}] wr_CI=[${r.blockBootstrap.wr}] pf_CI=[${r.blockBootstrap.pf}] n=${r.blockBootstrap.nSamples}`);
+        if (r.surrogate) robustnessLogs.push(`[SURROGATE] p=${r.surrogate.p} observed_sharpe=${r.surrogate.observedSharpe} n=${r.surrogate.nSurr} (edge real iff p<0.01)`);
+        if (r.freeParams != null) robustnessLogs.push(`[PARAM COUNT] free_params=${r.freeParams} (cap 8)`);
         robustnessLogs.push(`[MULTIPLE TESTING] total_combinations=${totalCombos} candidate_rank=1 percentile=${(100*(1-1/totalCombos)).toFixed(2)} penalty=${r.final.penalty.toFixed(2)}`);
         robustnessLogs.push(`[FINAL] raw=${r.final.raw.toFixed(2)} adjusted=${r.final.adjusted.toFixed(2)} cap=${r.final.cap} classification=${r.classification} robustScore=${(top.robustScore||0).toFixed(2)}/10`);
       }

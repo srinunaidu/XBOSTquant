@@ -561,6 +561,64 @@ function cyberCycle(src, alpha){
   }
   return out;
 }
+// ---------- Regime-first DSP (Ehlers): Hilbert dominant cycle + InstantTrend ----------
+// All outputs causal (bar i uses only bars ≤ i). NaN = warmup.
+function hilbertDC(close){
+  // Ehlers Hilbert-Transformer dominant cycle. period ∈ [6,50] clamped with
+  // rate limiting (1.5×/0.67× per bar) + 0.25/0.75 smoothing, exactly per the
+  // reference formulation (fixed coefficients — no time-growing factors).
+  const n=close.length, period=new Float64Array(n).fill(NaN), mode=new Int8Array(n);
+  const sm=new Float64Array(n), det=new Float64Array(n);
+  const I1=new Float64Array(n), Q1=new Float64Array(n);
+  const jI=new Float64Array(n), jQ=new Float64Array(n);
+  const I2=new Float64Array(n).fill(0), Q2=new Float64Array(n).fill(0);
+  const Re=new Float64Array(n).fill(0), Im=new Float64Array(n).fill(0);
+  let prevPeriod=0;
+  for(let i=0;i<n;i++){
+    sm[i]=i>=3?(close[i]+2*close[i-1]+2*close[i-2]+close[i-3])/6:close[i];
+    if(i<6)continue;
+    det[i]=0.0962*sm[i]+0.5769*sm[i-2]-0.5769*sm[i-4]-0.0962*sm[i-6];
+    Q1[i]=0.0962*det[i]+0.5769*det[i-2]-0.5769*det[i-4]-0.0962*det[i-6];
+    I1[i]=det[i-3];
+    jI[i]=0.0962*I1[i]+0.5769*I1[i-2]-0.5769*I1[i-4]-0.0962*I1[i-6];
+    jQ[i]=0.0962*Q1[i]+0.5769*Q1[i-2]-0.5769*Q1[i-4]-0.0962*Q1[i-6];
+    const i2v=I1[i]-jQ[i], q2v=Q1[i]+jI[i];
+    I2[i]=0.2*i2v+0.8*I2[i-1]; Q2[i]=0.2*q2v+0.8*Q2[i-1];
+    Re[i]=0.2*(I2[i]*I2[i-1]+Q2[i]*Q2[i-1])+0.8*Re[i-1];
+    Im[i]=0.2*(I2[i]*Q2[i-1]-Q2[i]*I2[i-1])+0.8*Im[i-1];
+    if(Re[i]!==0&&Im[i]!==0){
+      let p=6.2831853/Math.atan(Im[i]/Re[i]);
+      if(p>1.5*prevPeriod&&prevPeriod>0)p=1.5*prevPeriod;
+      if(p<0.67*prevPeriod&&prevPeriod>0)p=0.67*prevPeriod;
+      p=Math.min(50,Math.max(6,p));
+      p=0.25*p+0.75*(prevPeriod||p);
+      period[i]=p;prevPeriod=p;
+      mode[i]=Math.abs(p-(period[i-1]||p))<2?1:0; // 1 = stable cycle (trendable), 0 = shifting
+    }
+  }
+  return {period,mode};
+}
+function itrend(close, alpha){
+  // Ehlers Instantaneous Trendline: high-pass → SuperSmoother → 4-bar average.
+  // trend = zero-lag line, trigger = its 1-bar lag; direction = trend vs trigger.
+  const n=close.length, trend=new Float64Array(n).fill(NaN), trig=new Float64Array(n).fill(NaN);
+  alpha=Math.min(0.3,Math.max(0.01,alpha==null?0.07:alpha));
+  const a1=(1-alpha/2)*(1-alpha/2), b1=2*(1-alpha), c1=(1-alpha)*(1-alpha), k=(1+a1-b1-c1)/4;
+  const hp=new Float64Array(n), ss=new Float64Array(n);
+  const sa=Math.exp(-1.414*3.14159/10), sb=2*sa*Math.cos(1.414*3.14159/10), sc=sa*sa, ck=(1+sb+sc)/4;
+  for(let i=0;i<n;i++){
+    hp[i]=i>=2?k*(close[i]-2*close[i-1]+close[i-2])+b1*hp[i-1]-c1*hp[i-2]:0;
+    ss[i]=i>=2?ck*(hp[i]+hp[i-1])+sb*ss[i-1]-sc*ss[i-2]:0;
+    if(i>=3){trend[i]=(ss[i]+2*ss[i-1]+ss[i-2])/4;trig[i]=(ss[i-1]+2*ss[i-2]+(i>=3?ss[i-3]:ss[i-2]))/4;}
+  }
+  return {trend,trig};
+}
+function adaptivePeriod(base, cycle, min, max){
+  // Cycle-adaptive lookback: len = clamp(round(cycle/2)). Falls back to base
+  // when no cycle estimate exists. Zero free parameters beyond base.
+  if(cycle==null||isNaN(cycle)||cycle<4)return Math.round(base);
+  return Math.max(min,Math.min(max,Math.round(cycle/2)));
+}
 function vwma(close, vol, p){
   // Volume-Weighted MA: Σ(price·vol)/Σvol over p bars
   const n=close.length,out=new Float64Array(n).fill(NaN);
@@ -704,6 +762,55 @@ function buildSignals(d, cfg){
     const fz=fvgZones(d,P.maxZones||5,P.mitAge||60);
     osc={fvgBias:Array.from(fz.bias)};
     for(let i=0;i<n;i++)pos[i]=fz.bias[i]; // +1 tap bull zone, -1 tap bear zone, else flat
+  } else if(ind==='HilbertDC'){
+    // Dominant-cycle overlay: cycle period + trend/cycle mode. Directional
+    // companion is ITrend; this leg alone holds flat (overlay only).
+    const hc=hilbertDC(d.c);
+    overlay={cyclePeriod:hc.period,cycleMode:Array.from(hc.mode)};
+    for(let i=0;i<n;i++){if(isNaN(hc.period[i]))continue;pos[i]=0;}
+  } else if(ind==='ITrend'){
+    // Ehlers InstantTrend: long when zero-lag line > its trigger.
+    const t=itrend(d.c,P.alpha??0.07);
+    overlay={itrend:t.trend,itrigger:t.trig};
+    for(let i=0;i<n;i++){if(isNaN(t.trend[i])||isNaN(t.trig[i]))continue;pos[i]=t.trend[i]>t.trig[i]?1:-1;}
+  } else if(ind==='AdaptRSI'){
+    // Cycle-adaptive RSI: length = clamp(round(cycle/2)) from Hilbert DC,
+    // gated to range/cycle mode (mode==0); holds last pos otherwise.
+    const hc=hilbertDC(d.c);
+    const ra=new Float64Array(n).fill(NaN);
+    osc={rsi:ra};
+    const os=P.oversold??30, ob=P.overbought??70, base=P.baseLen||14;
+    for(let i=0;i<n;i++){
+      if(i<30)continue; // Hilbert settle quarantine (period estimates unreliable before bar 30)
+      const cyc=isNaN(hc.period[i])?null:hc.period[i];
+      const len=cyc==null?Math.round(base):Math.max(2,Math.min(50,Math.round(cyc/2)));
+      if(i<len)continue;
+      // Wilder RSI at adaptive length, computed causally on the window
+      let g=0,l=0;
+      for(let j=i-len+1;j<=i;j++){const ch=d.c[j]-d.c[j-1];if(ch>0)g+=ch;else l-=ch;}
+      const rs=l===0?100:g/Math.max(l,1e-12);
+      ra[i]=100-100/(1+rs);
+      if(hc.mode[i]===0){pos[i]=i>0?pos[i-1]:0;continue;}
+      if(ra[i]<os)pos[i]=1;else if(ra[i]>ob)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='AdaptBB'){
+    // Cycle-adaptive Bollinger: length follows the dominant cycle; %B
+    // extremes faded only in cycle mode, trend bars hold.
+    const hc=hilbertDC(d.c), base=P.baseLen||20, mult=P.mult||2;
+    for(let i=0;i<n;i++){
+      if(i<30)continue; // Hilbert settle quarantine (period estimates unreliable before bar 30)
+      const cyc=isNaN(hc.period[i])?null:hc.period[i];
+      const len=cyc==null?Math.round(base):Math.max(10,Math.min(50,Math.round(cyc)));
+      if(i<len)continue;
+      if(cyc!=null&&hc.mode[i]===0){pos[i]=i>0?pos[i-1]:0;continue;}
+      let s=0,s2=0;
+      for(let j=i-len+1;j<=i;j++){s+=d.c[j];s2+=d.c[j]*d.c[j];}
+      const m=s/len, sd=Math.sqrt(Math.max(0,s2/len-m*m));
+      const up=m+mult*sd, lo=m-mult*sd;
+      const pb=(d.c[i]-lo)/Math.max(1e-12,up-lo);
+      if(pb>0.8)pos[i]=-1;else if(pb<0.2)pos[i]=1;else pos[i]=i>0?pos[i-1]:0;
+    }
+    overlay={adBBLen:base,adBBMult:mult};
   } else if(ind==='Regime'){
     // Volatility gate: trend-follow EMA only when Choppiness < gate, else flat
     const ch=choppiness(d.h,d.l,d.c,P.chopPeriod||14);
@@ -828,13 +935,50 @@ const ROUTER={
   VWAP:[2,3],VWAPBands:[2,3],VWAPRev:[2,3],
   Keltner:[0,1,2],Squeeze:[0,1,2],SqueezeBreak:[0,1,2],ChandeKroll:[0,1,2],
   POC:[2,3],FVG:[2,3],Cyber:[2,3],
-  Chop:[0,1,2,3],Regime:[0,1,2,3]
+  Chop:[0,1,2,3],Regime:[0,1,2,3],
+  ITrend:[0,1],HilbertDC:[0,1,2,3],AdaptRSI:[2,3],AdaptBB:[2,3]
 };
 function regimeMask(regimes, indicator){
   const allow=ROUTER[indicator];
   const n=regimes.length, out=new Int8Array(n);
   if(!allow){out.fill(1);return out;}
   for(let i=0;i<n;i++)out[i]=allow.indexOf(regimes[i])>=0?1:0;
+  return out;
+}
+// ---------- Router v2: persistence + hysteresis (anti flip-flop) ----------
+// smoothRegime: a regime label must persist `persist` bars before it is
+// confirmed; after any confirmed switch, the next switch costs an extra
+// `hysteresis` bars. Bars inside an unconfirmed transition keep the last
+// confirmed label (never 0/flat — transitions hold, they don't blank).
+// applyMaskPersistence: suppress isolated allow-runs shorter than minBars in
+// a 0/1 trade mask (kills single-bar flicker entries).
+function smoothRegime(regimes, persist, hysteresis){
+  persist=Math.max(1,Math.round(persist||5));hysteresis=Math.max(0,Math.round(hysteresis||2));
+  const n=regimes.length, out=new Int8Array(n);
+  if(!n)return out;
+  let confirmed=regimes[0], need=persist, contender=-999, run=0;
+  for(let i=0;i<n;i++){
+    const r=regimes[i];
+    if(r===confirmed){contender=-999;run=0;}
+    else{
+      if(r!==contender){contender=r;run=1;}else run++;
+      if(run>=need){confirmed=r;need=persist+hysteresis;contender=-999;run=0;}
+    }
+    out[i]=confirmed;
+  }
+  return out;
+}
+function applyMaskPersistence(mask, minBars){
+  minBars=Math.max(1,Math.round(minBars||3));
+  const n=mask.length, out=Int8Array.from(mask);
+  let i=0;
+  while(i<n){
+    if(out[i]===1){
+      let j=i;while(j<n&&out[j]===1)j++;
+      if(j-i<minBars)for(let k=i;k<j;k++)out[k]=0;
+      i=j;
+    } else i++;
+  }
   return out;
 }
 
@@ -1404,6 +1548,10 @@ const SCHEMA={
   SqueezeBreak:[{key:'period',min:5,max:40,def:20},{key:'bbMult',min:1,max:3,def:2},{key:'kcMult',min:1,max:3,def:1.5},{key:'volMult',min:1,max:4,def:2},{key:'ckMult',min:1,max:5,def:3}],
   TrendRegime:[{key:'chopPeriod',min:7,max:40,def:14},{key:'gate',min:40,max:80,def:55},{key:'stMult',min:1,max:5,def:3},{key:'macdFast',min:5,max:20,def:12}],
   VWAPRev:[{key:'sd1',min:0.5,max:3,def:1.5},{key:'sd2',min:1,max:4,def:2},{key:'cmoPeriod',min:3,max:20,def:5},{key:'cmoOS',min:-70,max:0,def:-50},{key:'cmoOB',min:0,max:70,def:50}],
+  HilbertDC:[],
+  ITrend:[{key:'alpha',min:0.03,max:0.15,def:0.07}],
+  AdaptRSI:[{key:'baseLen',min:8,max:21,def:14},{key:'oversold',min:10,max:40,def:30},{key:'overbought',min:60,max:90,def:70}],
+  AdaptBB:[{key:'baseLen',min:15,max:30,def:20},{key:'mult',min:1,max:3,def:2}],
 };
 
 function cartesian(arrays){
@@ -1465,6 +1613,204 @@ function cfgKey(c){
   return c.timeframe+'|'+c.indicator+'|'+JSON.stringify(c.params)+'|'+(c.slPct||'')+'|'+(c.tpPct||'')+'|'+(c.exit||'fixed')+'|'+(c.carry?1:0);
 }
 
+function cfgKey(c){
+  return c.timeframe+'|'+c.indicator+'|'+JSON.stringify(c.params)+'|'+(c.slPct||'')+'|'+(c.tpPct||'')+'|'+(c.exit||'fixed')+'|'+(c.carry?1:0);
+}
+
+// ---------- Low-discrepancy (Halton) grid sampling ----------
+// Covers the SAME Cartesian space as buildGrid with N quasi-random points
+// instead of the full product. Deterministic (no seed needed): radical-inverse
+// in the first K primes, one prime per flattened axis. We use Halton rather
+// than Sobol deliberately — Sobol needs published direction-number tables to
+// be correct, Halton is correct by construction.
+const HALTON_BASES=[2,3,5,7,11,13,17,19,23,29,31,37,41,43,47,53];
+function haltonIndex(i, base){
+  let f=1,r=0;
+  while(i>0){f/=base;r+=f*(i%base);i=Math.floor(i/base);}
+  return r;
+}
+function haltonSequence(nPoints, dims){
+  const pts=[];
+  for(let i=0;i<nPoints;i++){
+    const row=[];
+    for(let d=0;d<dims;d++)row.push(haltonIndex(i+1,HALTON_BASES[d%HALTON_BASES.length]));
+    pts.push(row);
+  }
+  return pts;
+}
+function buildHaltonGrid(selected, risk, dims, nPoints){
+  // Same inputs as buildGrid; returns {combos, axes} where each of the
+  // nPoints combos picks axis values by Halton coordinate (low-discrepancy
+  // coverage of the full Cartesian space). Deterministic.
+  nPoints=Math.max(16,Math.round(nPoints||256));
+  const slVals=(risk&&risk.sl&&risk.sl.length)?risk.sl:[null];
+  const tpVals=(risk&&risk.tp&&risk.tp.length)?risk.tp:[null];
+  const trailVals=(risk&&risk.trail&&risk.trail.length)?risk.trail:[null];
+  const exits=(dims&&dims.exits&&dims.exits.length)?dims.exits:['fixed'];
+  const carrys=(dims&&dims.carry&&dims.carry.length)?dims.carry:[false];
+  // Flatten every searchable axis (indicator params + tf + sl/tp/trail/exit/carry)
+  const axes=[];
+  for(const s of selected){
+    const schema=SCHEMA[s.indicator]||[];
+    const paxes=schema.map(p=>{
+      const r=(s.ranges&&s.ranges[p.key])||{min:p.def,max:p.def,step:1};
+      return {kind:'param',ind:s.indicator,key:p.key,vals:expandRange(+r.min,+r.max,+r.step||1)};
+    });
+    axes.push({ind:s.indicator,tfs:(s.timeframes||[5]).slice(),paxes});
+  }
+  // Per-indicator Halton draw (axes differ per indicator, so sample per block)
+  const combos=[];
+  const per=Math.max(8,Math.floor(nPoints/Math.max(1,axes.length)));
+  axes.forEach((blk,bi)=>{
+    const flat=[...blk.paxes.map(a=>({kind:'param',key:a.key,vals:a.vals})),{kind:'tf',vals:blk.tfs},{kind:'sl',vals:slVals},{kind:'tp',vals:tpVals},{kind:'trail',vals:trailVals},{kind:'exit',vals:exits},{kind:'carry',vals:carrys}];
+    const seq=haltonSequence(per,flat.length);
+    for(const row of seq){
+      const params={};let tf=blk.tfs[0],sl=null,tp=null,tr=null,ex='fixed',cy=false;
+      flat.forEach((ax,ai)=>{
+        const v=ax.vals[Math.min(ax.vals.length-1,Math.floor(row[(ai+bi*3)%row.length]*ax.vals.length))];
+        if(ax.kind==='param')params[ax.key]=v;
+        else if(ax.kind==='tf')tf=v;else if(ax.kind==='sl')sl=v;else if(ax.kind==='tp')tp=v;
+        else if(ax.kind==='trail')tr=v;else if(ax.kind==='exit')ex=v;else cy=v;
+      });
+      const c={timeframe:tf,indicator:blk.ind,params,exit:ex,carry:cy};
+      if(sl!=null)c.slPct=sl;if(tp!=null)c.tpPct=tp;if(tr!=null)c.trailPct=tr;
+      combos.push(c);
+    }
+  });
+  // Halton draws with replacement: dedup so small spaces don't waste evals.
+  const seen=new Set(), uniq=[];
+  for(const c of combos){const k=cfgKey(c);if(seen.has(k))continue;seen.add(k);uniq.push(c);}
+  return uniq;
+}
+
+// ---------- Purged / embargoed walk-forward folds (index space) ----------
+// nSplits anchored folds over n bars: train grows [0,trainEnd), test follows
+// after a purge gap, shortened by an embargo tail. Train and test NEVER share
+// or touch bars — prevents leakage from indicator warmup/ATR windows.
+function purgedFolds(n, nSplits, purgeBars, embargoBars){
+  nSplits=Math.max(1,Math.round(nSplits||5));
+  purgeBars=Math.max(0,Math.round(purgeBars||0));embargoBars=Math.max(0,Math.round(embargoBars||0));
+  const folds=[], foldSize=Math.floor(n/(nSplits+1));
+  for(let f=0;f<nSplits;f++){
+    const trainEnd=(f+1)*foldSize;
+    const testStart=trainEnd+purgeBars;
+    const testEnd=Math.min(testStart+foldSize-embargoBars,n);
+    if(testStart<testEnd&&trainEnd>50)folds.push({train:[0,trainEnd],test:[testStart,testEnd]});
+  }
+  return folds;
+}
+
+// ---------- Bayesian refinement (GP-EI proposals over evaluated rows) ----------
+// Pure function: fits a Matérn-5/2 GP on ALREADY-EVALUATED rows (no new
+// backtests inside) and proposes nPropose new combos maximising Expected
+// Improvement via random-search over the EI surface. Caller evaluates the
+// proposals with the normal testCfg path. Deterministic given rows.
+function _m52(a,b,ls){
+  let s=0;for(let i=0;i<a.length;i++){const d=Math.abs(a[i]-b[i])/ls;s+=d*d;}
+  const r=Math.sqrt(5*s);return (1+r+r*r/3)*Math.exp(-r);
+}
+function _chol(A){
+  const n=A.length,L=A.map(r=>r.slice());
+  for(let i=0;i<n;i++)for(let j=0;j<=i;j++){
+    let s=A[i][j];for(let k=0;k<j;k++)s-=L[i][k]*L[j][k];
+    L[i][j]=i===j?Math.sqrt(Math.max(1e-12,s)):s/L[j][j];
+  }
+  return L;
+}
+function _cholSolve(L,b){
+  const n=L.length,y=new Array(n),x=new Array(n);
+  for(let i=0;i<n;i++){let s=b[i];for(let j=0;j<i;j++)s-=L[i][j]*y[j];y[i]=s/L[i][i];}
+  for(let i=n-1;i>=0;i--){let s=y[i];for(let j=i+1;j<n;j++)s-=L[j][i]*x[j];x[i]=s/L[i][i];}
+  return x;
+}
+function _nPdf(z){return Math.exp(-0.5*z*z)/Math.sqrt(2*Math.PI);}
+function _nCdf(z){
+  const s=z<0?-1:1,a=Math.abs(z),t=1/(1+0.3275911*a);
+  const y=1-((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-a*a);
+  return 0.5*(1+s*y);
+}
+function bayesianRefine(rows, stepsByInd, nPropose){
+  // rows: evaluated BoardRows with .m.sharpe. Returns NEW cfg objects
+  // (caller must testCfg them). Rows with <10 trades are ignored.
+  nPropose=Math.max(4,Math.round(nPropose||24));
+  const pool=rows.filter(r=>r.m&&r.m.totalTrades>=10);
+  if(pool.length<6)return [];
+  // Group by (indicator,timeframe,exit,carry); refine the best group only
+  // (keeps the proposal space coherent — no cross-indicator vectors).
+  const groups={};
+  for(const r of pool){const k=r.indicator+'|'+r.timeframe+'|'+(r.exit||'fixed')+'|'+(r.carry?1:0);(groups[k]=groups[k]||[]).push(r);}
+  let best=null;
+  for(const k of Object.keys(groups)){const g=groups[k].sort((a,b)=>b.m.sharpe-a.m.sharpe);if(!best||g[0].m.sharpe>best[0].m.sharpe)best=g;}
+  const top=best.slice(0,Math.min(40,best.length));
+  const keys=Object.keys(top[0].params||{}).filter(k=>typeof top[0].params[k]==='number');
+  if(!keys.length)return [];
+  const lo={},hi={};
+  for(const k of keys){
+    const vs=top.map(r=>r.params[k]);
+    lo[k]=Math.min(...vs);hi[k]=Math.max(...vs);
+    if(!(hi[k]>lo[k])){hi[k]=lo[k]+Math.abs(lo[k]||1)*0.2+1e-9;}
+  }
+  const norm=r=>keys.map(k=>(r.params[k]-lo[k])/(hi[k]-lo[k]));
+  const X=top.map(norm), y=top.map(r=>r.m.sharpe), yMax=Math.max(...y);
+  const K=X.map((a,i)=>X.map((b,j)=>_m52(a,b,0.5)+(i===j?1e-6:0)));
+  const L=_chol(K), alpha=_cholSolve(L,y);
+  const predict=v=>{
+    const ks=X.map(a=>_m52(a,v,0.5));
+    let mean=0;for(let i=0;i<ks.length;i++)mean+=alpha[i]*ks[i];
+    const w=_cholSolve(L,ks);
+    let vs=1;for(let i=0;i<w.length;i++)vs-=w[i]*w[i];
+    return {mean,sd:Math.sqrt(Math.max(1e-12,vs))};
+  };
+  // Deterministic candidate lattice: reuse a Halton draw, not Math.random
+  const cand=haltonSequence(400,keys.length);
+  const scored=cand.map(v=>{
+    const {mean,sd}=predict(v);
+    const z=(mean-yMax)/Math.max(1e-9,sd);
+    return {v,ei:sd*(z*_nCdf(z)+_nPdf(z))};
+  }).sort((a,b)=>b.ei-a.ei);
+  const seen=new Set(top.map(r=>JSON.stringify(r.params)));
+  const out=[];
+  const steps=stepsByInd[top[0].indicator]||{};
+  for(const s of scored){
+    if(out.length>=nPropose)break;
+    const params={};
+    keys.forEach((k,i)=>{
+      let v=lo[k]+s.v[i]*(hi[k]-lo[k]);
+      const st=steps[k]||0; // snap to grid step when known
+      if(st>0)v=Math.round(v/st)*st;
+      params[k]=+v.toFixed(6);
+    });
+    const k=JSON.stringify(params);
+    if(seen.has(k))continue;seen.add(k);
+    const c={timeframe:top[0].timeframe,indicator:top[0].indicator,params,exit:top[0].exit||'fixed',carry:!!top[0].carry,refined:true};
+    if(top[0].slPct!=null)c.slPct=top[0].slPct;
+    if(top[0].tpPct!=null)c.tpPct=top[0].tpPct;
+    if(top[0].trailPct!=null)c.trailPct=top[0].trailPct;
+    out.push(c);
+  }
+  if(!out.length){
+    // Degenerate space (all EI candidates already evaluated): fall back to
+    // ±1-step neighbors of the best row so callers always get proposals.
+    const b=top[0], st=stepsByInd[b.indicator]||{};
+    for(const k of keys){
+      const step=st[k]||((hi[k]-lo[k])/10)||1;
+      for(const dir of [-1,1]){
+        if(out.length>=nPropose)break;
+        const params=Object.assign({},b.params);
+        params[k]=+(params[k]+dir*step).toFixed(6);
+        const kk=JSON.stringify(params);
+        if(seen.has(kk))continue;seen.add(kk);
+        const c={timeframe:b.timeframe,indicator:b.indicator,params,exit:b.exit||'fixed',carry:!!b.carry,refined:true};
+        if(b.slPct!=null)c.slPct=b.slPct;
+        if(b.tpPct!=null)c.tpPct=b.tpPct;
+        if(b.trailPct!=null)c.trailPct=b.trailPct;
+        out.push(c);
+      }
+    }
+  }
+  return out;
+}
+
 function buildGrid(selected, risk, dims){
   // selected: [{indicator, ranges:{key:{min,max,step}}}, ...], timeframes:[...]
   // risk: {sl:[...], tp:[...], trail:[...]} — stop/target are searched per timeframe+indicator
@@ -1513,7 +1859,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);
