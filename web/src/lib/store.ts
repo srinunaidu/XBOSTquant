@@ -88,6 +88,9 @@ type State = {
   costMode: string;
   minTradesBoard: number;
   sigSource: string;
+  scoreW: Record<string, number>;
+  sampleT: { ins: number; exp: number; dev: number };
+  paperMinTrades: number;
   detail: Detail;
   view: 'all' | 'best' | 'cmp' | 'res';
   researchObj: string;
@@ -164,6 +167,9 @@ export const useStore = create<State>((set) => ({
   costMode: 'realistic',
   minTradesBoard: 0,
   sigSource: 'prices',
+  scoreW: { ret: 0.25, winExp: 0.20, pf: 0.15, sample: 0.15, risk: 0.15, sharpe: 0.10 },
+  sampleT: { ins: 10, exp: 20, dev: 30 },
+  paperMinTrades: 200,
   view: 'all',
   researchObj: 'netPnL',
   boardFilter: '',

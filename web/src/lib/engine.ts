@@ -33,6 +33,7 @@ export type BoardRow = {
   robustScore?: number; robustness?: any;
   rawRank?: number; rawObjective?: { key: string; value: number };
   pair?: boolean;
+  compositeScore?: { composite: number; parts: Record<string, number>; sharpeRaw: number; sharpeAdj: number; tier: string; reliability: string; n: number } | null;
   oosSharpe?: number | null; oosDegr?: number | null;
 };
 
@@ -71,6 +72,13 @@ export interface Engine {
   researchValue(m: any, key: string): number;
   researchCmp(key: string): (a: BoardRow, b: BoardRow) => number;
   auditRankingIntegrity(allRows: BoardRow[], displayed: BoardRow[]): { objective: string; key: string; pass: boolean; maxRow: string | null; maxValue: number | null; displayed: string | null }[];
+  SCORE_DEF: { weights: Record<string, number>; sampleK: number; ddScale: number; sharpeCap: number; shrK: number; tiers: { insufficient: number; exploratory: number; developing: number } };
+  sampleTier(n: number, tiers?: { insufficient: number; exploratory: number; developing: number }): string;
+  sharpeAdj(sharpeRaw: number, n: number, shrK?: number): number;
+  sharpeReliability(n: number): string;
+  strategyScore(m: any, over?: any): { composite: number; parts: Record<string, number>; sharpeRaw: number; sharpeAdj: number; tier: string; reliability: string; n: number };
+  rankableScore(m: any, over?: any): { composite: number } | null;
+  paretoFrontier(rows: BoardRow[], keys?: [string, number][]): BoardRow[];
   IST_OFFSET_MS: number;
   istParts(t: number): { h: number; m: number; y: number; mo: number; day: number };
   istDayKey(t: number): string;

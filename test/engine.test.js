@@ -754,3 +754,82 @@ test('refine respects declared SCHEMA ranges (never walks out)', () => {
     assert.ok(r.params.oversold >= 10 && r.params.oversold <= 40, 'oversold in schema');
   }
 });
+
+test('composite A: n=2 Sharpe-1500 monster cannot become rankable', () => {
+  const A = { netPnL: 5, totalTrades: 2, winRate: 100, expectancy: 2.5, profitFactor: 99.99, sharpe: 1500, maxDD: -0.5, grossProfit: 65, grossLoss: 60 };
+  const B = { netPnL: 100, totalTrades: 50, winRate: 62, expectancy: 2, profitFactor: 2.1, sharpe: 4, maxDD: -8, grossProfit: 200, grossLoss: 100 };
+  const sA = E.strategyScore(A), sB = E.strategyScore(B);
+  assert.equal(sA.tier, 'INSUFFICIENT');
+  assert.equal(E.rankableScore(A), null, 'thin monster not rankable');
+  assert.ok(E.rankableScore(B) !== null, 'solid candidate rankable');
+  assert.ok(sA.reliability === 'LOW' && sB.reliability === 'HIGH');
+  assert.ok(sA.sharpeAdj < 100, `shrunk adj=${sA.sharpeAdj} (raw 1500)`);
+});
+
+test('composite B: FVG-type stays visible, correctly tiered, never discarded', () => {
+  const F = { netPnL: 21.54, totalTrades: 6, winRate: 83.3, expectancy: 3.59, profitFactor: 5, sharpe: 8, maxDD: -2, grossProfit: 25, grossLoss: 3.46 };
+  const s = E.strategyScore(F);
+  assert.equal(s.tier, 'INSUFFICIENT');
+  assert.equal(E.rankableScore(F), null);
+  assert.ok(s.composite > 0.5, `balanced thin scores well raw (${s.composite})`);
+  assert.ok(isFinite(s.composite) && s.composite <= 1, 'bounded');
+});
+
+test('composite C: all-thin set yields no rankable selection', () => {
+  const rows = [2, 5, 7].map((n, i) => ({
+    i, m: { netPnL: 10 + i, totalTrades: n, winRate: 80, expectancy: 2, profitFactor: 3, sharpe: 100 * (i + 1), maxDD: -1, grossProfit: 20, grossLoss: 5 },
+  }));
+  const rankable = rows.filter(r => E.rankableScore(r.m) !== null);
+  assert.equal(rankable.length, 0, 'BEST_RANKABLE_COMPOSITE = NONE');
+  const scored = rows.map(r => E.strategyScore(r.m));
+  assert.ok(scored.every(s => s.tier === 'INSUFFICIENT'), 'all labelled thin, all retained');
+});
+
+test('composite D: Sharpe explosion cannot reorder a decided set', () => {
+  const mk = (pnl, n, wr, sh) => ({ netPnL: pnl, totalTrades: n, winRate: wr, expectancy: pnl / n, profitFactor: 2, sharpe: sh, maxDD: -5, grossProfit: pnl > 0 ? pnl * 1.5 : 0, grossLoss: pnl > 0 ? pnl * 0.5 : 10 });
+  const set = [mk(500, 120, 58, 3.2), mk(200, 60, 55, 2.4), mk(80, 40, 52, 1.8)];
+  const ord1 = set.map((m, i) => [E.strategyScore(m).composite, i]).sort((a, b) => b[0] - a[0]).map(x => x[1]);
+  const setX = [mk(500, 120, 58, 320), mk(200, 60, 55, 240), mk(80, 40, 52, 180)];
+  const ord2 = setX.map((m, i) => [E.strategyScore(m).composite, i]).sort((a, b) => b[0] - a[0]).map(x => x[1]);
+  assert.deepEqual(ord1, ord2, 'x100 Sharpe keeps order (winsorization contains it)');
+  assert.equal(ord1[0], 0, 'leader leads on merit, not Sharpe alone');
+});
+
+test('composite E: deterministic score/rank/pareto/tier', () => {
+  const m = { netPnL: 300, totalTrades: 80, winRate: 60, expectancy: 3.75, profitFactor: 2.4, sharpe: 5.5, maxDD: -6, grossProfit: 480, grossLoss: 180 };
+  const a = E.strategyScore(m), b = E.strategyScore(m);
+  assert.deepEqual(a, b);
+  assert.equal(E.sampleTier(80), E.sampleTier(80));
+  const rows = [0, 1, 2].map(i => ({ i, m: Object.assign({}, m, { netPnL: 300 - i * 50 }) }));
+  const p1 = E.paretoFrontier(rows).map(r => r.i);
+  const p2 = E.paretoFrontier(rows).map(r => r.i);
+  assert.deepEqual(p1, p2, 'pareto deterministic');
+});
+
+test('pareto: dominated rows excluded, trade-offs retained, no ranks', () => {
+  const R = (pnl, wr, n, dd) => ({ m: { netPnL: pnl, winRate: wr, totalTrades: n, expectancy: 1, profitFactor: 2, sharpe: 2, maxDD: dd } });
+  const rows = [
+    Object.assign({ i: 0 }, R(100, 60, 50, -5)),   // dominated by row 1 (better everywhere)
+    Object.assign({ i: 1 }, R(200, 70, 60, -4)),   // frontier
+    Object.assign({ i: 2 }, R(150, 90, 20, -3)),   // frontier (best WR)
+    Object.assign({ i: 3 }, R(50, 40, 30, -20)),   // dominated
+  ];
+  const f = E.paretoFrontier(rows).map(r => r.i);
+  assert.ok(f.includes(1) && f.includes(2), 'trade-offs retained: ' + f);
+  assert.ok(!f.includes(0) && !f.includes(3), 'dominated excluded: ' + f);
+});
+
+test('tiers: configurable cutoffs drive rankability, reliability scale', () => {
+  assert.equal(E.sampleTier(5), 'INSUFFICIENT');
+  assert.equal(E.sampleTier(15), 'EXPLORATORY');
+  assert.equal(E.sampleTier(25), 'DEVELOPING');
+  assert.equal(E.sampleTier(30), 'RANKABLE');
+  assert.equal(E.sampleTier(9, { insufficient: 5, exploratory: 8, developing: 12 }), 'DEVELOPING', 'custom cutoffs apply');
+  assert.equal(E.sampleTier(15, { insufficient: 5, exploratory: 8, developing: 12 }), 'RANKABLE', 'custom rankable');
+  assert.equal(E.sharpeReliability(5), 'LOW');
+  assert.equal(E.sharpeReliability(15), 'MEDIUM');
+  assert.equal(E.sharpeReliability(100), 'HIGH');
+  const m = { netPnL: 10, totalTrades: 25, winRate: 60, expectancy: 0.4, profitFactor: 1.5, sharpe: 2, maxDD: -3, grossProfit: 20, grossLoss: 10 };
+  assert.equal(E.rankableScore(m), null, 'default developing not rankable');
+  assert.ok(E.rankableScore(m, { tiers: { insufficient: 10, exploratory: 20, developing: 25 } }) !== null, 'custom developing rankable');
+});

@@ -716,6 +716,20 @@ export async function runGrid() {
     audit.forEach(a => logLine(`  rank[${a.objective}]: ${a.pass ? 'PASS' : 'FAIL'} max=${a.maxValue} @${(a.maxRow || '').slice(0, 60)}`));
     logLine(fails.length ? `RANKING_INTEGRITY = FAIL (${fails.map(f => f.objective).join(',')})` : 'RANKING_INTEGRITY = PASS (5/5 objectives)');
   } catch (e: any) { logLine('ranking audit skipped: ' + (e?.message || e)); }
+  // Score config from store (weights + tier cutoffs are user-configurable).
+  // Composite post-pass (shared worker + fallback paths): attaches
+  // RANKABLE_METRICS (composite/tier/reliability) to every board row.
+  try {
+    const sst = useStore.getState();
+    const cfg: any = {
+      weights: sst.scoreW,
+      tiers: { insufficient: sst.sampleT.ins, exploratory: sst.sampleT.exp, developing: sst.sampleT.dev },
+    };
+    for (const r of top) {
+      try { r.compositeScore = engine.strategyScore(r.m, cfg); }
+      catch { (r as any).compositeScore = null; }
+    }
+  } catch (e: any) { logLine('composite pass skipped: ' + (e?.message || e)); }
   // Knife-edge demotion (uniform across worker + fallback paths): PSS ≥ 0.5
   // sinks below every clean row. Reuses worker robustness evidence when
   // present; otherwise probes PSS directly (session filter off — curvature
@@ -946,10 +960,11 @@ export async function runGrid() {
   if (bd.length && !s4.userPickedSeq) selectRow(bd[0], true);
   // PAPER verdict for the champion (logged every run, regardless of adaptive).
   if (bd.length && !stopped) {
-    const gate = engine.paperEligible(bd[0], { scoreThreshold: s4.paperThreshold ?? 9.5, cost: opts.cost, allowZeroCost: opts.costMode === 'signal' });
+    const gate = engine.paperEligible(bd[0], { scoreThreshold: s4.paperThreshold ?? 9.5, cost: opts.cost, allowZeroCost: opts.costMode === 'signal', minTrades: s4.paperMinTrades ?? 200 });
     useStore.getState().set({ lastPaper: gate });
     if (gate.eligible) logLine(`PAPER: ELIGIBLE — [${bd[0].symbol}] ${bd[0].timeframe}m ${bd[0].indicator} passed all gates${(gate.warnings || []).length ? ' (warnings: ' + (gate.warnings || []).join('; ') + ')' : ''}`);
     else logLine(`PAPER: BLOCKED — ${gate.reasons.join(' · ')}`);
+    logSelection(bd);
   }
   // Adaptive tier escalation: Tier-A best must clear the HARD gate
   // (Sharpe base + robustness + surrogate + PSS + OOS), not raw Sharpe.
@@ -976,6 +991,47 @@ export async function runGrid() {
       logLine(`Adaptive: Tier ${hasTierLabel()} cleared hard gate — stopping`);
     }
   }
+}
+
+// Selection report: BEST_RANKABLE_COMPOSITE (or NONE), THIN-sample list,
+// PARETO frontier (unranked ids), RANKING WARNINGS, WHY_RANKED lines.
+// Pure discovery + honest labels — never hides rows, never manufactures.
+export function logSelection(bd: BoardRow[]) {
+  try {
+    const ranked = bd.filter(r => r.compositeScore && r.compositeScore.tier !== 'INSUFFICIENT')
+      .sort((a, b) => ((b.compositeScore || {}).composite || 0) - ((a.compositeScore || {}).composite || 0));
+    const best = ranked[0] || null;
+    if (best && best.compositeScore) {
+      const c = best.compositeScore;
+      logLine(`BEST_RANKABLE_COMPOSITE: [${best.symbol || '?'}] ${best.timeframe}m ${best.indicator} ${fmtParams(best.params)} score=${c.composite} tier=${c.tier} n=${c.n} pnl=${Math.round(best.m.netPnL)} wr=${best.m.winRate.toFixed(1)}% exp=${best.m.expectancy.toFixed(2)} pf=${best.m.profitFactor.toFixed(2)} sharpe=${best.m.sharpe.toFixed(2)}(adj ${c.sharpeAdj}) dd=${best.m.maxDD.toFixed(2)}%`);
+      const p = c.parts || {};
+      logLine(`  RANKING_BREAKDOWN: return=${p.ret} winExp=${p.winExp} pf=${p.pf} sample=${p.sample} risk=${p.risk} sharpe=${p.sharpe} → COMPOSITE=${c.composite}`);
+      logLine(`  WHY_RANKED: largest composite among ${ranked.length} rankable rows (tier≥${useStore.getState().sampleT.dev}, reliability=${c.reliability})`);
+    } else {
+      logLine('BEST_RANKABLE_COMPOSITE = NONE (no rankable rows — all INSUFFICIENT tier; see RAW discovery)');
+    }
+    const thin = bd.filter(r => !r.compositeScore || r.compositeScore.tier === 'INSUFFICIENT').slice(0, 8);
+    if (thin.length) {
+      logLine(`THIN-SAMPLE CANDIDATES (${thin.length} shown, visible NOT validated):`);
+      thin.forEach((r, i) => logLine(`  thin${i + 1}: [${r.symbol || '?'}] ${r.timeframe}m ${r.indicator} n=${r.m.totalTrades} wr=${r.m.winRate.toFixed(1)}% pnl=${Math.round(r.m.netPnL)} sharpe=${r.m.sharpe.toFixed(1)} THIN SAMPLE / NOT RANKABLE`));
+    }
+    const pareto = engine.paretoFrontier(bd.filter(r => r.m && r.m.totalTrades >= 10));
+    if (pareto.length) logLine(`PARETO CANDIDATES (${pareto.length}, unranked, n≥10): ` + pareto.slice(0, 12).map(r => `[${r.symbol || '?'}]${r.timeframe}m ${r.indicator} n=${r.m.totalTrades}`).join(' · '));
+    const warns: string[] = [];
+    bd.slice(0, 25).forEach(r => {
+      const n = r.m?.totalTrades || 0;
+      if (n > 0 && n < 30 && Math.abs(r.m?.sharpe || 0) > 20) warns.push(`SHARPE_ANNUALIZATION_WARNING: [${r.symbol || '?'}] ${r.indicator} Sharpe=${(r.m.sharpe || 0).toFixed(1)} on n=${n} (reliability LOW — ranking uses adj)`);
+      if (r.robustness && r.robustness.blockBootstrap && !r.robustness.blockBootstrap.nSamples) warns.push(`BOOTSTRAP_STATUS=SKIPPED for [${r.symbol || '?'}] ${r.indicator} (insufficient sample — never a [0,0] interval)`);
+    });
+    if (warns.length) { logLine('RANKING WARNINGS:'); warns.slice(0, 8).forEach(w => logLine('  ' + w)); }
+    if (best && best.compositeScore) {
+      const c = best.compositeScore;
+      const whyNot: string[] = [];
+      if (c.tier === 'INSUFFICIENT') whyNot.push(`n=${c.n} below rankable threshold`);
+      if (c.reliability !== 'HIGH') whyNot.push(`Sharpe reliability ${c.reliability}`);
+      logLine(whyNot.length ? `WHY_NOT_RANKED: ${whyNot.join('; ')}` : 'WHY_NOT_RANKED: n/a (champion is rankable)');
+    }
+  } catch (e: any) { logLine('selection report skipped: ' + (e?.message || e)); }
 }
 
 // Hard adaptive gate: raw Sharpe is necessary but never sufficient. With
@@ -1011,8 +1067,7 @@ export function tierGate(best: BoardRow, opts: any): { ok: boolean; lines: strin
   return { ok: base && gScore && gSurr && gPss && oosReq, lines };
 }
 
-function hasTierLabel(): string {
-  const cur = useStore.getState().inds;
+function hasTierLabel(): string {  const cur = useStore.getState().inds;
   const onTiers = new Set(Object.entries(cur).filter(([_, v]: any) => v.on).map(([k]) => IND_TIER[k]));
   return [...onTiers].sort().join('+') || '—';
 }

@@ -44,6 +44,8 @@ function rowToObj(r: BoardRow, ix: number, th: number, cost: number, signalOnly:
     paper: gate.eligible ? 'PAPER' : '—',
     paperWhy: gate.eligible ? '' : gate.reasons.join('; '),
     rawRank: r.rawRank ?? null,
+    score: r.compositeScore ? r.compositeScore.composite : null,
+    tier: r.compositeScore ? r.compositeScore.tier : '',
     _r: r,
   };
 }
@@ -104,6 +106,8 @@ const COLS = [
       : { color: '#5b5b66' }),
   },
   { field: 'rawRank', headerName: 'Raw#', width: 64, type: 'rightAligned' },
+  { field: 'score', headerName: 'Score', width: 78, type: 'rightAligned', valueFormatter: (p: any) => (p.value == null ? '' : (+p.value).toFixed(3)) },
+  { field: 'tier', headerName: 'Tier', width: 110 },
 ];
 
 export default function Leaderboard() {
@@ -140,6 +144,15 @@ export default function Leaderboard() {
       const rk = useStore.getState().researchObj || 'netPnL';
       list = [...list].sort(engine.researchCmp(rk));
     }
+    if (view === 'all') {
+      // Final-selection view: composite order, rankable rows first, thin
+      // rows retained below (visible, labelled — never hidden).
+      const isRankable = (r: BoardRow) => (r.compositeScore && r.compositeScore.tier !== 'INSUFFICIENT') ? 1 : 0;
+      list = [...list].sort((a, b) =>
+        (isRankable(b) - isRankable(a)) ||
+        (((b.compositeScore || {}).composite || 0) - ((a.compositeScore || {}).composite || 0)) ||
+        (b.m.netPnL - a.m.netPnL));
+    }
     return { rows: list.map((r, i) => rowToObj(r, i, paperThreshold ?? 9.5, costNow, signalOnly)), hidden };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [board, view, boardFilter, objective, paperThreshold, costNow, signalOnly, minTrH]);
@@ -147,7 +160,7 @@ export default function Leaderboard() {
   return (
     <section className="card p-3">
       <div className="flex flex-wrap items-center gap-2 mb-2">
-        <div className="font-display font-semibold text-[14px] tracking-tight">🏆 Master Leaderboard <span className="text-zinc-500 font-normal text-xs">— click any row to load it on the charts</span></div>
+        <div className="font-display font-semibold text-[14px] tracking-tight">🏆 Master Leaderboard <span className="text-zinc-500 font-normal text-xs">— {view === 'all' ? '★ composite-ranked final selection (thin rows retained below)' : 'click any row to load it on the charts'}</span></div>
         <div className="flex gap-1 ml-2">
           {([['all', '📋 All results'], ['best', '🏆 Best per indicator'], ['res', '🔬 Research'], ['cmp', '⚖ Compare exits']] as const).map(([v, l]) => (
             <button key={v} onClick={() => set({ view: v })}

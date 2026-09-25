@@ -2489,6 +2489,85 @@ function demoteKnifeEdge(ranked, pssOf){
 }
 
 // ---------- Research ranking: single canonical ordering ----------
+// ---------- Research scoring: multi-metric, sample-aware ----------
+// LAYER MODEL: RAW_METRICS (informational, everything calculated) →
+// RANKABLE_METRICS (composite score determines selection order) →
+// ROBUST_METRICS (validation/final selection, separate gate).
+// Sharpe is ONE 10% component, winsorized and sample-shrunk, so n=2 with
+// Sharpe 1,160 can never dominate. All transforms are absolute (no
+// run-relative percentiles) and documented below. Deterministic.
+const SCORE_DEF={
+  weights:{ret:0.25, winExp:0.20, pf:0.15, sample:0.15, risk:0.15, sharpe:0.10},
+  sampleK:30, ddScale:10, sharpeCap:20, shrK:30,
+  tiers:{insufficient:10, exploratory:20, developing:30},
+};
+function sampleTier(n, tiers){
+  tiers=tiers||SCORE_DEF.tiers;
+  if(!(n>=tiers.insufficient))return 'INSUFFICIENT';
+  if(n<tiers.exploratory)return 'EXPLORATORY';
+  if(n<tiers.developing)return 'DEVELOPING';
+  return 'RANKABLE';
+}
+function sharpeAdj(sharpeRaw, n, shrK){
+  // Empirical-Bayes-style shrinkage toward 0 (NOT a statistical estimator):
+  // factor n/(n+k) → 1 as n grows, crushes tiny n. k configurable.
+  // n=2,k=30 → 0.06 (Sharpe 1160 → 73, then winsorized); n=200 → 0.87.
+  if(typeof sharpeRaw!=='number'||!isFinite(sharpeRaw))return 0;
+  const k=shrK==null?SCORE_DEF.shrK:shrK;
+  return sharpeRaw*(Math.max(0,n)/(Math.max(0,n)+Math.max(1,k)));
+}
+function sharpeReliability(n){
+  if(n>=30)return 'HIGH';
+  if(n>=10)return 'MEDIUM';
+  return 'LOW';
+}
+function strategyScore(m, over){
+  // Components (all 0..1, monotonic, bounded):
+  // ret: R-multiple expectancy E/|avgLoss| → R/(1+R) (0 when E≤0)
+  // winExp: 50% win-rate scale + 50% positive-expectancy direction
+  // pf: profitFactor → pf/(1+pf) (0.5 at breakeven, smooth both sides)
+  // sample: n/(n+k) diminishing returns (evidence quality, not frequency)
+  // risk: 1/(1+|maxDD|/ddScale), maxDD in %
+  // sharpe: winsorized(±cap) sample-adjusted Sharpe → s/(s+2)
+  const o=Object.assign({}, SCORE_DEF, over||{});
+  const W=Object.assign({}, SCORE_DEF.weights, (over&&over.weights)||{});
+  const n=(m&&m.totalTrades)||0;
+  const wins=Math.round(((m&&m.winRate)||0)*n/100);
+  const avgLoss=(m&&n-wins>0)?(m.grossLoss||0)/Math.max(1,n-wins):0;
+  const R=(m&&m.expectancy>0&&avgLoss>0)?m.expectancy/avgLoss:0;
+  const ret=R<=0?0:R/(1+R);
+  const winExp=0.5*((m&&m.winRate||0)/100)+((m&&m.expectancy>0)?0.5:0);
+  const pf=(m&&m.profitFactor)||0;
+  const pfQ=pf<=0?0:pf/(1+pf);
+  const sample=n<=0?0:n/(n+Math.max(1,o.sampleK));
+  const dd=Math.abs((m&&m.maxDD)||0);
+  const risk=1/(1+dd/Math.max(1e-9,o.ddScale));
+  const sraw=typeof (m&&m.sharpe)==='number'?m.sharpe:0;
+  const sadj=sharpeAdj(sraw,n,o.shrK);
+  const sc=Math.max(-o.sharpeCap,Math.min(o.sharpeCap,sadj));
+  const sharpeQ=sc<=0?0:sc/(sc+2);
+  const parts={ret:+ret.toFixed(4),winExp:+winExp.toFixed(4),pf:+pfQ.toFixed(4),sample:+sample.toFixed(4),risk:+risk.toFixed(4),sharpe:+sharpeQ.toFixed(4)};
+  const composite=+(W.ret*parts.ret+W.winExp*parts.winExp+W.pf*parts.pf+W.sample*parts.sample+W.risk*parts.risk+W.sharpe*parts.sharpe).toFixed(4);
+  return {composite, parts, sharpeRaw:isFinite(sraw)?+sraw.toFixed(2):0, sharpeAdj:+sadj.toFixed(2),
+    tier:sampleTier(n,o.tiers), reliability:sharpeReliability(n), n};
+}
+function rankableScore(m, over){
+  // Selection gate: RANKABLE tier or better. Returns null when NOT_RANKABLE
+  // (row stays visible in RAW discovery, never in composite selection).
+  const s=strategyScore(m, over);
+  const tiers=(over&&over.tiers)||SCORE_DEF.tiers;
+  if(s.n<(tiers.developing==null?30:tiers.developing))return null;
+  return s;
+}
+function paretoFrontier(rows, keys){
+  // Non-dominated set over [key,dir] dims (dir=+1 maximize, -1 minimize).
+  // Returns frontier rows in input order — NO 1st/2nd/3rd ranking.
+  // Default dims: P&L, expectancy, WR, trades, PF, maxDD, Sharpe.
+  keys=keys||[['netPnL',1],['expectancy',1],['winRate',1],['totalTrades',1],['profitFactor',1],['maxDD',1],['sharpe',1]];
+  const val=(r,k)=>{const v=r.m&&r.m[k];return (typeof v==='number'&&isFinite(v))?v:-Infinity;};
+  const dom=(a,b)=>{let strictly=false;for(const [k,dir] of keys){const d=(val(a,k)-val(b,k))*dir;if(d<0)return false;if(d>0)strictly=true;}return strictly;};
+  return rows.filter(a=>!rows.some(b=>b!==a&&dom(b,a)));
+}
 // RESEARCH_OBJS: the five discovery objectives. researchValue guards NaN/
 // undefined explicitly (±Infinity never wins; -Infinity never tops).
 // Tie-break chain (explicit, deterministic): primary → netPnL → trades →
@@ -2539,7 +2618,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,strategyScore,rankableScore,paretoFrontier};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

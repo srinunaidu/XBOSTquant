@@ -107,7 +107,26 @@ export default function Sidebar() {
         </div>
         <div className="grid grid-cols-2 gap-2 mt-2">
           <Num id="minTr" label="Hide rows < N trades" value={st.minTradesBoard} onChange={(v: number) => set({ minTradesBoard: Math.max(0, v || 0) })} />
+          <Num id="paperMin" label="Paper min trades" value={st.paperMinTrades} onChange={(v: number) => set({ paperMinTrades: Math.max(10, v || 200) })} />
         </div>
+        <details className="mt-2 text-[11px] text-zinc-400">
+          <summary className="cursor-pointer text-zinc-500">composite score weights + sample tiers (research selection)</summary>
+          <div className="grid grid-cols-3 gap-1.5 mt-1.5">
+            {([['ret', 'Return 25%'], ['winExp', 'WinExp 20%'], ['pf', 'PF 15%'], ['sample', 'Sample 15%'], ['risk', 'Risk 15%'], ['sharpe', 'Sharpe 10%']] as const).map(([k, l]) => (
+              <div key={k}><label className="lbl">{l}</label>
+                <input type="number" step="0.01" min={0} max={1} className="w-full mt-1 num" value={st.scoreW[k] ?? 0}
+                  onChange={e => set({ scoreW: { ...st.scoreW, [k]: Math.min(1, Math.max(0, +e.target.value || 0)) } })} /></div>
+            ))}
+          </div>
+          <div className="grid grid-cols-3 gap-1.5 mt-1.5">
+            {[['ins', 'Insuff <'], ['exp', 'Explor <'], ['dev', 'Rankable ≥']].map(([k, l]) => (
+              <div key={k}><label className="lbl">{l}</label>
+                <input type="number" className="w-full mt-1 num" value={(st.sampleT as any)[k] ?? 0}
+                  onChange={e => set({ sampleT: { ...st.sampleT, [k]: Math.max(2, Math.round(+e.target.value || 0)) } as any })} /></div>
+            ))}
+          </div>
+          <div className="text-[10px] text-zinc-500 mt-1">Sharpe is 10% of selection, winsorized ±20 and sample-shrunk. Tiers gate rankability, never visibility.</div>
+        </details>
         <div className="grid grid-cols-2 gap-2 mt-2">
           <div><label className="lbl">Grid sampler</label>
             <select value={st.gridMode} className="w-full mt-1" onChange={e => set({ gridMode: e.target.value as any })}>
