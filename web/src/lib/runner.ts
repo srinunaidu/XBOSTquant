@@ -220,6 +220,27 @@ export function logLine(s: string) {
   const ts = new Date().toLocaleTimeString('en-IN', { hour12: false });
   const log = [...st.log, `[${ts}] ${s}`];
   st.set({ log: log.length > 2000 ? log.slice(log.length - 2000) : log });
+  // Crash-proof mirror: tab memory dies with Aw Snap, localStorage survives.
+  // Ring buffer (500 lines) so a post-crash reload can still show/download
+  // exactly where the run stopped.
+  try {
+    const k = 'xbost_log_v1';
+    const prev = JSON.parse(localStorage.getItem(k) || '[]');
+    prev.push(`[${ts}] ${s}`);
+    while (prev.length > 500) prev.shift();
+    localStorage.setItem(k, JSON.stringify(prev));
+  } catch { /* storage blocked/private mode — session log still works */ }
+}
+
+export function recoveredLog(): string[] {
+  try {
+    const v = JSON.parse(localStorage.getItem('xbost_log_v1') || '[]');
+    return Array.isArray(v) ? v : [];
+  } catch { return []; }
+}
+
+export function clearRecoveredLog() {
+  try { localStorage.removeItem('xbost_log_v1'); } catch { /* noop */ }
 }
 
 function fmtETA(sec: number) {

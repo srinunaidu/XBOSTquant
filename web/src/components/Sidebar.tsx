@@ -6,9 +6,9 @@ for (const m of IND_META) if (m.n && m.tier) TIERS_META[m.n] = m.tier;
 import { useStore } from '../lib/store';
 import { estimateCombos } from '../lib/runner';
 import { applyDateFilter, loadFile, selectATM } from '../lib/data';
-import { downloadLog } from '../lib/export';
+import { downloadLog, downloadRecoveredLog } from '../lib/export';
 import { runValidation } from '../lib/validate';
-import { downloadAuditArtifact, replayArtifactFile } from '../lib/runner';
+import { downloadAuditArtifact, replayArtifactFile, recoveredLog, clearRecoveredLog } from '../lib/runner';
 
 function Section({ n, children }: { n: string; children: React.ReactNode }) {
   return (
@@ -178,6 +178,8 @@ export default function Sidebar() {
         <button className="btn-ghost btn-xs w-full mt-2" onClick={() => downloadLog()}>⬇ Download session log (.txt)</button>
         <div className="text-[10px] text-zinc-500 mt-1 num">Heap: {heapMB()} · {boardLen()} board rows · {dataBars()} bars loaded</div>
         <button className="btn-ghost btn-xs w-full mt-2" onClick={() => downloadAuditArtifact()}>⤓ Export audit artifact (research JSON)</button>
+        <LiveLogView />
+        <RecoveredLogView />
         <label className="btn-ghost btn-xs w-full mt-2 text-center cursor-pointer">⤴ Replay audit file
           <input type="file" accept=".json" className="hidden" onChange={e => {
             const f = e.target.files && e.target.files[0];
@@ -563,6 +565,43 @@ function dataBars(): string {
     const n = Object.values(ds).reduce((a: number, d: any) => a + (d.raw?.t?.length || 0), 0);
     return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : Math.round(n / 1000) + 'k';
   } catch { return '—'; }
+}
+
+function LiveLogView() {
+  // Live tail of the session log — watch a run narrate itself here.
+  const log = useStore(s => s.log);
+  const ref = React.useRef<HTMLPreElement>(null);
+  React.useEffect(() => {
+    const el = ref.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [log.length]);
+  if (!log.length) return null;
+  return (
+    <pre ref={ref} className="text-[10px] num text-zinc-300 bg-zinc-950 border border-[#2e2e36] rounded-md p-2 mt-2 whitespace-pre-wrap max-h-48 overflow-auto">
+      {log.slice(-30).join('\n')}
+    </pre>
+  );
+}
+
+function RecoveredLogView() {
+  // Survived a dead tab? The mirrored log is still here — download it and
+  // send the last lines; they show exactly where the run stopped.
+  const [lines, setLines] = React.useState<string[] | null>(null);
+  React.useEffect(() => { setLines(recoveredLog()); }, []);
+  if (!lines || !lines.length) return null;
+  return (
+    <div className="mt-2 rounded-lg border border-red-900 bg-red-950/20 p-2">
+      <div className="text-[11px] text-red-300 font-semibold">💾 Recovered log from a previous session ({lines.length} lines)</div>
+      <div className="text-[10px] text-zinc-400 mt-1">If the tab died mid-run, the tail below is where it stopped:</div>
+      <pre className="text-[10px] num text-zinc-300 bg-zinc-950 border border-zinc-800 rounded-md p-2 mt-1 whitespace-pre-wrap max-h-32 overflow-auto">
+        {lines.slice(-12).join('\n')}
+      </pre>
+      <div className="flex gap-1.5 mt-1.5">
+        <button className="btn-ghost btn-xs flex-1" onClick={() => downloadRecoveredLog(lines)}>⬇ Download full</button>
+        <button className="btn-ghost btn-xs flex-1" onClick={() => { clearRecoveredLog(); setLines([]); }}>Clear</button>
+      </div>
+    </div>
+  );
 }
 
 function ValidationOut() {

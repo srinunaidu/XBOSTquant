@@ -75,3 +75,9 @@ export function downloadLog() {
   dl(`xbost_log_${st.symbol || 'data'}_${new Date().toISOString().slice(0, 10)}.txt`,
     `XBOST run log · ${new Date().toString()}\n${'='.repeat(60)}\n` + st.log.join('\n') + '\n');
 }
+
+export function downloadRecoveredLog(lines: string[]) {
+  if (!lines.length) return;
+  dl(`xbost_log_RECOVERED_${new Date().toISOString().slice(0, 10)}.txt`,
+    `XBOST RECOVERED log (survived a dead tab — last lines are where it stopped)\n${new Date().toString()}\n${'='.repeat(60)}\n` + lines.join('\n') + '\n');
+}
