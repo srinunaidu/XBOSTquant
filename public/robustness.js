@@ -191,9 +191,10 @@ function jitterResilience(d, indicator, params, baseOpts){
 }
 function tradeOrderRobustness(trades, capital){
   if(!trades.length) return {medianSharpe:0,p5Sharpe:0,p95Sharpe:0,medianDD:0,p95DD:0,medianStreak:0,p95Streak:0, parameters_locked:true, reoptimized:false};
-  const pnls=trades.map(t=>t.pnl); const iters=1000, sharpes=[],dds=[],streaks=[];
+  const cap=capTrades(trades.map(t=>t.pnl)); const pnls=cap.arr;
+  const iters=1000, sharpes=[],dds=[],streaks=[];
   for(let k=0;k<iters;k++){ const arr=[...pnls].sort(()=>Math.random()-0.5); let eq=capital,peak=capital,mdd=0,curL=0,maxL=0; const rets=[]; for(const p of arr){ const prev=eq; eq+=p; if(eq>peak) peak=eq; const dd=peak>0?(eq-peak)/peak*100:0; if(dd<mdd) mdd=dd; rets.push((eq-prev)/Math.max(1,Math.abs(prev))); if(p>0) curL=0; else {curL++; if(curL>maxL) maxL=curL;} } const mu=mean(rets), s=sd(rets,mu)||1e-9; sharpes.push(mu/s*Math.sqrt(252)); dds.push(mdd); streaks.push(maxL); }
-  return {medianSharpe:median(sharpes),p5Sharpe:percentile(sharpes,0.05),p95Sharpe:percentile(sharpes,0.95),medianDD:median(dds),p95DD:percentile(dds,0.05),medianStreak:median(streaks),p95Streak:percentile(streaks,0.95), parameters_locked:true, reoptimized:false};
+  return {medianSharpe:median(sharpes),p5Sharpe:percentile(sharpes,0.05),p95Sharpe:percentile(sharpes,0.95),medianDD:median(dds),p95DD:percentile(dds,0.05),medianStreak:median(streaks),p95Streak:percentile(streaks,0.95), capped:cap.capped, parameters_locked:true, reoptimized:false};
 }
 function concentrationMetrics(trades){
   const pnls=trades.map(t=>t.pnl), total=pnls.reduce((a,b)=>a+b,0)||1, s=[...pnls].sort((a,b)=>b-a);
@@ -228,8 +229,9 @@ function distributionQuality(trades){
 }
 function bootstrapCI(trades, iters){
   iters=iters||1000;
-  const pnls=trades.map(t=>t.pnl);
-  if(!pnls.length) return {exp:{median:0,p5:0,p95:0}, sharpe:{median:0,p5:0,p95:0}, wr:{median:0,p5:0,p95:0}, parameters_locked:true, reoptimized:false};
+  const cap=capTrades(trades.map(t=>t.pnl));
+  const pnls=cap.arr;
+  if(!pnls.length) return {exp:{median:0,p5:0,p95:0}, sharpe:{median:0,p5:0,p95:0}, wr:{median:0,p5:0,p95:0}, capped:false, parameters_locked:true, reoptimized:false};
   const exps=[], shs=[], wrs=[];
   for(let k=0;k<iters;k++){
     const samp=[]; for(let i=0;i<pnls.length;i++) samp.push(pnls[Math.floor(Math.random()*pnls.length)]);
@@ -238,7 +240,7 @@ function bootstrapCI(trades, iters){
     exps.push(mu); shs.push(mu/1000/s*Math.sqrt(252)); wrs.push(samp.filter(p=>p>0).length/samp.length*100);
     void pf;
   }
-  return {exp:{median:median(exps),p5:percentile(exps,0.05),p95:percentile(exps,0.95)}, sharpe:{median:median(shs),p5:percentile(shs,0.05),p95:percentile(shs,0.95)}, wr:{median:median(wrs),p5:percentile(wrs,0.05),p95:percentile(wrs,0.95)}, parameters_locked:true, reoptimized:false};
+  return {exp:{median:median(exps),p5:percentile(exps,0.05),p95:percentile(exps,0.95)}, sharpe:{median:median(shs),p5:percentile(shs,0.05),p95:percentile(shs,0.95)}, wr:{median:median(wrs),p5:percentile(wrs,0.05),p95:percentile(wrs,0.95)}, capped:cap.capped, parameters_locked:true, reoptimized:false};
 }
 function deflatedSharpe(observedSharpe, n, totalCombos){
   const trials=Math.max(1,totalCombos);
@@ -346,6 +348,16 @@ async function robustnessFor(d, candidate, baseOpts, datasets, totalCombos, rank
 // ---------- Anti-overfit extensions (upgrade spec §6) ----------
 // Deterministic PRNG (mulberry32) so CIs/surrogates are reproducible/loggable.
 function _rng(seed){ let a=(seed==null?42:seed)>>>0; return function(){ a|=0;a=(a+0x6D2B79F5)|0; let t=Math.imul(a^(a>>>15),1|a); t=(t+Math.imul(t^(t>>>7),61|t))^t; return ((t^(t>>>14))>>>0)/4294967296; }; }
+// Cap trade arrays for MC-class evidences: beyond 20k trades the statistics
+// are already saturated; strided sampling keeps runtime/memory bounded and
+// identical results on normal sizes. Returns {arr, capped}.
+function capTrades(pnls, cap){
+  cap=Math.max(1000,Math.round(cap||20000));
+  if(pnls.length<=cap)return {arr:pnls, capped:false};
+  const stride=pnls.length/cap, out=[];
+  for(let i=0;i<cap;i++)out.push(pnls[Math.floor(i*stride)]);
+  return {arr:out, capped:true};
+}
 function paramSensitivity(d, indicator, params, baseOpts, eps){
   // Parameter Sensitivity Surface: 2nd-order curvature of Sharpe at the
   // candidate point, per free param, via ±eps relative bumps (cached
@@ -381,7 +393,8 @@ function blockBootstrapCI(trades, block, iters, seed){
   // Block bootstrap over the trade-PnL series (preserves autocorrelation —
   // i.i.d. resampling understates streak risk). Deterministic via seed.
   block=Math.max(1,Math.round(block||20)); iters=Math.max(50,Math.round(iters||1000));
-  const pnls=(trades||[]).map(t=>t.pnl);
+  const cap=capTrades((trades||[]).map(t=>t.pnl));
+  const pnls=cap.arr;
   const n=pnls.length;
   // Skipped calculations are null with status/reason — NEVER a fake [0,0]
   // zero-width interval (§12/§14).
@@ -404,7 +417,7 @@ function blockBootstrapCI(trades, block, iters, seed){
     S.netPnL.push(s.reduce((a,x)=>a+x,0)*n/s.length);
   }
   const q=(a,p)=>percentile(a,p);
-  return {status:'OK', method:'block', block, iters, seed:seed==null?1234:seed, n,
+  return {status:'OK', method:'block', block, iters, seed:seed==null?1234:seed, n, capped:cap.capped,
     sharpe:[+q(S.sharpe,0.025).toFixed(3),+q(S.sharpe,0.975).toFixed(3)],
     wr:[+q(S.wr,0.025).toFixed(2),+q(S.wr,0.975).toFixed(2)],
     pf:[+q(S.pf,0.025).toFixed(3),+q(S.pf,0.975).toFixed(3)],
@@ -459,7 +472,8 @@ function surrogateTest(trades, nSurr, seed){
   // but destroy time-structure edge. p = fraction of surrogates with Sharpe
   // ≥ observed. Real edge ⇒ p < 0.01; noise ⇒ p ≈ 0.5.
   nSurr=Math.max(20,Math.round(nSurr||100));
-  const pnls=(trades||[]).map(t=>t.pnl);
+  const cap=capTrades((trades||[]).map(t=>t.pnl));
+  const pnls=cap.arr;
   const n=pnls.length;
   if(n<20) return {p:1, nSurr:0, observedSharpe:0, skipped:true, note:'insufficient trades'};
   const mu=mean(pnls), sdv=sd(pnls,mu)||1e-9;
@@ -471,7 +485,7 @@ function surrogateTest(trades, nSurr, seed){
     const m2=mean(surr), sd2=sd(surr,m2)||1e-9;
     if(m2/sd2*Math.sqrt(252)>=obs)beat++;
   }
-  return {p:+(beat/nSurr).toFixed(4), nSurr, observedSharpe:+obs.toFixed(3), skipped:false, parameters_locked:true, reoptimized:false};
+  return {p:+(beat/nSurr).toFixed(4), nSurr, observedSharpe:+obs.toFixed(3), skipped:false, capped:cap.capped, parameters_locked:true, reoptimized:false};
 }
 function freeParamCount(candidate){
   // Total free parameters: numeric signal params + active risk/exit knobs.

@@ -20,6 +20,7 @@ async function runGridSearch(msg) {
   const E = self.XBOST_ENGINE;
   if (!E) throw new Error('XBOST_ENGINE missing in worker (engine.js failed to load)');
   if (!msg.grid || !msg.grid.length) throw new Error('empty grid — nothing to search (check indicator selection)');
+  const heapMB = () => { try { const m = performance.memory?.usedJSHeapSize; return m ? Math.round(m / 1048576) : null; } catch { return null; } };
   const d1m = {
     t: new Float64Array(msg.t),
     o: new Float64Array(msg.o),
@@ -178,7 +179,7 @@ async function runGridSearch(msg) {
     if ((i+1)%batch===0 || i===total-1){
       const ranked = E.rankResults(results, objective).slice(0, topN);
       const cfg = grid[i];
-      self.postMessage({ type:'progress', stage:'grid', done:i+1, total, top:ranked, errCount:errCount,
+      self.postMessage({ type:'progress', stage:'grid', done:i+1, total, top:ranked, errCount:errCount, heap:heapMB(),
         current:{ indicator:cfg.indicator, timeframe:cfg.timeframe, params:cfg.params, slPct:cfg.slPct||tradeOpts.slPct||0, tpPct:cfg.tpPct||tradeOpts.tpPct||0, exit:cfg.exit||'fixed', carry:!!cfg.carry } });
     }
   }
@@ -209,7 +210,7 @@ async function runGridSearch(msg) {
       if ((j+1) % 25 === 0 || j === cands.length - 1) {
         const ranked = E.rankResults(results, objective).slice(0, topN);
         self.postMessage({ type:'progress', stage:'refine', done:total + refined, total: total + '+refine',
-          top: ranked, errCount: errCount, pass: pass,
+          top: ranked, errCount: errCount, heap: heapMB(), pass: pass,
           current:{ indicator:cands[j].indicator, timeframe:cands[j].timeframe, params:cands[j].params,
             slPct:cands[j].slPct||0, tpPct:cands[j].tpPct||0,
             exit:cands[j].exit||'fixed', carry:!!cands[j].carry } });
@@ -232,7 +233,7 @@ async function runGridSearch(msg) {
       if (cands.length) {
         const ranked = E.rankResults(results, objective).slice(0, topN);
         self.postMessage({ type:'progress', stage:'bayes', done: total + refined, total: total + '+refine+bayes',
-          top: ranked, errCount: errCount, pass: pass,
+          top: ranked, errCount: errCount, heap: heapMB(), pass: pass,
           current:{ indicator:'EI', timeframe:'—', params:{proposals: cands.length}, slPct:0, tpPct:0, exit:'fixed', carry:false } });
       }
     } catch (e) { /* best-effort */ }
@@ -276,6 +277,11 @@ async function runGridSearch(msg) {
             cand.robustScore = Math.min(cand.robustScore, 6.8);
           }
         } catch (e) { cand.robustError = String(e && e.message || e); cand.robustScore = Math.min(cand.robustScore || 0, 6.8); }
+        // Stage heartbeat: robustness is the longest silent phase — post per
+        // candidate so the UI (and the 90s watchdog) sees proof of life.
+        self.postMessage({ type: 'progress', stage: 'robust', done: i + 1, total: Math.min(ranked.length, 25),
+          top: ranked.slice(0, topN), errCount: errCount, heap: heapMB(),
+          current: { sym: msg.symbol, indicator: 'robustness', timeframe: cand.timeframe, params: { candidate: i + 1 }, slPct: 0, tpPct: 0, exit: 'fixed', carry: false } });
       }
       // build machine logs for #1 (§26)
       const top = ranked[0];

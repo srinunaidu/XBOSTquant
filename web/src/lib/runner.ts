@@ -569,6 +569,27 @@ export async function runGrid() {
   } catch { /* best-effort */ }
   const onBatch = (done: number, total: number | string, top: BoardRow[], current: any, stage: string, pass: number) => {
     if (useStore.getState().runSeq !== mySeq) return;
+    // Stage logging: transitions logged once with timing + heap; robustness
+    // (the longest silent phase) logs every 5th candidate. A stuck run thus
+    // always shows WHERE it stopped — never silent.
+    const stHeap = (() => {
+      try {
+        const m = (performance as any)?.memory?.usedJSHeapSize;
+        return m ? ` heap=${Math.round(m / 1048576)}MB` : '';
+      } catch { return ''; }
+    })();
+    const stEl = ((performance.now() - t0) / 1000).toFixed(1);
+    const lastStage = (onBatch as any)._ls || '';
+    const stageKey = stage + ':' + (pass || 0);
+    if (stageKey !== lastStage) {
+      const sym = current && current.sym ? ` [${current.sym}]` : '';
+      const what = current && current.indicator ? ` ${current.indicator}` : '';
+      logLine(`[STAGE ${stage}${pass ? ' pass ' + pass : ''} start${sym}${what} @${stEl}s${stHeap}]`);
+      (onBatch as any)._ls = stageKey;
+    } else if (stage === 'robust' && typeof done === 'number' && done % 5 === 0 && (onBatch as any)._lr !== done) {
+      (onBatch as any)._lr = done;
+      logLine(`[STAGE robust ${done}/${total} @${stEl}s${stHeap}]`);
+    }
     if (stage === 'refine' && !useStore.getState()._refineAt) useStore.getState().set({ _refineAt: performance.now() });
     const pct = typeof done === 'number' && typeof total === 'number' ? ((done / total) * 100).toFixed(1) : '—';
     const el = (performance.now() - t0) / 1000;
