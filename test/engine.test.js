@@ -953,3 +953,103 @@ test('no hidden seeds/normalization (18/19): weights logged sum to 1, Halton fix
   const m = { netPnL: 200, totalTrades: 60, winRate: 58, expectancy: 3.3, profitFactor: 2.2, sharpe: 4.1, maxDD: -7, grossProfit: 300, grossLoss: 100 };
   assert.equal(E.strategyScore(m).composite, E.strategyScore(m).composite, 'score independent of population');
 });
+
+test('TOD buckets: 15m IST grid, session boundaries exact', () => {
+  const t = (h, m) => Date.UTC(2026, 8, 7, h, m, 0) - 19800000;
+  assert.equal(E.todBucket15(t(9, 15)), '09:15-09:30');
+  assert.equal(E.todBucket15(t(9, 29)), '09:15-09:30');
+  assert.equal(E.todBucket15(t(9, 30)), '09:30-09:45');
+  assert.equal(E.todBucket15(t(15, 29)), '15:15-15:30');
+  // MCX evening bar lands in evening bucket, not NSE close
+  assert.equal(E.todBucket15(t(23, 5)), '23:00-23:15');
+});
+
+test('holidays/gaps: no phantom bars, segments skip non-trading days', () => {
+  // Mon + Wed only (Tue holiday = gap) — segments must be exactly 2
+  const mk = (day, n) => {
+    const out = [];
+    for (let i = 0; i < n; i++) out.push(day + i * 60000);
+    return out;
+  };
+  const t0 = Date.UTC(2026, 8, 7, 3, 45, 0); // Mon 09:15 IST
+  const t2 = Date.UTC(2026, 8, 9, 3, 45, 0); // Wed 09:15 IST
+  const T = [...mk(t0, 10), ...mk(t2, 10)];
+  const n = T.length;
+  const d = { t: Float64Array.from(T), o: new Float64Array(n).fill(100), h: new Float64Array(n).fill(101), l: new Float64Array(n).fill(99), c: new Float64Array(n).fill(100), v: new Float64Array(n).fill(10) };
+  const segs = E.daySegments(d);
+  assert.equal(segs.length, 2, 'two trading days, no phantom Tuesday');
+  const r = E.resample(d, 5);
+  assert.ok(r.t.length <= 6, `no invented buckets, got ${r.t.length}`);
+});
+
+test('expiry parse: weekly + monthly variants', () => {
+  // Assert in IST wall-clock (strategy clock), never viewer-local fields.
+  assert.deepEqual(E.istParts(E.parseExpiryFlex('29SEP2026')), { h: 0, m: 0, y: 2026, mo: 8, day: 29 });
+  assert.ok(isFinite(E.parseExpiryFlex('15OCT2026')));
+  assert.ok(isFinite(E.parseExpiryFlex('2026-09-29')));
+  assert.ok(isFinite(E.parseExpiryFlex('29-Sep-2026')));
+  assert.ok(isNaN(E.parseExpiryFlex('not-a-date')));
+});
+
+test('profiles: discovery on train only, OOS never leaks into train cells', () => {
+  const tr = [];
+  for (let i = 0; i < 40; i++) tr.push({ pnl: 10, entryTime: 1000 + i, session: 'd1', expiry: 'e1', family: 'MOM', direction: 'LONG', regime: '0', timeframe: 5, fold: 'train' + (1 + (i % 3)), mae: 1, mfe: 2, hold: 5 });
+  for (let i = 0; i < 10; i++) tr.push({ pnl: -100, entryTime: 2000 + i, session: 'd2', expiry: 'e1', family: 'MOM', direction: 'LONG', regime: '0', timeframe: 5, fold: 'oos', mae: 1, mfe: 2, hold: 5 });
+  const cells = E.aggregateProfile(tr);
+  const k = Object.keys(cells)[0];
+  assert.equal(cells[k].train.n, 40, 'train cell uncontaminated by OOS');
+  assert.equal(cells[k].oos.n, 10);
+  assert.ok(cells[k].train.expectancy > 0 && cells[k].oos.expectancy < 0, 'train/OOS kept separate');
+  const cls = E.classifyCell(cells[k], {});
+  assert.ok(cls.status, 'classified');
+});
+
+test('transfer + locked consumption + versioning', () => {
+  const F = { status: 'RANKABLE', train: { expectancy: 5 } };
+  const O = { status: 'RANKABLE', train: { expectancy: 3 } };
+  assert.equal(E.classifyTransfer(F, O), 'TRANSFERRED');
+  assert.equal(E.classifyTransfer(F, { status: 'EXPLORATORY', train: { expectancy: 1 } }), 'PARTIALLY_TRANSFERRED');
+  assert.equal(E.classifyTransfer(null, O), 'INSUFFICIENT_DATA');
+  assert.equal(E.classifyTransfer({ status: 'INSUFFICIENT', train: {} }, { status: 'INSUFFICIENT', train: {} }), 'INSUFFICIENT_DATA');
+  const prof = { locked: true, market: 'NIFTY', instrument: 'FUTURES', eligible: [{ bucket: '09:30-09:45', timeframe: 5, regime: '0', family: 'MOMENTUM' }] };
+  const q = { market: 'NIFTY', instrument: 'FUTURES', bucket: '09:30-09:45', timeframe: 5, regime: '0' };
+  assert.equal(E.consumeProfile(prof, q).decision, 'TRADE');
+  assert.equal(E.consumeProfile(prof, Object.assign({}, q, { bucket: '14:00-14:15' })).decision, 'NO_TRADE');
+  assert.equal(E.consumeProfile(Object.assign({}, prof, { locked: false }), q).decision, 'PROFILE_INVALID');
+  assert.equal(E.consumeProfile(null, q).decision, 'NO_PROFILE');
+  assert.equal(E.consumeProfile(prof, Object.assign({}, q, { market: 'BANKNIFTY' })).decision, 'NO_PROFILE');
+  const pid = E.profileId('NIFTY', 'FUT', '5', 'R123', 'abcdef123456');
+  assert.ok(/^TOD_NIFTY_FUT_5M_R123_abcdef12$/.test(pid), 'versioned id: ' + pid);
+});
+
+test('worker/main parity: same inputs, identical rankings twice', () => {
+  const rows = [];
+  for (let i = 0; i < 40; i++) rows.push({
+    i, timeframe: 5, indicator: 'EMA', params: { period: 5 + i }, exit: 'fixed', carry: false,
+    m: { netPnL: (i * 61) % 300 - 80, winRate: (i * 17) % 100, totalTrades: 20 + (i % 25), profitFactor: 0.6 + (i % 7) * 0.4, expectancy: 1.5, sharpe: (i % 9) - 4, maxDD: -(i % 5), sortino: 0, grossProfit: 100, grossLoss: 50 },
+  });
+  const r1 = E.rankResults(rows, 'sharpe').map(r => E.cfgKey(r));
+  const r2 = E.rankResults(rows, 'sharpe').map(r => E.cfgKey(r));
+  assert.deepEqual(r1, r2, '17/21 rank parity across paths');
+  const p1 = E.paretoFrontier(rows).map(r => E.cfgKey(r));
+  const p2 = E.paretoFrontier(rows).map(r => E.cfgKey(r));
+  assert.deepEqual(p1, p2, 'pareto parity');
+  const u1 = E.researchUnion(rows, 10, 'sharpe'), u2 = E.researchUnion(rows, 10, 'sharpe');
+  assert.deepEqual(u1.board.map(r => E.cfgKey(r)), u2.board.map(r => E.cfgKey(r)), 'union parity');
+});
+
+test('futures golden regression: fixed data + config → exact metrics', () => {
+  const n = 240, t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+    l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+  const t0 = Date.parse('2026-09-07T09:15:00');
+  for (let i = 0; i < n; i++) { const p = 100 + Math.sin(i / 12) * 2; t[i] = t0 + i * 60000; o[i] = p; h[i] = p + 0.3; l[i] = p - 0.3; c[i] = p; v[i] = 120; }
+  const d = { t, o, h, l, c, v };
+  const run = () => {
+    const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 12 } });
+    return E.backtest(d, sig.pos, { direction: 'Both', sessionMask: new Int8Array(n).fill(1), capital: 100000, qty: 1, lotSize: 1, cost: 0, slPct: 1, tpPct: 2 }).metrics;
+  };
+  const a = run(), b = run();
+  assert.deepEqual(a, b, '21/22 deterministic');
+  assert.ok(a.totalTrades > 5, 'trades exist');
+  console.log('    golden: n=' + a.totalTrades + ' wr=' + a.winRate.toFixed(2) + ' pnl=' + a.netPnL.toFixed(2) + ' sharpe=' + a.sharpe.toFixed(3));
+});

@@ -1001,6 +1001,7 @@ export async function runGrid() {
       logLine('===== FINAL VERDICT =====');
       logLine('  BEST AVAILABLE SAMPLE RESULT ≠ VALIDATED GENERAL STRATEGY. Research discovery only.');
     } catch (e: any) { logLine('research audit skipped: ' + (e?.message || e)); }
+    buildProfiles(bd, symData, opts, mySeq);
     logLine('===== END SUMMARY =====');
   } catch (e: any) { logLine('summary build failed: ' + (e?.message || e)); }
   setRun({ current: '' });
@@ -1012,7 +1013,7 @@ export async function runGrid() {
     useStore.getState().set({ lastPaper: gate });
     if (gate.eligible) logLine(`PAPER: ELIGIBLE — [${bd[0].symbol}] ${bd[0].timeframe}m ${bd[0].indicator} passed all gates${(gate.warnings || []).length ? ' (warnings: ' + (gate.warnings || []).join('; ') + ')' : ''}`);
     else logLine(`PAPER: BLOCKED — ${gate.reasons.join(' · ')}`);
-    logSelection(bd);
+    logSelection(bd, opts);
   }
   // Adaptive tier escalation: Tier-A best must clear the HARD gate
   // (Sharpe base + robustness + surrogate + PSS + OOS), not raw Sharpe.
@@ -1044,7 +1045,7 @@ export async function runGrid() {
 // Selection report: BEST_RANKABLE_COMPOSITE (or NONE), THIN-sample list,
 // PARETO frontier (unranked ids), RANKING WARNINGS, WHY_RANKED lines.
 // Pure discovery + honest labels — never hides rows, never manufactures.
-export function logSelection(bd: BoardRow[]) {
+export function logSelection(bd: BoardRow[], opts: any) {
   try {
     // RANKABLE = tier RANKABLE only (n ≥ configured threshold). EXPLORATORY
     // rows are NEVER promoted — they get their own BEST_EXPLORATORY line.
@@ -1074,6 +1075,19 @@ export function logSelection(bd: BoardRow[]) {
       const rbBest = rbRows[0] || null;
       if (rbBest) logLine(`BEST_ROBUST: [${rbBest.symbol || '?'}] ${rbBest.timeframe}m ${rbBest.indicator} score=${(((rbBest as any).robustScore || 0)).toFixed(2)} n=${rbBest.m.totalTrades} classification=${((rbBest as any).robustness || {}).classification || '?'}`);
       else logLine('BEST_ROBUST = NONE (no robustness evaluated)');
+      const oosRows = bd.filter(r => (r as any).survived === true && (r as any).oosNet != null)
+        .sort((a, b) => (((b as any).oosNet || 0) - ((a as any).oosNet || 0)));
+      const oosBest = oosRows[0] || null;
+      if (oosBest) logLine(`BEST_OOS: [${oosBest.symbol || '?'}] ${oosBest.timeframe}m ${oosBest.indicator} oosNet=${Math.round((oosBest as any).oosNet)} oosWR=${(((oosBest as any).oosWR || 0)).toFixed(1)}% oosN=${(oosBest as any).oosN} IS_WR=${oosBest.m.winRate.toFixed(1)}%`);
+      else logLine('BEST_OOS = NONE (no OOS survivor)');
+      const stPE = useStore.getState();
+      const peRows = bd.filter(r => {
+        const g = engine.paperEligible(r, { scoreThreshold: stPE.paperThreshold ?? 9.5, cost: opts.cost, allowZeroCost: opts.costMode === 'signal', minTrades: stPE.paperMinTrades ?? 200 });
+        return g.eligible;
+      }).sort((a, b) => ((b.compositeScore || {}).composite || 0) - ((a.compositeScore || {}).composite || 0));
+      const peBest = peRows[0] || null;
+      if (peBest) logLine(`BEST_PAPER_ELIGIBLE: [${peBest.symbol || '?'}] ${peBest.timeframe}m ${peBest.indicator} score=${((peBest.compositeScore || {}).composite ?? '?')} n=${peBest.m.totalTrades}`);
+      else logLine('BEST_PAPER_ELIGIBLE = NONE (no candidate cleared every gate — see PAPER verdict)');
     } catch (e: any) { logLine('meaningful/robust lines skipped: ' + (e?.message || e)); }
     const expl = bd.filter(r => r.compositeScore && r.compositeScore.tier === 'EXPLORATORY')
       .sort((a, b) => ((b.compositeScore || {}).composite || 0) - ((a.compositeScore || {}).composite || 0))[0] || null;
@@ -1299,6 +1313,25 @@ export function buildAuditArtifact(): any {
     per_objective[key] = [...allRows].sort(engine.researchCmp(key)).slice(0, 20).map(r => engine.cfgKey(r as any));
   }
   const paretoIds = engine.paretoFrontier(allRows.filter(r => r.m && r.m.totalTrades > 0)).map(r => engine.cfgKey(r as any));
+  // WHY_DOMINATED: first frontier dominator per non-member (default 7 dims).
+  const pareto_results = (() => {
+    try {
+      const dims: [string, number][] = [['netPnL', 1], ['expectancy', 1], ['winRate', 1], ['totalTrades', 1], ['profitFactor', 1], ['maxDD', 1], ['sharpe', 1]];
+      const val = (r: any, k: string) => { const v = r.m && r.m[k]; return (typeof v === 'number' && isFinite(v)) ? v : -Infinity; };
+      const domBy = (a: any, b: any) => { let s = false; for (const [k, dir] of dims) { const d = (val(a, k) - val(b, k)) * dir; if (d < 0) return false; if (d > 0) s = true; } return s; };
+      const front = new Set(paretoIds);
+      const byKey = new Map(allRows.map(r => [engine.cfgKey(r as any), r]));
+      const members = paretoIds.map(k => byKey.get(k)).filter(Boolean);
+      const why: Record<string, string> = {};
+      for (const r of allRows.slice(0, 500)) {
+        const k = engine.cfgKey(r as any);
+        if (front.has(k)) continue;
+        const d = members.find(m => m && domBy(m, r));
+        if (d) why[k] = 'PARETO_DOMINATED by ' + engine.cfgKey(d as any).slice(0, 80);
+      }
+      return { dims: dims.map(([k, d]) => `${d > 0 ? 'max' : 'min'}_${k}`), pareto: paretoIds, dominated_sample: why };
+    } catch { return { dims: [], pareto: paretoIds, dominated_sample: {} }; }
+  })();
   const ranking_results = {
     input_count: allRows.length,
     stages: [
@@ -1393,7 +1426,20 @@ export function buildAuditArtifact(): any {
     run_manifest: manifest, config, data_manifest: dataManifest,
     candidate_results, ranking_results, robustness_results, walkforward_results,
     trade_records: [], trade_records_note: withTradesNote(),
+    time_profile_results: useStore.getState().lastProfiles || [],
+    transfer_results: useStore.getState().lastTransfer || [],
+    profile: (useStore.getState().lastProfiles || []).map((p: any) => ({
+      profile_id: p.profile_id, market: p.market, instrument: p.instrument,
+      timeframe: p.timeframe, data_start: p.data_start, data_end: p.data_end,
+      generated_at: p.generated_at, engine_version: p.engine_version,
+      engine_hash: p.engine_hash, data_hash: p.data_hash, strategy_hash: p.strategy_hash,
+      sampler_seed: p.sampler_seed, validation_status: p.validation_status,
+      parameters_locked: p.parameters_locked, reoptimized: p.reoptimized,
+      eligible: p.eligible, merged: p.merged,
+    })),
+    pareto_results,
     stage_summary: ranking_results.stages, final_report,
+    hash_manifest: {},
     hashes: {
       dataset: { algo: 'FNV-1a-32', hash: dataManifest.dataset_hash },
       config: { algo: 'FNV-1a-32', hash: engine.hashRecord(config) },
@@ -1402,6 +1448,7 @@ export function buildAuditArtifact(): any {
       artifact: null as any,
     },
   };
+  art.hash_manifest = Object.fromEntries(Object.entries(art.hashes).filter(([k]) => k !== 'artifact').map(([k, v]: any) => [k + '.json', v]));
   useStore.getState().set({ lastAudit: art });
   logLine(`audit artifact staged (${allRows.length} candidates, ${dataManifest.total_bars} bars) — use ⤓ Export audit JSON to download with trade records + hashes`);
   return art;
@@ -1470,6 +1517,221 @@ export async function replayArtifactFile(f: File, onProgress?: (p: number) => vo
   ];
   useStore.getState().set({ validation: out, valOk: rep.pass });
   out.forEach(l => logLine('[replay] ' + l));
+}
+
+// ---------- Dynamic time-of-day profiles (§TOD) ----------
+// Post-pass: rebuilds trades for top board rows on TRAIN/OOS splits,
+// attributes (bucket, family, direction, regime, TF, instrument, expiry),
+// discovers per-market cells, validates OOS, versions + locks profiles,
+// and runs the futures→options transfer test. All caps + logged.
+export function buildProfiles(bd: BoardRow[], symData: [string, OHLCV][], opts: any, mySeq: number) {
+  try {
+    const st = useStore.getState();
+    const rows = (bd || []).slice(0, 60);
+    if (!rows.length) { logLine('profiles: no rows'); return; }
+    const tfCache: Record<string, any> = {};
+    const getTD = (sym: string, tf: number, slice: 'train' | 'oos') => {
+      const sd = symData.find(([s]) => s === sym);
+      if (!sd) return null;
+      const raw = sd[1];
+      const split = Math.floor(raw.t.length * (st.wfSplit || 70) / 100);
+      const purge = Math.max(0, Math.round(st.purgeBars || 0));
+      const s0 = slice === 'train' ? 0 : Math.min(raw.t.length - 1, split + purge);
+      const s1 = slice === 'train' ? split : raw.t.length;
+      if (s1 - s0 < 50) return null;
+      const pk = (a: Float64Array) => a.slice(s0, s1);
+      const key = sym + '|' + tf + '|' + slice;
+      if (!tfCache[key]) {
+        const d = engine.resample({ t: pk(raw.t), o: pk(raw.o), h: pk(raw.h), l: pk(raw.l), c: pk(raw.c), v: pk(raw.v) } as any, tf);
+        tfCache[key] = d;
+      }
+      return tfCache[key];
+    };
+    const dayRegCache: Record<string, any> = {};
+    const dayRegOf = (sym: string, tf: number, slice: 'train' | 'oos', idx: number): string => {
+      try {
+        const d = getTD(sym, tf, slice);
+        if (!d) return '?';
+        const key = sym + '|' + tf + '|' + slice;
+        if (!dayRegCache[key]) dayRegCache[key] = engine.dayRouting(d, { source: opts.regimeSource || 'rules', confGate: opts.confGate ?? 0.6 });
+        const rt = dayRegCache[key];
+        if (!rt.dayReg) return '?';
+        for (let s = 0; s < rt.dayReg.segs.length; s++) {
+          const sg = rt.dayReg.segs[s];
+          if (idx >= sg.s && idx < sg.e) {
+            const p = rt.dayReg.pred[s];
+            if (p < 0) return 'FB';
+            return String(p);
+          }
+        }
+        return '?';
+      } catch { return '?'; }
+    };
+    const effFor = (d: any, r: BoardRow) => {
+      const base = opts;
+      let mi = engine.buildSessionMask(d, base.sessionStart, base.sessionEnd);
+      mi = engine.combineMasks(mi, engine.buildWindowMask(d.t, base.tradeWindows)) as Int8Array;
+      mi = engine.combineMasks(mi, engine.buildExpiryMask(d, base.excludeExpiry)) as Int8Array;
+      if (base.ivMaxRank != null && base.ivMaxRank < 1) mi = engine.combineMasks(mi, engine.ivRankMask(d, base.ivMaxRank, 20, 75600).mask) as Int8Array;
+      const eff: any = Object.assign({}, base, {
+        sessionMask: r.carry ? new Int8Array(d.c.length).fill(1) : mi,
+        slPct: r.slPct, tpPct: r.tpPct, trailPct: r.trailPct ?? base.trailPct,
+        exit: r.exit || 'fixed', carry: !!r.carry,
+      });
+      return eff;
+    };
+    const isOptSym = (sym: string, dsRaw?: any) => {
+      const c = dsRaw && dsRaw.contract;
+      if (c && c.strike != null) return true;
+      const k = (sym || '').toUpperCase().replace(/[^A-Z]/g, '');
+      return /(CE|PE)$/.test(k) || k.includes('OPTION');
+    };
+    const marketOf = (sym: string) => {
+      const s = (sym || '').toUpperCase();
+      if (s.includes('BANKNIFTY') || s.includes('BANKEX')) return 'BANKNIFTY';
+      if (s.includes('NIFTY') || s.includes('SENSEX')) return 'NIFTY';
+      if (s.includes('CRUDE')) return 'CRUDE';
+      return 'OTHER';
+    };
+    // per-row train/oos trades with attribution
+    type PT = { pnl: number; entryTime: number; session: string; expiry: string; family: string; direction: string; regime: string; timeframe: number; fold: string; mae: number; mfe: number; hold: number };
+    const byGroup: Record<string, PT[]> = {};
+    const rowConcentration: Record<string, any> = {};
+    let rebuilt = 0;
+    for (const r of rows) {
+      if (useStore.getState().runSeq !== mySeq) return;
+      const sym = r.symbol || '';
+      const sd = symData.find(([s]) => s === sym);
+      const raw = sd ? sd[1] : null;
+      const cmeta = (raw as any)?.contract || (useStore.getState().datasets[sym]?.raw as any)?.contract || {};
+      const fam = (((engine as any).FAMILY || {})[r.indicator] || '?');
+      const all: PT[] = [];
+      for (const slice of ['train', 'oos'] as const) {
+        const d = getTD(sym, r.timeframe, slice);
+        if (!d) continue;
+        const sig = engine.buildSignals(d, { indicator: r.indicator, params: r.params });
+        const bt = engine.backtest(d, sig.pos, effFor(d, r));
+        const span = slice === 'train' ? d.t[d.t.length - 1] - d.t[0] : 0;
+        const fOf = (t: number) => {
+          if (slice === 'oos') return 'oos';
+          const f = Math.min(2, Math.floor(3 * (t - d.t[0]) / Math.max(1, span)));
+          return 'train' + (f + 1);
+        };
+        for (const t of bt.trades) {
+          all.push({
+            pnl: t.pnl, entryTime: t.entryTime, session: engine.istDayKey(t.entryTime),
+            expiry: cmeta.expiry || '', family: fam, direction: t.type,
+            regime: dayRegOf(sym, r.timeframe, slice, t.entryIdx),
+            timeframe: r.timeframe, fold: fOf(t.entryTime),
+            mae: (t as any).mae || 0, mfe: (t as any).mfe || 0, hold: t.exitIdx - t.entryIdx,
+          });
+        }
+      }
+      if (!all.length) continue;
+      rebuilt++;
+      const key = marketOf(sym) + '|' + (isOptSym(sym, (raw as any)) ? 'OPT' : 'FUT');
+      (byGroup[key] = byGroup[key] || []).push(...all.map(t => Object.assign(t, { _sym: sym })));
+      // concentration flags for this candidate
+      const bySess: Record<string, number> = {};
+      for (const t of all) bySess[t.session] = (bySess[t.session] || 0) + t.pnl;
+      const sess = Object.keys(bySess).length;
+      const tot = Math.abs(all.reduce((a, t) => a + t.pnl, 0)) || 1e-9;
+      const topSess = Math.max(...Object.values(bySess).map(v => Math.abs(v))) / tot;
+      const exps = new Set(all.map(t => t.expiry).filter(Boolean)).size;
+      (r as any).concentration = {
+        sessions: sess, topSessionPct: +(100 * topSess).toFixed(1), expiries: exps,
+        timeConcentrated: topSess > 0.6 || sess < 5,
+      };
+      rowConcentration[engine.cfgKey(r as any)] = (r as any).concentration;
+    }
+    // per-group profiles
+    const profiles: any[] = [];
+    const dataHash = engine.hashRecord(symData.map(([s, d]) => `${s}:${d.t.length}:${d.t[0] ?? 0}`).join('|'));
+    for (const gk of Object.keys(byGroup)) {
+      const [market, inst] = gk.split('|');
+      // one profile per timeframe present
+      const tfs = [...new Set(byGroup[gk].map(t => t.timeframe))];
+      for (const tf of tfs) {
+        const trades = byGroup[gk].filter(t => t.timeframe === tf);
+        const cells = engine.aggregateProfile(trades);
+        const classified: Record<string, any> = {};
+        for (const k of Object.keys(cells)) classified[k] = engine.classifyCell(cells[k], {});
+        const merged = engine.mergeBuckets(cells, classified);
+        const eligible = Object.keys(cells).filter(k => classified[k].status === 'RANKABLE')
+          .map(k => { const [bucket, family, direction, regime] = k.split('|'); return { bucket, family, direction, regime, timeframe: tf, status: 'RANKABLE', n: cells[k].train.n, sessions: cells[k].train.sessions, oos_expectancy: cells[k].oos.expectancy, oos_pf: cells[k].oos.profitFactor }; });
+        profiles.push({
+          profile_id: engine.profileId(market, inst === 'OPT' ? 'OPT' : 'FUT', String(tf), st.runId || 'norun', dataHash),
+          market, instrument: inst === 'OPT' ? 'OPTIONS' : 'FUTURES', timeframe: tf,
+          data_start: new Date(byGroup[gk][0].entryTime).toISOString(), data_end: new Date(byGroup[gk][byGroup[gk].length - 1].entryTime).toISOString(),
+          generated_at: new Date().toISOString(), engine_version: '1.0.0', engine_hash: 'version-stamp-only (browser)',
+          data_hash: dataHash, strategy_hash: engine.hashRecord(Object.keys(byGroup[gk]).length + ':' + tf),
+          sampler_seed: 'deterministic (Halton/none)',
+          validation_status: eligible.length ? 'HAS_RANKABLE_CELLS' : 'NO_RANKABLE_CELLS',
+          parameters_locked: true, reoptimized: false,
+          cells, classified, merged, eligible,
+        });
+      }
+    }
+    // transfer: futures vs options of the same market+TF on shared cell keys
+    const transfer: any[] = [];
+    const fProfs = profiles.filter(p => p.instrument === 'FUTURES');
+    const oProfs = profiles.filter(p => p.instrument === 'OPTIONS');
+    for (const fp of fProfs) for (const op of oProfs) {
+      if (fp.market !== op.market || fp.timeframe !== op.timeframe) continue;
+      const fCells: Record<string, any> = {}, oCells: Record<string, any> = {};
+      for (const k of Object.keys(fp.cells)) { const p = k.split('|'); fCells[p.slice(0, 4).join('|')] = { status: fp.classified[k].status, train: fp.cells[k].train }; }
+      for (const k of Object.keys(op.cells)) { const p = k.split('|'); oCells[p.slice(0, 4).join('|')] = { status: op.classified[k].status, train: op.cells[k].train }; }
+      for (const k of Object.keys(fCells)) {
+        if (!oCells[k]) continue;
+        transfer.push({ market: fp.market, timeframe: fp.timeframe, cell: k, futures: fCells[k].status, options: oCells[k].status, result: engine.classifyTransfer(fCells[k], oCells[k]) });
+      }
+    }
+    useStore.getState().set({ lastProfiles: profiles, lastTransfer: transfer });
+    // ---- §24 report ----
+    logLine('===== DYNAMIC TIME-OF-DAY DISCOVERY =====');
+    logLine(`  rebuilt=${rebuilt} candidates (top-${rows.length} board, train+OOS trades) profiles=${profiles.length}`);
+    for (const p of profiles) {
+      logLine(`  ${p.profile_id}: ${p.validation_status} eligible=${p.eligible.length} merged=${p.merged.length} ranges=${p.data_start.slice(0, 10)}→${p.data_end.slice(0, 10)}`);
+      p.eligible.slice(0, 6).forEach((e: any) => logLine(`    ELIGIBLE ${e.bucket} ${e.family}/${e.direction} n=${e.n} sess=${e.sessions} oos_exp=${e.oos_expectancy} oos_pf=${e.oos_pf}`));
+    }
+    logLine('===== TIME PROFILE ===== (NIFTY/BANKNIFTY × FUTURES/OPTIONS)');
+    for (const p of profiles) logLine(`  ${p.profile_id}: ${p.eligible.length} eligible cells (${p.validation_status})`);
+    if (!profiles.length) logLine('  TIME PROFILE = NONE (no attributed trades)');
+    logLine('===== FUTURES → OPTIONS TRANSFER =====');
+    if (!transfer.length) logLine('  TRANSFER = INSUFFICIENT_DATA (needs both instrument types in one run)');
+    else {
+      const counts: Record<string, number> = {};
+      for (const t of transfer) counts[t.result] = (counts[t.result] || 0) + 1;
+      logLine('  ' + Object.entries(counts).map(([k, v]) => `${k}=${v}`).join(' '));
+      transfer.filter(t => t.result === 'TRANSFERRED').slice(0, 5).forEach(t => logLine(`  TRANSFERRED ${t.market} ${t.timeframe}m ${t.cell}`));
+    }
+    // concentration flags + cost-sensitivity on profiled rows
+    try {
+      let concLogged = 0;
+      for (const r of rows.slice(0, 20)) {
+        const cc = (r as any).concentration;
+        if (cc && cc.timeConcentrated) {
+          if (concLogged < 5) logLine(`  TIME_CONCENTRATED [${r.symbol}] ${r.indicator}: top-session ${cc.topSessionPct}% over ${cc.sessions} sessions, ${cc.expiries} expiries — cannot become BEST_ROBUST/PAPER`);
+          concLogged++;
+        }
+      }
+      if (concLogged > 5) logLine(`  …+${concLogged - 5} more TIME_CONCENTRATED rows`);
+      const top5 = (useStore.getState().board || []).slice(0, 5);
+      for (const r of top5) {
+        const det = detailFor(r);
+        if (!det) continue;
+        const base = tradeOpts();
+        const eff2: any = Object.assign({}, base, {
+          sessionMask: new Int8Array(det.data.c.length).fill(1),
+          slPct: r.slPct, tpPct: r.tpPct, trailPct: r.trailPct ?? base.trailPct,
+          exit: r.exit || 'fixed', carry: !!r.carry,
+        });
+        const bt2 = engine.backtest(det.data, det.sig.pos, Object.assign({}, eff2, { cost: (base.cost || 0) * 2 }));
+        if (det.bt.metrics.netPnL > 0 && bt2.metrics.netPnL <= 0)
+          logLine(`  COST_SENSITIVITY_FAILURE [${r.symbol}] ${r.indicator}: +P&L at 1x cost, ≤0 at 2x cost`);
+      }
+    } catch (e: any) { logLine('cost-sensitivity check skipped: ' + (e?.message || e)); }
+  } catch (e: any) { logLine('profiles skipped: ' + (e?.message || e)); }
 }
 
 // Hard adaptive gate: raw Sharpe is necessary but never sufficient. With

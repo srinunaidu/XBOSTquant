@@ -107,7 +107,7 @@ function parseExpiryFlex(s){
     const mon={JAN:0,FEB:1,MAR:2,APR:3,MAY:4,JUN:5,JUL:6,AUG:7,SEP:8,OCT:9,NOV:10,DEC:11}[m[2]];
     if(mon==null)return NaN;
     let y=+m[3]; if(y<100)y+=2000;
-    return new Date(y,mon,+m[1]).getTime();
+    return Date.UTC(y,mon,+m[1])-IST_OFFSET_MS; // IST midnight, host-independent
   }
   const v=Date.parse(t);
   return isNaN(v)?NaN:v;
@@ -2577,6 +2577,151 @@ function replayAudit(art){
 }
 
 // ---------- Research ranking: single canonical ordering ----------
+// ---------- Dynamic time-of-day discovery primitives ----------
+// All functions are pure + deterministic. Buckets are fixed 15m IST grid
+// cells (boundary optimization is deferred: boundaries are parameters and
+// would need nested OOS; instead fixed cells are validated OOS and only
+// adjacent same-sign RANKABLE cells merge — conservative, logged).
+// A "cell" groups trades by (bucket, family, direction, regime, timeframe).
+function todBucket15(t){
+  const p=istParts(t);
+  const mins=p.h*60+p.m;
+  const b=Math.floor(mins/15)*15;
+  const hh=String(Math.floor(b/60)).padStart(2,'0'), mm=String(b%60).padStart(2,'0');
+  const hh2=String(Math.floor((b+15)/60)).padStart(2,'0'), mm2=String((b+15)%60).padStart(2,'0');
+  return `${hh}:${mm}-${hh2}:${mm2}`;
+}
+function cellKey(c){ return [(c.bucket||todBucket15(c.entryTime)),c.family,c.direction,c.regime,c.timeframe].join('|'); }
+// aggregateProfile(trades): trades carry {pnl, entryTime, session, expiry,
+// family, direction, regime, timeframe, fold ('train1..3'|'oos'), mae, mfe}.
+// Returns per-cell stats with IS/train aggregates, fold stability and OOS.
+function aggregateProfile(trades){
+  const cells={};
+  const grp={};
+  for(const t of trades){
+    const k=cellKey(t);
+    if(!grp[k])grp[k]=[];
+    grp[k].push(t);
+  }
+  for(const k of Object.keys(grp)){
+    const all=grp[k];
+    const tr=all.filter(t=>t.fold!=='oos'), oos=all.filter(t=>t.fold==='oos');
+    const stats=list=>{
+      const n=list.length;
+      if(!n)return {n:0};
+      const pnls=list.map(t=>t.pnl);
+      const wins=pnls.filter(p=>p>0).length;
+      const gp=pnls.filter(p=>p>0).reduce((a,x)=>a+x,0), gl=-pnls.filter(p=>p<0).reduce((a,x)=>a+x,0);
+      const mu=pnls.reduce((a,x)=>a+x,0)/n;
+      const sd=Math.sqrt(pnls.reduce((a,x)=>a+(x-mu)*(x-mu),0)/Math.max(1,n-1))||1e-9;
+      const bySess={}; for(const x of list){bySess[x.session]=(bySess[x.session]||0)+x.pnl;}
+      const sessN=Object.keys(bySess).length;
+      const profSess=Object.values(bySess).filter(v=>v>0).length;
+      const exps=new Set(list.map(x=>x.expiry||'').filter(Boolean));
+      const srt=[...pnls].sort((a,b)=>a-b);
+      const tot=Math.abs(pnls.reduce((a,x)=>a+x,0))||1e-9;
+      const top1=Math.max(0,...srt.slice(-1))/tot*100, top5=srt.slice(-5).filter(x=>x>0).reduce((a,x)=>a+x,0)/tot*100;
+      const maes=list.map(x=>x.mae||0), mfes=list.map(x=>x.mfe||0);
+      return {n, sessions:sessN, expiries:exps.size, wr:+(100*wins/n).toFixed(2),
+        expectancy:+mu.toFixed(4), pf:+(gl>0?gp/gl:(gp>0?99.99:0)).toFixed(3),
+        net:+pnls.reduce((a,x)=>a+x,0).toFixed(2), maxDD:null,
+        sharpe:+(mu/sd*Math.sqrt(252)).toFixed(2),
+        avgHold:+(list.reduce((a,x)=>a+(x.hold||0),0)/n).toFixed(1),
+        avgMAE:+(maes.reduce((a,x)=>a+x,0)/n).toFixed(2), avgMFE:+(mfes.reduce((a,x)=>a+x,0)/n).toFixed(2),
+        bestPct:+top1.toFixed(1), top5Pct:+top5.toFixed(1),
+        profitableSessionsPct:+(sessN?100*profSess/sessN:0).toFixed(1)};
+    };
+    // fold stability over train folds only
+    const folds=[1,2,3].map(f=>tr.filter(t=>t.fold==='train'+f).map(t=>t.pnl));
+    const fexp=folds.map(pn=>pn.length?pn.reduce((a,x)=>a+x,0)/pn.length:null);
+    const live=fexp.filter(v=>v!=null);
+    const srtF=[...live].sort((a,b)=>a-b);
+    const q=p=>srtF.length?srtF[Math.min(srtF.length-1,Math.floor(p*srtF.length))]:null;
+    const [bkt,fam,dir,reg,tf]=k.split('|');
+    cells[k]={bucket:bkt, family:fam, direction:dir, regime:reg, timeframe:+tf,
+      train:stats(tr), oos:stats(oos),
+      profitable_folds:live.filter(v=>v>0).length, folds_evaluated:live.length,
+      worst_fold:srtF.length?+srtF[0].toFixed(4):null, median_fold:srtF.length?+q(0.5).toFixed(4):null,
+      p10_fold:srtF.length?+q(0.1).toFixed(4):null, p90_fold:srtF.length?+q(0.9).toFixed(4):null};
+  }
+  return cells;
+}
+// classifyCell: INSUFFICIENT / EXPLORATORY / RANKABLE (+TIME_CONCENTRATED).
+function classifyCell(cell, cfg){
+  cfg=cfg||{};
+  const minN=cfg.minCellTrades==null?20:cfg.minCellTrades;
+  const minSess=cfg.minCellSessions==null?8:cfg.minCellSessions;
+  const t=cell.train||{n:0};
+  if(t.n<10)return {status:'INSUFFICIENT', reasons:['CELL_N_LT_10']};
+  if(t.n<minN||t.sessions<minSess)return {status:'EXPLORATORY', reasons:['CELL_THIN']};
+  const reasons=[];
+  if(t.expiries<=1)reasons.push('SINGLE_EXPIRY');
+  if(cell.profitable_folds<2)reasons.push('UNSTABLE_FOLDS');
+  if(t.top5Pct>50)reasons.push('CONCENTRATED_TOP5');
+  const o=cell.oos||{n:0};
+  if(o.n>=5&&!(o.expectancy>0))reasons.push('OOS_NEGATIVE');
+  if(reasons.length)return {status:reasons.includes('OOS_NEGATIVE')?'EXPLORATORY':'RANKABLE', reasons, timeConcentrated:reasons.includes('CONCENTRATED_TOP5')||t.expiries<=1};
+  return {status:'RANKABLE', reasons:[], timeConcentrated:false};
+}
+// mergeBuckets: merge ADJACENT same-(family,direction,regime,timeframe)
+// buckets when both RANKABLE with same expectancy sign. Logged, conservative.
+function mergeBuckets(cells, classified){
+  const groups={};
+  for(const k of Object.keys(cells)){
+    const [b,fam,dir,reg,tf]=k.split('|');
+    const gk=[fam,dir,reg,tf].join('|');
+    (groups[gk]=groups[gk]||[]).push(k);
+  }
+  const merged=[];
+  for(const gk of Object.keys(groups)){
+    const ks=groups[gk].sort();
+    let run=[ks[0]];
+    const flush=()=>{ if(run.length>1)merged.push(run); run=[ks[ks.length-1]]; };
+    for(let i=1;i<ks.length;i++){
+      const a=cells[ks[i-1]], b=cells[ks[i]];
+      const ca=classified[ks[i-1]], cb=classified[ks[i]];
+      const adjacent=isAdjacentBucket(ks[i-1].split('|')[0], ks[i].split('|')[0]);
+      if(adjacent&&ca&&cb&&ca.status==='RANKABLE'&&cb.status==='RANKABLE'&&
+        Math.sign(a.train.expectancy||0)===Math.sign(b.train.expectancy||0)&& (a.train.expectancy||0)!==0) run.push(ks[i]);
+      else { if(run.length>1)merged.push(run); run=[ks[i]]; }
+    }
+    if(run.length>1)merged.push(run);
+  }
+  return merged;
+}
+function isAdjacentBucket(b1, b2){
+  const toMin=s=>{const [h,m]=s.split(':').map(Number);return h*60+m;};
+  try{
+    const [s1,e1]=b1.split('-'), [s2]=b2.split('-');
+    return toMin(e1)===toMin(s2);
+  }catch(e){return false;}
+}
+// classifyTransfer: futures cell vs options cell on shared keys.
+function classifyTransfer(fCell, oCell){
+  if(!fCell||!oCell)return 'INSUFFICIENT_DATA';
+  const f=fCell.status, o=oCell.status;
+  const fOk=f==='RANKABLE', oOk=o==='RANKABLE';
+  const sameDir=Math.sign(fCell.train.expectancy||0)===Math.sign(oCell.train.expectancy||0);
+  if(fOk&&oOk)return sameDir?'TRANSFERRED':'FAILED_TRANSFER';
+  if(fOk&&!oOk)return 'PARTIALLY_TRANSFERRED';
+  if(!fOk&&oOk)return 'OPTIONS_ONLY';
+  if(!fOk&&!oOk)return (f==='INSUFFICIENT'&&o==='INSUFFICIENT')?'INSUFFICIENT_DATA':'FAILED_TRANSFER';
+  return 'FUTURES_ONLY';
+}
+// consumeProfile: locked-profile gate for live/paper (no live loop exists;
+// this is the pure decision function, unit-tested, ready to wire).
+// Returns {decision:'TRADE'|'NO_TRADE'|'NO_PROFILE'|'PROFILE_INVALID', families, reason}.
+function consumeProfile(profile, q){
+  if(!profile)return {decision:'NO_PROFILE', families:[], reason:'no profile supplied'};
+  if(!profile.locked)return {decision:'PROFILE_INVALID', families:[], reason:'profile not locked'};
+  if(profile.market!==q.market||profile.instrument!==q.instrument)return {decision:'NO_PROFILE', families:[], reason:'market/instrument mismatch'};
+  const hits=(profile.eligible||[]).filter(e=>e.bucket===q.bucket&&e.timeframe===q.timeframe&&(!q.regime||e.regime===q.regime));
+  if(!hits.length)return {decision:'NO_TRADE', families:[], reason:'no validated family for bucket'};
+  return {decision:'TRADE', families:hits.map(h=>h.family), reason:hits.length+' eligible familie(s)'};
+}
+function profileId(market, instrument, tf, runId, dataHash){
+  return `TOD_${market}_${instrument}_${tf}M_${runId}_${String(dataHash||'nodata').slice(0,8)}`;
+}
 // ---------- Research scoring: multi-metric, sample-aware ----------
 // LAYER MODEL: RAW_METRICS (informational, everything calculated) →
 // RANKABLE_METRICS (composite score determines selection order) →
@@ -2746,7 +2891,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,todBucket15,aggregateProfile,classifyCell,mergeBuckets,classifyTransfer,consumeProfile,profileId,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

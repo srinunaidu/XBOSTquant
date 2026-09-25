@@ -84,6 +84,8 @@ type State = {
   runId: string;
   lastAudit: any | null;
   lastAllRows: any[];
+  lastProfiles: any[];
+  lastTransfer: any[];
   exchange: string;
   ivMaxRank: number | null;
   excludeExpiry: boolean;
@@ -166,6 +168,8 @@ export const useStore = create<State>((set) => ({
   runId: '',
   lastAudit: null,
   lastAllRows: [],
+  lastProfiles: [],
+  lastTransfer: [],
   exchange: 'auto',
   ivMaxRank: null,
   excludeExpiry: false,
