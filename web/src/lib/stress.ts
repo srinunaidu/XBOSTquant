@@ -86,8 +86,8 @@ export const HEAT_BUCKETS_MCX = [
 export function heatmap(trades: Trade[], buckets = HEAT_BUCKETS) {
   return buckets.map(b => {
     const ts = trades.filter(t => {
-      const dt = new Date(t.exitTime);
-      const m = dt.getHours() * 60 + dt.getMinutes();
+      // IST wall-clock minutes (strategy clock, not viewer clock)
+      const m = Math.floor((t.exitTime + 19800000) / 60000) % 1440;
       return m >= b.from && m < b.to;
     });
     const pnl = ts.reduce((s, t) => s + t.pnl, 0);

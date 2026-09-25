@@ -42,7 +42,7 @@ export default function RunSummary() {
           {kv('Day/carry', (lastRun.exec.carry || []).join('/'))}
           {kv('Regime', `${lastRun.exec.regime} @${Math.round((lastRun.exec.confGate ?? 0.6) * 100)}%`)}
           {kv('Qty × lot', `${lastRun.sizing.qty}×${lastRun.sizing.lot}`)}
-          {kv('Cost', '₹' + lastRun.sizing.cost)}
+          {kv('Cost', '₹' + lastRun.risk.cost)}
         </div>
         <div>
           <div className="lbl mb-1">Best found {b?.refined ? '(refined 🔁)' : ''}</div>

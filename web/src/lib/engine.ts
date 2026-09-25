@@ -31,6 +31,7 @@ export type BoardRow = {
   oosNet?: number; oosWR?: number; oosN?: number; survived?: boolean | null;
   oosFolds?: { net: number; wr: number; n: number; sharpe?: number; skipped: boolean }[];
   robustScore?: number; robustness?: any;
+  rawRank?: number; rawObjective?: { key: string; value: number };
   oosSharpe?: number | null; oosDegr?: number | null;
 };
 
@@ -61,6 +62,14 @@ export interface Engine {
   itrend(close: Float64Array, alpha?: number): { trend: Float64Array; trig: Float64Array };
   adaptivePeriod(base: number, cycle: number | null, min?: number, max?: number): number;
   rankResults(rows: BoardRow[], objective: string): BoardRow[];
+  RESEARCH_OBJS: [string, string][];
+  researchValue(m: any, key: string): number;
+  researchCmp(key: string): (a: BoardRow, b: BoardRow) => number;
+  auditRankingIntegrity(allRows: BoardRow[], displayed: BoardRow[]): { objective: string; key: string; pass: boolean; maxRow: string | null; maxValue: number | null; displayed: string | null }[];
+  IST_OFFSET_MS: number;
+  istParts(t: number): { h: number; m: number; y: number; mo: number; day: number };
+  istDayKey(t: number): string;
+  istDayIndex(t: number): number;
   paperEligible(row: BoardRow, o?: { scoreThreshold?: number; requireWF?: boolean; minTrades?: number; cost?: number; allowZeroCost?: boolean }): { eligible: boolean; reasons: string[]; warnings?: string[] };
   demoteKnifeEdge(ranked: BoardRow[], pssOf: (r: BoardRow) => number | null): BoardRow[];
   parseExpiryFlex(s: any): number;

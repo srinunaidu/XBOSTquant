@@ -376,6 +376,9 @@ function RegimeSection() {
   const regimeSource = useStore(s => s.regimeSource);
   const granularity = useStore(s => s.granularity);
   const confGate = useStore(s => s.confGate);
+  const routerV2 = useStore(s => s.routerV2);
+  const routerPersist = useStore(s => s.routerPersist);
+  const routerHyst = useStore(s => s.routerHyst);
   const set = useStore(s => s.set);
   return (
     <section className="card p-3">
@@ -385,13 +388,13 @@ function RegimeSection() {
         Route entries by regime (trend / range / high-vol)
       </label>
       <label className="flex items-center gap-2 text-[11px] text-emerald-300 mt-1.5 cursor-pointer">
-        <input type="checkbox" checked={useStore(s => s.routerV2)} onChange={e => set({ routerV2: e.target.checked })} />
+        <input type="checkbox" checked={routerV2} onChange={e => set({ routerV2: e.target.checked })} />
         Router v2 — persistence + hysteresis (anti flip-flop) ★
       </label>
-      {useStore(s => s.routerV2) && (
+      {routerV2 && (
         <div className="grid grid-cols-2 gap-2 mt-1.5">
-          <Num label="Persist bars" value={useStore(s => s.routerPersist)} onChange={(v: number) => set({ routerPersist: Math.max(1, v || 5) })} />
-          <Num label="Hysteresis +" value={useStore(s => s.routerHyst)} onChange={(v: number) => set({ routerHyst: Math.max(0, v || 0) })} />
+          <Num label="Persist bars" value={routerPersist} onChange={(v: number) => set({ routerPersist: Math.max(1, v || 5) })} />
+          <Num label="Hysteresis +" value={routerHyst} onChange={(v: number) => set({ routerHyst: Math.max(0, v || 0) })} />
         </div>
       )}
       <div className="flex gap-3 text-xs mt-1.5">

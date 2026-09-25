@@ -10,13 +10,15 @@ function parseDateFlex(s){
   s=String(s).trim();
   if(/^\d{13,}$/.test(s))return +s; // epoch ms
   if(/^\d{10}$/.test(s)&&+s>946684800&&+s<4102444800)return +s*1000; // epoch s (also matches YYYYMMDD range? no: YYYYMMDD 20150101 < 946684800? 20150101 < 946684800 yes! safe)
-  if(/^\d{8}$/.test(s)){ // YYYYMMDD
+  if(/^\d{8}$/.test(s)){ // YYYYMMDD → IST midnight
     const y=+s.slice(0,4),m=+s.slice(4,6),d=+s.slice(6,8);
-    if(m>=1&&m<=12&&d>=1&&d<=31)return new Date(y,m-1,d).getTime();
+    if(m>=1&&m<=12&&d>=1&&d<=31)return Date.UTC(y,m-1,d)-IST_OFFSET_MS;
     return NaN;
   }
+  const hasTZ=/([Zz]|[+-]\d{2}:?\d{2})$/.test(s);
   const p=Date.parse(s.replace(' ', 'T'));
-  return isNaN(p)?NaN:p;
+  if(isNaN(p))return NaN;
+  return hasTZ?p:istFromNaive(p); // naive stamps are IST wall-clock, not host-local
 }
 function parseTimeFlex(s){
   const m=/^(\d{1,2}):(\d{2})(?::(\d{2}))?/.exec(String(s||'').trim());
@@ -122,7 +124,7 @@ function extractRows(grid, start, col, onlySym){
     if (col.dtI>=0) t=parseDateFlex(p[col.dtI]);
     else if (col.dateI>=0){
       const base=parseDateFlex(p[col.dateI]);
-      if(col.timeI>=0){const tm=parseTimeFlex(p[col.timeI]); t=isNaN(base)||!tm?NaN:new Date(new Date(base).getFullYear(),new Date(base).getMonth(),new Date(base).getDate(),tm.h,tm.min,tm.s).getTime();}
+      if(col.timeI>=0){const tm=parseTimeFlex(p[col.timeI]); if(isNaN(base)||!tm){t=NaN;}else{const bp=istParts(base);t=Date.UTC(bp.y,bp.mo,bp.day,tm.h,tm.min,tm.s)-IST_OFFSET_MS;}}
       else t=base;
     }
     else if (col.timeI>=0){
@@ -384,7 +386,7 @@ function adx(h,l,c,p){
 function vwapSeries(d){
   const n=d.c.length,out=new Float64Array(n).fill(NaN);
   let pv=0,vv=0,day='';
-  const fmt=t=>new Date(t).toDateString();
+  const fmt=t=>istDayKey(t);
   for(let i=0;i<n;i++){
     const dd=fmt(d.t[i]);
     if(dd!==day){day=dd;pv=0;vv=0;}
@@ -530,7 +532,7 @@ function cvdSeries(d){
   // Cumulative Volume Delta (tick-rule proxy), reset each session
   const n=d.c.length,out=new Float64Array(n).fill(NaN);
   let cum=0,day='';
-  const fmt=t=>new Date(t).toDateString();
+  const fmt=t=>istDayKey(t);
   for(let i=0;i<n;i++){
     const dd=fmt(d.t[i]);
     if(dd!==day){day=dd;cum=0;}
@@ -1041,8 +1043,8 @@ function regimeFeatures(d){
       vsma[i]>0?Math.min(3,(d.v[i]||0)/vsma[i]):1,
       0.5, 0
     ];
-    const dt=new Date(d.t[i]);
-    f[8]=((dt.getHours()*60+dt.getMinutes())-555)/375; // minutes since 09:15 / session
+    const ip=istParts(d.t[i]);
+    f[8]=((ip.h*60+ip.m)-555)/375; // minutes since 09:15 IST / session
     for(let k=0;k<F;k++)X[i*F+k]=(k===F-1)?1:(isFinite(f[k])?f[k]:0);
   }
   return {X, n, p:F};
@@ -1118,7 +1120,7 @@ function trainRegimeML(d, isFrac, K, iters, maxTrain){
 // strictly prior-session bars — no leakage by construction.
 function daySegments(d){
   const segs=[];let s=0,cur='';
-  const key=t=>new Date(t).toDateString();
+  const key=t=>istDayKey(t);
   for(let i=0;i<d.t.length;i++){
     const k=key(d.t[i]);
     if(i===0)cur=k;
@@ -1328,6 +1330,19 @@ function validateLayers(d, o){
 
 // ---------- backtest ----------
 function timeToMin(s){const[a,b]=s.split(':').map(Number);return a*60+b;}
+// ---------- Timezone pin: Asia/Kolkata (IST, fixed +05:30, no DST) ----------
+// Strategy/session math MUST NOT depend on viewer-local time: session masks,
+// day boundaries, VWAP/CVD resets, expiry-day checks and ML clock features
+// all use IST wall-clock derived from epoch ms. Only display formatting may
+// use local time. Verified identical under TZ=UTC/Asia_Kolkata/America_New_York.
+const IST_OFFSET_MS=19800000;
+function istParts(t){ const d=new Date(t+IST_OFFSET_MS); return {h:d.getUTCHours(),m:d.getUTCMinutes(),y:d.getUTCFullYear(),mo:d.getUTCMonth(),day:d.getUTCDate()}; }
+function istDayKey(t){ const p=istParts(t); return p.y+'-'+p.mo+'-'+p.day; }
+function istDayIndex(t){ return Math.floor((t+IST_OFFSET_MS)/86400000); }
+function istFromNaive(ms){ // reinterpret a locally-parsed naive stamp as IST wall-clock
+  const off=new Date(ms).getTimezoneOffset()*60000;
+  return ms-off-IST_OFFSET_MS;
+}
 // ---------- Exchange-aware sessions ----------
 // NSE equity/F&O 09:15–15:30 IST; MCX commodities 09:00–23:30; NCDEX 09:00–21:00.
 // detectExchange sniffs the symbol; resolveSession returns {exchange,start,end}
@@ -1396,9 +1411,9 @@ function buildExpiryMask(d, excludeExpiry){
   const n=d.c.length, out=new Int8Array(n).fill(1);
   const ex=d.contract&&isFinite(d.contract.expiryMs)?d.contract.expiryMs:null;
   if(!excludeExpiry||ex==null)return out;
-  const ed=new Date(ex);
-  const ey=ed.getFullYear(), em=ed.getMonth(), eday=ed.getDate();
-  for(let i=0;i<n;i++){const t=new Date(d.t[i]);out[i]=(t.getFullYear()===ey&&t.getMonth()===em&&t.getDate()===eday)?0:1;}
+  const eyp=istParts(ex);
+  const ey=eyp.y, em=eyp.mo, eday=eyp.day;
+  for(let i=0;i<n;i++){const p=istParts(d.t[i]);out[i]=(p.y===ey&&p.mo===em&&p.day===eday)?0:1;}
   return out;
 }
 
@@ -1408,7 +1423,7 @@ function buildSessionMask(d, startStr, endStr){
   const n=d.c.length, mask=new Int8Array(n);
   if(!startStr||!endStr){mask.fill(1);return mask;}
   const s0=timeToMin(startStr), s1=timeToMin(endStr);
-  for(let i=0;i<n;i++){const dt=new Date(d.t[i]);const m=dt.getHours()*60+dt.getMinutes();mask[i]=(m>=s0&&m<=s1)?1:0;}
+  for(let i=0;i<n;i++){const p=istParts(d.t[i]);const m=p.h*60+p.m;mask[i]=(m>=s0&&m<=s1)?1:0;}
   return mask;
 }
 // Intraday window mask: 1 inside the allowed [fromMin,toMin) buckets (local clock).
@@ -1417,7 +1432,7 @@ function buildSessionMask(d, startStr, endStr){
 function buildWindowMask(t, wins){
   const n=t.length, m=new Int8Array(n);
   if(!wins||!wins.length){m.fill(1);return m;}
-  for(let i=0;i<n;i++){const dt=new Date(t[i]);const mm=dt.getHours()*60+dt.getMinutes();
+  for(let i=0;i<n;i++){const p=istParts(t[i]);const mm=p.h*60+p.m;
     let ok=0;for(let k=0;k<wins.length;k++){const w=wins[k];if(mm>=w[0]&&mm<w[1]){ok=1;break;}}
     m[i]=ok;}
   return m;
@@ -1484,8 +1499,23 @@ function backtest(d, sigPos, opts){
   // after any exit the engine stands aside until the next new trigger.
   const trigOnly=(opts.entry==='trigger');
   let prevAct=99, lastExitBar=-1;
+  // Options expiry enforcement: a contract cannot be entered at/after its
+  // expiry timestamp, and any open position is force-liquidated there
+  // (reason EXPIRY). Futures/equity (no contract meta) are unaffected.
+  const exMs=(d.contract&&isFinite(d.contract.expiryMs))?d.contract.expiryMs:0;
+  const respectExpiry=opts.respectExpiry===false?false:true;
   for(let i=1;i<n;i++){
     const px=d.c[i], ox=d.o[i];
+    const expired=respectExpiry&&exMs&&d.t[i]>=exMs;
+    if(position!==0&&expired){
+      const units=qty*lotSize;
+      const exitPx=fillNext?ox:px;
+      const pnl=(position===1?(exitPx-entryPx):(entryPx-exitPx))*units-costPerTrade;
+      const pnlPct=position===1?(exitPx-entryPx)/entryPx*100:(entryPx-exitPx)/entryPx*100;
+      trades.push({id:trades.length+1,entryIdx,exitIdx:i,entryTime:d.t[entryIdx],exitTime:d.t[i],entryPx,exitPx,type:position===1?'LONG':'SHORT',pnl,pnlPct,reason:'EXPIRY',mae:+trMAE.toFixed(2),mfe:+trMFE.toFixed(2),lat:fillNext?1:0});
+      position=0;curQty=0;liveEq+=pnl;lastExitBar=i;eqMtm[i]=liveEq;
+      continue;
+    }
     const decTgt=desiredTarget(i);
     const actTgt=fillNext?pendTgt:decTgt;
     pendTgt=decTgt;
@@ -1553,7 +1583,7 @@ function backtest(d, sigPos, opts){
         // (no point burning 1M-bar loops for a dead parameter set).
         if(liveEq<=0){ruined=true;for(let j=i;j<n;j++)eqMtm[j]=liveEq;lastExitBar=i;break;}
         // immediate re-entry on flip (mask already enforced via tgt)
-        if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&(!opts.premiumFloor||!(fillPx<opts.premiumFloor))){
+        if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&(!opts.premiumFloor||!(fillPx<opts.premiumFloor))&&!expired){
           position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;
           hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
         }
@@ -1564,7 +1594,7 @@ function backtest(d, sigPos, opts){
     } else {
       const allowEntry=!trigOnly||(edge&&i>lastExitBar);
       const premOk=!opts.premiumFloor||!(fillPx<opts.premiumFloor); // options: never buy dust (sub-floor premium)
-      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry&&premOk){
+      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry&&premOk&&!expired){
         position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;
         hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
       }
@@ -1606,11 +1636,11 @@ function backtest(d, sigPos, opts){
   const dayPnl={};
   for(const t of trades){const dy=Math.floor(t.exitTime/86400000);dayPnl[dy]=(dayPnl[dy]||0)+t.pnl;}
   let days=0,lastDay=-1;
-  for(let i=0;i<n;i++){const dy=Math.floor(d.t[i]/86400000);if(dy!==lastDay){lastDay=dy;days++;}}
+  for(let i=0;i<n;i++){const dy=istDayIndex(d.t[i]);if(dy!==lastDay){lastDay=dy;days++;}}
   const tradesPerDay=days>0?trades.length/days:trades.length;
   const dret=[];
   { const seen={};
-    for(let i=0;i<n;i++){const dy=Math.floor(d.t[i]/86400000);if(!seen[dy]){seen[dy]=1;dret.push((dayPnl[dy]||0)/Math.max(1e-9,capital0));}} }
+    for(let i=0;i<n;i++){const dy=istDayIndex(d.t[i]);if(!seen[dy]){seen[dy]=1;dret.push((dayPnl[dy]||0)/Math.max(1e-9,capital0));}} }
   function mean(a){if(!a.length)return 0;let s=0;for(const x of a)s+=x;return s/a.length;}
   function sd(a,m){if(a.length<2)return 0;let s=0;for(const x of a)s+=(x-m)*(x-m);return Math.sqrt(s/(a.length-1));}
   const dm=mean(dret),dsd=sd(dret,dm);
@@ -1983,7 +2013,7 @@ function paperEligible(row, o){
   else if(rb.paramSensitivity.skipped) reasons.push(`PSS skipped (n=${rb.paramSensitivity.baseTrades}<30)`);
   else if(rb.paramSensitivity.knifeEdge) reasons.push(`knife-edge PSS=${rb.paramSensitivity.pss}`);
   if(o.requireWF!==false){
-    if(row.survived==null) reasons.push('no OOS verdict (enable walk-forward)');
+    if(row.survived==null) reasons.push('no OOS verdict (thin OOS folds — enable walk-forward already on? widen OOS window)');
     else if(!row.survived) reasons.push('OOS not survived');
   }
   return {eligible:reasons.length===0, reasons, warnings};
@@ -2001,6 +2031,43 @@ function demoteKnifeEdge(ranked, pssOf){
   return clean.concat(edge);
 }
 
+// ---------- Research ranking: single canonical ordering ----------
+// RESEARCH_OBJS: the five discovery objectives. researchValue guards NaN/
+// undefined explicitly (±Infinity never wins; -Infinity never tops).
+// Tie-break chain (explicit, deterministic): primary → netPnL → trades →
+// maxDD (higher) → row index. rankResults below implements exactly this.
+const RESEARCH_OBJS=[['netPnL','NET_PNL'],['winRate','WIN_RATE'],['expectancy','EXPECTANCY'],['profitFactor','PROFIT_FACTOR'],['sharpe','SHARPE']];
+function researchValue(m, key){
+  if(!m)return -Infinity;
+  const v=m[key];
+  if(typeof v!=='number'||!isFinite(v))return -Infinity;
+  return v;
+}
+function researchCmp(key){
+  return (a,b)=>(researchValue(b.m,key)-researchValue(a.m,key))
+    ||((b.m.netPnL||0)-(a.m.netPnL||0))
+    ||((b.m.totalTrades||0)-(a.m.totalTrades||0))
+    ||((b.m.maxDD||0)-(a.m.maxDD||0))
+    ||((a.i||0)-(b.i||0));
+}
+// auditRankingIntegrity(allRows, displayed): for each research objective,
+// argmax over the COMPLETE evaluated set vs displayed rank #1 under the same
+// objective (identity = cfgKey). Any mismatch → RANKING_INTEGRITY = FAIL.
+function auditRankingIntegrity(allRows, displayed){
+  return RESEARCH_OBJS.map(([key,label])=>{
+    // argmax with the SAME comparator the display sort uses (ties included)
+    const cmp=researchCmp(key);
+    let bi=null;
+    for(const r of allRows){ if(!bi||cmp(r,bi)<0) bi=r; }
+    const bv=bi?researchValue(bi.m,key):-Infinity;
+    const disp=(displayed||[]).slice().sort(researchCmp(key));
+    const d0=disp[0]||null;
+    const pass=!!(bi&&d0&&cfgKey(bi)===cfgKey(d0));
+    return {objective:label, key, pass,
+      maxRow:bi?cfgKey(bi):null, maxValue:isFinite(bv)?+bv.toFixed(4):null,
+      displayed:d0?cfgKey(d0):null};
+  });
+}
 function rankResults(rows, objective){
   // Do-nothing rows (0 trades: flat signals, warmup-only, unavailable legs)
   // always rank BELOW traded rows — otherwise a 0/0/0 row tops losing boards.
@@ -2015,7 +2082,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

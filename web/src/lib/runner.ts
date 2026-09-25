@@ -589,6 +589,39 @@ export async function runGrid() {
     doneBase += grid.length;
   }
   top = engine.rankResults(allRows, objective).slice(0, topN);
+  // Research union: top-20 per research objective are ALWAYS retained on the
+  // board, so no discovery (high-WR, high-P&L, …) can vanish merely because
+  // another objective was configured. Raw ranks stamped BEFORE any demotion.
+  try {
+    const keep = new Map<string, BoardRow>();
+    for (const r of top) keep.set(engine.cfgKey(r), r);
+    let extra = 0;
+    for (const [key] of (engine.RESEARCH_OBJS as [string, string][])) {
+      for (const r of [...allRows].sort(engine.researchCmp(key)).slice(0, 20)) {
+        const k = engine.cfgKey(r);
+        if (!keep.has(k)) { keep.set(k, r); extra++; }
+      }
+    }
+    top = [...keep.values()];
+    if (extra) logLine(`research union: +${extra} rows retained (top-20 per objective beyond top-${topN})`);
+  } catch (e: any) { logLine('research union skipped: ' + (e?.message || e)); }
+  try {
+    const fullRank = engine.rankResults(allRows, objective);
+    const rankOf = new Map<string, number>();
+    fullRank.forEach((r, i) => { if (!rankOf.has(engine.cfgKey(r))) rankOf.set(engine.cfgKey(r), i + 1); });
+    for (const r of top) {
+      r.rawRank = rankOf.get(engine.cfgKey(r));
+      r.rawObjective = { key: objective, value: engine.objectiveValue(r.m, objective) };
+    }
+  } catch { /* best-effort stamping */ }
+  // Ranking integrity: argmax over the COMPLETE evaluated set vs displayed
+  // #1, per research objective. Any mismatch is a loud FAIL, never silent.
+  try {
+    const audit = engine.auditRankingIntegrity(allRows, top);
+    const fails = audit.filter(a => !a.pass);
+    audit.forEach(a => logLine(`  rank[${a.objective}]: ${a.pass ? 'PASS' : 'FAIL'} max=${a.maxValue} @${(a.maxRow || '').slice(0, 60)}`));
+    logLine(fails.length ? `RANKING_INTEGRITY = FAIL (${fails.map(f => f.objective).join(',')})` : 'RANKING_INTEGRITY = PASS (5/5 objectives)');
+  } catch (e: any) { logLine('ranking audit skipped: ' + (e?.message || e)); }
   // Knife-edge demotion (uniform across worker + fallback paths): PSS ≥ 0.5
   // sinks below every clean row. Reuses worker robustness evidence when
   // present; otherwise probes PSS directly (session filter off — curvature
@@ -630,6 +663,34 @@ export async function runGrid() {
       logLine(formatCoreSignal(r));
     });
   }
+  // CONFIG_IDENTITY: candidate row == core display == robustness config.
+  // Rebuilds the robustness execution via effOptsFor and diffs every field.
+  try {
+    const champ = top[0];
+    if (champ) {
+      const symD = symData.find(([s]) => s === (champ.symbol || symData[0][0]));
+      const src = symD ? symD[1] : symData[0][1];
+      const dd = engine.resample(src, champ.timeframe);
+      const eff = Robust.effOptsFor(champ, opts, dd);
+      const diffs: string[] = [];
+      const cmp = (name: string, a: any, b: any) => { if (JSON.stringify(a) !== JSON.stringify(b)) diffs.push(`${name}: row=${JSON.stringify(a)} robust=${JSON.stringify(b)}`); };
+      // indicator+params travel as direct backtest args (same object — cannot
+      // diverge); everything below is reconstructed, so any drift is real.
+      cmp('slPct', champ.slPct ?? opts.slPct ?? 0, eff.slPct ?? 0);
+      cmp('tpPct', champ.tpPct ?? opts.tpPct ?? 0, eff.tpPct ?? 0);
+      cmp('trailPct', champ.trailPct ?? opts.trailPct ?? 0, eff.trailPct ?? 0);
+      cmp('exit', champ.exit || 'fixed', eff.exit || 'fixed');
+      cmp('carry', !!champ.carry, !!eff.carry);
+      cmp('direction', opts.direction, eff.direction);
+      cmp('fill', opts.fill, eff.fill);
+      cmp('entry', opts.entry, eff.entry);
+      cmp('cost', opts.cost, eff.cost);
+      cmp('sessionMaskLen', dd.c.length, (eff.sessionMask || []).length || dd.c.length);
+      logLine(diffs.length
+        ? `CONFIG_IDENTITY = FAIL :: ${diffs.join(' · ')}`
+        : `CONFIG_IDENTITY = PASS :: ${engine.cfgKey(champ).slice(0, 100)} (candidate=core=robustness=display)`);
+    }
+  } catch (e: any) { logLine('CONFIG_IDENTITY = SKIP (' + (e?.message || e) + ')'); }
   useStore.getState().set({ board: top });
   const s3 = useStore.getState();
   if (s3.stoppedFlag) stopped = true;
@@ -730,7 +791,28 @@ export async function runGrid() {
       if (S.bestTime) logLine(`  bestTime[best]: ${S.bestTime.w} WR=${S.bestTime.wr}% n=${S.bestTime.n} pnl=${S.bestTime.pnl}`);
     }
     logLine(`env: ${typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 120) : 'node'}`);
-    logLine(`env: ${typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 120) : 'node'}`);
+    // BEST_* per research objective over the COMPLETE evaluated set (raw —
+    // validation never hides these; WHY-NOT questions answer themselves here).
+    try {
+      for (const [key, label] of (engine.RESEARCH_OBJS as [string, string][])) {
+        const br = [...allRows].sort(engine.researchCmp(key))[0];
+        if (br) logLine(`  BEST_${label}: [${br.symbol || '?'}] ${br.timeframe}m ${br.indicator} ${fmtParams(br.params)} SL=${br.slPct} TP=${br.tpPct} exit=${br.exit || 'fixed'} value=${(engine.researchValue(br.m, key)).toFixed(2)} n=${br.m.totalTrades} wr=${br.m.winRate.toFixed(1)}%`);
+      }
+      const exitKinds = new Set(allRows.map(r => `${r.exit || 'fixed'}|${r.slPct}|${r.tpPct}|${r.trailPct || 0}|${r.carry ? 1 : 0}`));
+      logLine(`  EXIT_SEARCH: ${exitKinds.size} distinct exit configs evaluated across ${allRows.length} rows`);
+    } catch (e: any) { logLine('best-lists skipped: ' + (e?.message || e)); }
+    logLine('===== RESEARCH RUN AUDIT =====');
+    try {
+      const dh = dataHealth();
+      const sessions = new Set<string>();
+      for (const [ , dd] of symData) {
+        const step = Math.max(1, Math.floor(dd.t.length / 2000));
+        for (let i = 0; i < dd.t.length; i += step) { const d = new Date(dd.t[i] + 19800000); sessions.add(d.getUTCFullYear() + '-' + d.getUTCMonth() + '-' + d.getUTCDate()); }
+      }
+      logLine(`MODE=${st.instrumentMode || 'futures'} DATASET=${syms.map(([s]) => s).join('+')} SESSIONS=${sessions.size} CONTRACTS=${dh.contracts || syms.length} EXPIRIES=${dh.expiries.length || 1} TIMEZONE=Asia/Kolkata(pinned) COST_MODE=${opts.costMode === 'signal' ? 'ZERO' : 'REAL(' + opts.cost + ')'}`);
+      logLine(`CANDIDATES_GENERATED=${grid.length * symData.length} CANDIDATES_EVALUATED=${tested} CANDIDATES_DISPLAYED=${useStore.getState().board.length}`);
+      logLine(`OPTIONS_RESEARCH_READY=${st.instrumentMode === 'options' ? 'YES' : 'N/A'} OPTIONS_VALIDATION_READY=NO GENERALIZATION=UNVERIFIED MULTI_EXPIRY=${dh.expiries.length > 1 ? 'AVAILABLE' : 'NOT_AVAILABLE'}`);
+    } catch (e: any) { logLine('research audit skipped: ' + (e?.message || e)); }
     logLine('===== END SUMMARY =====');
   } catch (e: any) { logLine('summary build failed: ' + (e?.message || e)); }
   setRun({ current: '' });

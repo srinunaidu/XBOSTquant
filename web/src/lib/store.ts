@@ -87,7 +87,8 @@ type State = {
   costMode: string;
   minTradesBoard: number;
   detail: Detail;
-  view: 'all' | 'best' | 'cmp';
+  view: 'all' | 'best' | 'cmp' | 'res';
+  researchObj: string;
   boardFilter: string;
   run: RunState;
   barsToShow: number;
@@ -160,6 +161,7 @@ export const useStore = create<State>((set) => ({
   costMode: 'realistic',
   minTradesBoard: 0,
   view: 'all',
+  researchObj: 'netPnL',
   boardFilter: '',
   run: { ...initialRun },
   barsToShow: 500,

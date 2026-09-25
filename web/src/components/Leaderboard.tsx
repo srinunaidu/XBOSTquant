@@ -40,6 +40,7 @@ function rowToObj(r: BoardRow, ix: number, th: number, cost: number, signalOnly:
     surr, pss,
     paper: gate.eligible ? 'PAPER' : '—',
     paperWhy: gate.eligible ? '' : gate.reasons.join('; '),
+    rawRank: r.rawRank ?? null,
     _r: r,
   };
 }
@@ -96,6 +97,7 @@ const COLS = [
       ? { color: '#04120a', background: '#22ff88', fontWeight: 800 }
       : { color: '#5b5b66' }),
   },
+  { field: 'rawRank', headerName: 'Raw#', width: 64, type: 'rightAligned' },
 ];
 
 export default function Leaderboard() {
@@ -110,6 +112,7 @@ export default function Leaderboard() {
   const signalOnly = useStore(s => s.costMode) === 'signal';
 
   const minTrH = useStore(s => s.minTradesBoard);
+  const researchObjSel = useStore(s => s.researchObj);
   const rows = useMemo(() => {
     const q = boardFilter.toLowerCase();
     const minTr = useStore.getState().minTradesBoard || 0;
@@ -125,6 +128,12 @@ export default function Leaderboard() {
       const champ = new Set(out);
       list = list.filter(r => champ.has(r)).sort((a, b) => out.indexOf(a) - out.indexOf(b));
     }
+    if (view === 'res') {
+      // Research view: RAW order under the selected research objective.
+      // Demotion/validation never hide rows here — discovery first.
+      const rk = useStore.getState().researchObj || 'netPnL';
+      list = [...list].sort(engine.researchCmp(rk));
+    }
     return { rows: list.map((r, i) => rowToObj(r, i, paperThreshold ?? 9.5, costNow, signalOnly)), hidden };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [board, view, boardFilter, objective, paperThreshold, costNow, signalOnly, minTrH]);
@@ -134,16 +143,25 @@ export default function Leaderboard() {
       <div className="flex flex-wrap items-center gap-2 mb-2">
         <div className="font-display font-semibold text-[14px] tracking-tight">🏆 Master Leaderboard <span className="text-zinc-500 font-normal text-xs">— click any row to load it on the charts</span></div>
         <div className="flex gap-1 ml-2">
-          {([['all', '📋 All results'], ['best', '🏆 Best per indicator'], ['cmp', '⚖ Compare exits']] as const).map(([v, l]) => (
+          {([['all', '📋 All results'], ['best', '🏆 Best per indicator'], ['res', '🔬 Research'], ['cmp', '⚖ Compare exits']] as const).map(([v, l]) => (
             <button key={v} onClick={() => set({ view: v })}
               className={view === v ? 'btn-run !py-1 !px-2.5 !text-[11px]' : 'btn-ghost btn-xs'}>{l}</button>
           ))}
         </div>
+        {view === 'res' && (
+          <select value={researchObjSel} className="!text-xs !py-1.5 px-2 ml-1"
+            onChange={e => set({ researchObj: e.target.value })} title="Research objective (raw ranking)">
+            {([['netPnL', 'Top P&L'], ['winRate', 'Top WR'], ['expectancy', 'Top Expectancy'], ['profitFactor', 'Top PF'], ['sharpe', 'Top Sharpe']] as const).map(([v, l]) => (
+              <option key={v} value={v}>{l}</option>
+            ))}
+          </select>
+        )}
         <input placeholder="filter e.g. EMA 5m…" value={boardFilter}
           onChange={e => set({ boardFilter: e.target.value })}
           className="ml-auto !text-xs !py-1.5 px-2 w-52" />
       </div>
       {view === 'best' && <div className="text-[11px] text-green-300 num mb-2">★ One champion row per indicator for the current objective — full details in every column.</div>}
+      {view === 'res' && <WhyNot />}
       {rows.hidden > 0 && view !== 'cmp' && <div className="text-[11px] text-amber-300 num mb-2">⚠ {rows.hidden} thin rows hidden (&lt; {minTrH} trades) — lower the board filter to inspect them.</div>}
       {view === 'cmp' ? (
         <CompareView />
@@ -164,6 +182,26 @@ export default function Leaderboard() {
         <div className="empty-state">Upload a 1-min CSV to populate terminal strategies…</div>
       )}
     </section>
+  );
+}
+
+// WHY-NOT diagnostic: why isn't the highest-P&L row #1? Because rank follows
+// the REQUESTED research objective, not P&L. Shows both side by side.
+function WhyNot() {
+  const board = useStore(s => s.board);
+  const researchObj = useStore(s => s.researchObj);
+  if (!board.length) return null;
+  const rk = researchObj || 'netPnL';
+  const byObj = [...board].sort(engine.researchCmp(rk))[0];
+  const byPnl = [...board].sort(engine.researchCmp('netPnL'))[0];
+  const lbl: Record<string, string> = { netPnL: 'P&L ₹', winRate: 'WR%', expectancy: 'Exp', profitFactor: 'PF', sharpe: 'Sharpe' };
+  return (
+    <div className="text-[11px] text-zinc-400 num mb-2">
+      🔬 Ranked by <b className="text-emerald-300">{rk}</b>: #1 = {byObj.indicator} {byObj.timeframe}m ({lbl[rk] || rk}={(engine.researchValue(byObj.m, rk) || 0).toFixed(2)})
+      {engine.cfgKey(byObj) !== engine.cfgKey(byPnl) && (
+        <span> · top P&L instead = {byPnl.indicator} {byPnl.timeframe}m (₹{Math.round(byPnl.m.netPnL)}, {lbl[rk] || rk}={(engine.researchValue(byPnl.m, rk) || 0).toFixed(2)})</span>
+      )}
+    </div>
   );
 }
 

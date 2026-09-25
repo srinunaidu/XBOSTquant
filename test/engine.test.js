@@ -468,3 +468,135 @@ test('paperEligible: signal-only downgrades cost to warning', () => {
   assert.equal(sig.eligible, true, JSON.stringify(sig.reasons));
   assert.ok((sig.warnings || []).length > 0, 'warning recorded');
 });
+
+test('IST pin: naive stamps interpret as IST, masks deterministic', () => {
+  assert.equal(E.parseDateFlex('2026-09-07 10:05:00'), Date.UTC(2026, 8, 7, 10, 5, 0) - 19800000);
+  assert.equal(E.parseDateFlex('20260907'), Date.UTC(2026, 8, 7) - 19800000);
+  const t = Date.UTC(2026, 8, 7, 9, 15, 0) - 19800000; // 09:15 IST wall-clock
+  assert.deepEqual(E.istParts(t), { h: 9, m: 15, y: 2026, mo: 8, day: 7 });
+  assert.equal(E.istDayKey(t), '2026-8-7');
+  const d = {
+    t: Float64Array.from([t, t + 60000, t + 5400000]), o: new Float64Array(3).fill(100),
+    h: new Float64Array(3).fill(101), l: new Float64Array(3).fill(99), c: new Float64Array(3).fill(100),
+    v: new Float64Array(3).fill(10),
+  };
+  assert.deepEqual([...E.buildSessionMask(d, '09:15', '15:30')], [1, 1, 1]);
+  assert.deepEqual([...E.buildSessionMask(d, '10:30', '15:30')], [0, 0, 1]);
+  assert.equal(E.daySegments(d).length, 1);
+});
+
+test('ranking integrity: argmax over full set matches displayed #1 per objective', () => {
+  const rows = [];
+  for (let i = 0; i < 12; i++) rows.push({
+    i, timeframe: 5, indicator: 'EMA', params: { period: 10 + i }, exit: 'fixed', carry: false,
+    m: { netPnL: (i * 37) % 500 - 100, winRate: (i * 13) % 100, totalTrades: 50, profitFactor: 1 + (i % 5) * 0.3, expectancy: ((i * 37) % 500 - 100) / 50, sharpe: (i % 7) - 3, maxDD: -(i % 4), sortino: 0 },
+  });
+  // Union board exactly like the runner: topN by objective + top-20 per
+  // research objective, so every objective-max stays visible.
+  const topN = 5, objective = 'sharpe';
+  const keep = new Map();
+  for (const r of E.rankResults(rows, objective).slice(0, topN)) keep.set(E.cfgKey(r), r);
+  for (const [key] of E.RESEARCH_OBJS)
+    for (const r of rows.slice().sort(E.researchCmp(key)).slice(0, 20)) keep.set(E.cfgKey(r), r);
+  const board = [...keep.values()];
+  const audit = E.auditRankingIntegrity(rows, board);
+  assert.equal(audit.length, 5);
+  for (const a of audit) assert.equal(a.pass, true, `${a.objective}: max=${a.maxRow} displayed=${a.displayed}`);
+  // tamper: drop the true best → FAIL detected
+  const victim = audit[0].maxRow;
+  const tampered = board.filter(r => E.cfgKey(r) !== victim);
+  const audit2 = E.auditRankingIntegrity(rows, tampered);
+  assert.equal(audit2[0].pass, false, 'tamper detected');
+});
+
+test('researchValue: NaN/undefined never win, ties deterministic', () => {
+  assert.equal(E.researchValue(null, 'sharpe'), -Infinity);
+  assert.equal(E.researchValue({ sharpe: NaN }, 'sharpe'), -Infinity);
+  assert.equal(E.researchValue({ sharpe: 2 }, 'sharpe'), 2);
+  const mk = (i, sh) => ({ i, m: { sharpe: sh, netPnL: 100, totalTrades: 10, maxDD: -1 } });
+  const rows = [mk(2, 1.5), mk(0, 1.5), mk(1, 1.5)];
+  const sorted = rows.slice().sort(E.researchCmp('sharpe'));
+  assert.deepEqual(sorted.map(r => r.i), [0, 1, 2], 'ties break by index');
+});
+
+test('expiry enforcement: no entries at/after expiry, open force-liquidated', () => {
+  const n = 200, t0 = Date.parse('2026-09-18T09:15:00');
+  const t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+    l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+  for (let i = 0; i < n; i++) { const p = 100 + Math.sin(i / 5) * 4; t[i] = t0 + i * 60000; o[i] = p; h[i] = p + 0.5; l[i] = p - 0.5; c[i] = p; v[i] = 100; }
+  const exMs = t0 + 100 * 60000; // expiry mid-sample
+  const d = { t, o, h, l, c, v, contract: { strike: 100, otype: 'CE', expiry: '', expiryMs: exMs } };
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 9 } });
+  const bt = E.backtest(d, sig.pos, { direction: 'Both', sessionMask: new Int8Array(n).fill(1), capital: 100000, qty: 1, lotSize: 1, cost: 0 });
+  assert.ok(bt.trades.length > 0, 'trades before expiry');
+  for (const tr of bt.trades) {
+    assert.ok(d.t[tr.entryIdx] < exMs, 'no entry at/after expiry');
+    assert.ok(tr.reason !== 'EXPIRY' || d.t[tr.exitIdx] >= exMs, 'EXPIRY exits only at/after expiry');
+  }
+  assert.ok(bt.trades.some(tr => tr.reason === 'EXPIRY'), 'open position force-closed at expiry');
+  // futures (no contract meta) unaffected
+  const d2 = { t, o, h, l, c, v };
+  const bt2 = E.backtest(d2, sig.pos, { direction: 'Both', sessionMask: new Int8Array(n).fill(1), capital: 100000, qty: 1, lotSize: 1, cost: 0 });
+  assert.ok(!bt2.trades.some(tr => tr.reason === 'EXPIRY'));
+  // opt-out flag restores legacy behavior
+  const bt3 = E.backtest(d, sig.pos, { direction: 'Both', sessionMask: new Int8Array(n).fill(1), capital: 100000, qty: 1, lotSize: 1, cost: 0, respectExpiry: false });
+  assert.ok(!bt3.trades.some(tr => tr.reason === 'EXPIRY'));
+});
+
+test('resample never forward-fills: gaps stay gaps, no invented bars', () => {
+  // bars at minute 0,1,2 then a 10-minute gap, then 13,14 — 5m buckets: [0],[1]... only buckets WITH bars exist
+  const t0 = Date.parse('2026-09-18T09:15:00');
+  const idx = [0, 1, 2, 13, 14];
+  const n = idx.length;
+  const t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+    l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+  idx.forEach((m, i) => { t[i] = t0 + m * 60000; o[i] = h[i] = l[i] = c[i] = 100 + i; v[i] = 10; });
+  const r = E.resample({ t, o, h, l, c, v }, 5);
+  assert.ok(r.t.length <= 3, `only populated buckets, got ${r.t.length}`);
+  let vol = 0; for (let i = 0; i < r.t.length; i++) vol += r.v[i];
+  assert.equal(vol, 50, 'volume conserved exactly — nothing invented');
+});
+
+test('exit search: exit-only changes are distinct, preserved configs', () => {
+  const d = (() => {
+    const n = 500, t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+      l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+    const t0 = Date.parse('2026-09-18T09:15:00');
+    for (let i = 0; i < n; i++) { const p = 100 + Math.sin(i / 8) * 3; t[i] = t0 + i * 60000; o[i] = p; h[i] = p + 0.4; l[i] = p - 0.4; c[i] = p; v[i] = 100; }
+    return { t, o, h, l, c, v };
+  })();
+  const sig = E.buildSignals(d, { indicator: 'RSI', params: { period: 14, oversold: 30, overbought: 70 } });
+  const mk = (exit, sl, tp) => E.backtest(d, sig.pos, {
+    direction: 'Both', sessionMask: new Int8Array(d.t.length).fill(1),
+    capital: 100000, qty: 1, lotSize: 1, cost: 0, slPct: sl, tpPct: tp, exit,
+  }).metrics;
+  const a = mk('fixed', 1, 2), b = mk('fixed', 2, 4), cc = mk('breakeven', 1, 2);
+  const k1 = E.cfgKey({ timeframe: 5, indicator: 'RSI', params: { period: 14 }, slPct: 1, tpPct: 2, exit: 'fixed', carry: false });
+  const k2 = E.cfgKey({ timeframe: 5, indicator: 'RSI', params: { period: 14 }, slPct: 2, tpPct: 4, exit: 'fixed', carry: false });
+  const k3 = E.cfgKey({ timeframe: 5, indicator: 'RSI', params: { period: 14 }, slPct: 1, tpPct: 2, exit: 'breakeven', carry: false });
+  assert.ok(k1 !== k2 && k1 !== k3 && k2 !== k3, 'distinct configs, distinct keys');
+  assert.ok(!(a.netPnL === b.netPnL && a.totalTrades === b.totalTrades && a.netPnL === cc.netPnL), 'exit changes move results independently');
+});
+
+test('zero-cost mode: identical schedule, P&L differs by exactly n*cost', () => {
+  const d = (() => {
+    const n = 400, t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+      l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+    const t0 = Date.parse('2026-09-18T09:15:00');
+    for (let i = 0; i < n; i++) { const p = 100 + Math.sin(i / 6) * 2; t[i] = t0 + i * 60000; o[i] = p; h[i] = p + 0.3; l[i] = p - 0.3; c[i] = p; v[i] = 100; }
+    return { t, o, h, l, c, v };
+  })();
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 12 } });
+  const base = { direction: 'Both', sessionMask: new Int8Array(d.t.length).fill(1), capital: 100000, qty: 1, lotSize: 1 };
+  const free = E.backtest(d, sig.pos, Object.assign({}, base, { cost: 0 }));
+  const paid = E.backtest(d, sig.pos, Object.assign({}, base, { cost: 60 }));
+  assert.equal(free.trades.length, paid.trades.length, 'same trade count');
+  for (let i = 0; i < free.trades.length; i++) {
+    assert.equal(free.trades[i].entryIdx, paid.trades[i].entryIdx, 'same entries');
+    assert.equal(free.trades[i].exitIdx, paid.trades[i].exitIdx, 'same exits');
+  }
+  // NOTE: WR is post-cost by definition (win = pnl>0), so costs DO move WR.
+  // That is honest: a strategy that only wins before costs is not a winner.
+  assert.ok(Math.abs((free.metrics.netPnL - paid.metrics.netPnL) - paid.trades.length * 60) < 1e-6, 'P&L differs by exactly n*cost');
+  assert.ok(Math.abs(free.metrics.grossPreCost - paid.metrics.grossPreCost) < 1e-6, 'pre-cost economics identical');
+});
