@@ -690,10 +690,17 @@ export async function runGrid() {
   try {
     const tfCacheP: Record<string, any> = {};
     const routeCacheP: Record<string, Record<number, any>> = {};
+    // Single-entry resample cache (replaces per-sym|tf retention): resampled
+    // datasets are MBs each — holding every symbol×TF simultaneously OOMs
+    // multi-file runs. Sequential access keeps the hot path cached.
+    const keepOne = (cache: Record<string, any>, key: string) => {
+      for (const k of Object.keys(cache)) if (k !== key) delete cache[k];
+    };
     const evalPair = (sym: string, tf: number, legA: BoardRow, legB: BoardRow): BoardRow | null => {
       const sd = symData.find(([s]) => s === sym);
       if (!sd) return null;
       const key = sym + '|' + tf;
+      keepOne(tfCacheP, key); keepOne(routeCacheP, key);
       if (!tfCacheP[key]) {
         const d = engine.resample(sd[1], tf);
         let mi = engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd);
@@ -790,6 +797,9 @@ export async function runGrid() {
   try {
     const pssCache = new Map<string, number | null>();
     const tfDataCache: Record<string, any> = {};
+    const keepOnePss = (key: string) => {
+      for (const k of Object.keys(tfDataCache)) if (k !== key) delete tfDataCache[k];
+    };
     const pssOf = (r: BoardRow): number | null => {
       if (r.robustness && r.robustness.paramSensitivity) return r.robustness.paramSensitivity.pss;
       const k = engine.cfgKey(r);
@@ -798,6 +808,7 @@ export async function runGrid() {
         const symD = symData.find(([s]) => s === (r.symbol || symData[0][0]));
         const src = symD ? symD[1] : symData[0][1];
         const dk = (r.symbol || '') + '|' + r.timeframe;
+        keepOnePss(dk);
         if (!tfDataCache[dk]) tfDataCache[dk] = engine.resample(src, r.timeframe);
         const d = tfDataCache[dk];
         const base = tradeOpts();
@@ -824,11 +835,15 @@ export async function runGrid() {
     const pairTops = top.filter(r => r.indicator === 'PAIR' && !r.robustness).slice(0, 3);
     const rbCache: Record<string, any> = {};
     const rbRoute: Record<string, Record<number, any>> = {};
+    const keepOneRb = (key: string) => {
+      for (const k of Object.keys(rbCache)) if (k !== key) { delete rbCache[k]; delete rbRoute[k]; }
+    };
     for (const pr of pairTops) {
       if (useStore.getState().runSeq !== mySeq) break;
       const symD = symData.find(([s]) => s === (pr.symbol || symData[0][0]));
       const src = symD ? symD[1] : symData[0][1];
       const dk = (pr.symbol || '') + '|' + pr.timeframe;
+      keepOneRb(dk);
       if (!rbCache[dk]) { rbCache[dk] = engine.resample(src, pr.timeframe); rbRoute[dk] = {}; }
       const d = rbCache[dk];
       const base = tradeOpts();
@@ -1572,6 +1587,9 @@ export function buildProfiles(bd: BoardRow[], symData: [string, OHLCV][], opts: 
     const rows = (bd || []).slice(0, 60);
     if (!rows.length) { logLine('profiles: no rows'); return; }
     const tfCache: Record<string, any> = {};
+    const keepOneTD = (key: string) => {
+      for (const k of Object.keys(tfCache)) if (k !== key) delete tfCache[k];
+    };
     const getTD = (sym: string, tf: number, slice: 'train' | 'oos') => {
       const sd = symData.find(([s]) => s === sym);
       if (!sd) return null;
@@ -1583,6 +1601,7 @@ export function buildProfiles(bd: BoardRow[], symData: [string, OHLCV][], opts: 
       if (s1 - s0 < 50) return null;
       const pk = (a: Float64Array) => a.slice(s0, s1);
       const key = sym + '|' + tf + '|' + slice;
+      keepOneTD(key);
       if (!tfCache[key]) {
         const d = engine.resample({ t: pk(raw.t), o: pk(raw.o), h: pk(raw.h), l: pk(raw.l), c: pk(raw.c), v: pk(raw.v) } as any, tf);
         tfCache[key] = d;
@@ -1590,11 +1609,15 @@ export function buildProfiles(bd: BoardRow[], symData: [string, OHLCV][], opts: 
       return tfCache[key];
     };
     const dayRegCache: Record<string, any> = {};
+    const keepOneDR = (key: string) => {
+      for (const k of Object.keys(dayRegCache)) if (k !== key) delete dayRegCache[k];
+    };
     const dayRegOf = (sym: string, tf: number, slice: 'train' | 'oos', idx: number): string => {
       try {
         const d = getTD(sym, tf, slice);
         if (!d) return '?';
         const key = sym + '|' + tf + '|' + slice;
+        keepOneDR(key);
         if (!dayRegCache[key]) dayRegCache[key] = engine.dayRouting(d, { source: opts.regimeSource || 'rules', confGate: opts.confGate ?? 0.6 });
         const rt = dayRegCache[key];
         if (!rt.dayReg) return '?';
