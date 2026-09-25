@@ -1,11 +1,5 @@
 // Data ingestion: upload, bundled file, date slicing. Mirrors classic behavior.
 import engine, { type OHLCV } from './engine';
-
-// IST day key (strategy clock, not viewer clock): matches engine istDayKey.
-const istDay = (t: number) => {
-  const d = new Date(t + 19800000);
-  return d.getUTCFullYear() + '-' + d.getUTCMonth() + '-' + d.getUTCDate();
-};
 import { useStore } from './store';
 import { logLine } from './runner';
 
@@ -129,26 +123,20 @@ export function selectATM(legs: number = 1): { enabled: string[]; reason: string
   const u = ds[und].raw;
   // distinct strikes across option datasets
   const strikes = [...new Set(optNames.map(k => ds[k].raw.contract!.strike as number))].sort((a, b) => a - b);
-  const wanted = new Set<number>();
-  // sample underlying close per calendar day
-  let lastDay = '';
-  for (let i = 0; i < u.t.length; i++) {
-    const day = istDay(u.t[i]);
-    if (day === lastDay) continue;
-    lastDay = day;
-    const px = u.c[i];
-    let best = strikes[0], bd = Math.abs(px - best);
-    for (const s of strikes) { const d = Math.abs(px - s); if (d < bd) { bd = d; best = s; } }
-    const bi = strikes.indexOf(best);
-    for (let j = Math.max(0, bi - legs); j <= Math.min(strikes.length - 1, bi + legs); j++) wanted.add(strikes[j]);
-  }
+  // Per-day ATM from that day's underlying bar only (causal; engine-tested).
+  // The UNION enables whole-series datasets — universe selection, logged.
+  const atm = engine.atmStrikes(u.t, u.c, strikes, legs);
+  const wanted = new Set<number>(atm.union);
   const keep = optNames.filter(k => wanted.has(ds[k].raw.contract!.strike as number));
   if (!keep.length) return { enabled: [], reason: 'no contracts near underlying (stale strikes?)' };
   const nds: typeof ds = { ...ds };
   names.forEach(k => { nds[k] = { ...nds[k], enabled: keep.includes(k) }; });
   st.set({ datasets: nds });
   applyDateFilter();
-  logLine(`ATM±${legs} select vs ${und}: enabled ${keep.length}/${optNames.length} contracts (${[...wanted].sort((a, b) => a - b).join(',')})`);
+  const ce = keep.filter(k => ds[k].raw.contract!.otype === 'CE').length;
+  const pe = keep.filter(k => ds[k].raw.contract!.otype === 'PE').length;
+  logLine(`ATM±${legs} select vs ${und}: enabled ${keep.length}/${optNames.length} contracts (CE=${ce} PE=${pe}, strikes ${atm.union.join(',')})`);
+  atm.perDay.slice(-5).forEach(r => logLine(`  ATM day=${r.day} underlying=${r.underlying} atm=${r.atm} band=[${r.band.join(',')}]`));
   return { enabled: keep, reason: `ATM±${legs} vs ${und}` };
 }
 
@@ -169,7 +157,7 @@ export function dataHealth(): {
     bars += d.t.length;
     if (d.t.length) { t0 = Math.min(t0, d.t[0]); t1 = Math.max(t1, d.t[d.t.length - 1]); }
     const step = Math.max(1, Math.floor(d.t.length / 5000));
-    for (let i = 0; i < d.t.length; i += step) days.add(istDay(d.t[i]));
+    for (let i = 0; i < d.t.length; i += step) days.add(engine.istDayKey(d.t[i]));
     const c = (d as any).contract;
     if (c && c.strike != null) {
       contracts++;

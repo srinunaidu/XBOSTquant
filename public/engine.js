@@ -927,6 +927,331 @@ function buildSignals(d, cfg){
       else if(d.c[i]>vb.up1[i]&&d.c[i]<vb.up2[i]&&cm[i]>ob)pos[i]=-1;
       else pos[i]=i>0?pos[i-1]:0;
     }
+  } else if(ind==='Ribbon'){
+    // EMA Ribbon alignment: full bullish stack (fast>med>slow, close>fast)
+    // → long; full bearish stack → short; mixed → hold last.
+    const ef=ema(d.c,P.fast||5), em=ema(d.c,P.med||13), es=ema(d.c,P.slow||34);
+    overlay={ribF:ef,ribM:em,ribS:es};
+    for(let i=0;i<n;i++){
+      if(isNaN(ef[i])||isNaN(em[i])||isNaN(es[i]))continue;
+      const bull=ef[i]>em[i]&&em[i]>es[i]&&d.c[i]>ef[i];
+      const bear=ef[i]<em[i]&&em[i]<es[i]&&d.c[i]<ef[i];
+      if(bull)pos[i]=1;else if(bear)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='VWAPSlope'){
+    // Session-VWAP slope sign over slopeLen bars (causal, session-aware).
+    const v=vwapSeries(d), L=Math.max(2,Math.round(P.slopeLen||5));
+    overlay={vwap:v};
+    for(let i=0;i<n;i++){
+      if(isNaN(v[i])||i<L)continue;
+      if(isNaN(v[i-L])){pos[i]=i>0?pos[i-1]:0;continue;}
+      const s=(v[i]-v[i-L])/Math.max(1e-12,Math.abs(v[i-L]));
+      if(s>0)pos[i]=1;else if(s<0)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='MACDSlope'){
+    // MACD histogram slope: hist>0 & rising → long; hist<0 & falling → short.
+    const m=macd(d.c,P.fast||12,P.slow||26,P.signal||9), L=Math.max(2,Math.round(P.slopeLen||3));
+    osc={macdLine:m.line,macdSig:m.signal,macdHist:m.hist};
+    for(let i=0;i<n;i++){
+      if(isNaN(m.hist[i])||i<L||isNaN(m.hist[i-L])){if(!isNaN(m.hist[i]))pos[i]=i>0?pos[i-1]:0;continue;}
+      const s=m.hist[i]-m.hist[i-L];
+      if(m.hist[i]>0&&s>0)pos[i]=1;else if(m.hist[i]<0&&s<0)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='ADXDI'){
+    // ADX + DI cross: trend must be strong (ADX>threshold), then +DI/-DI side wins.
+    const p=Math.max(2,Math.round(P.length||14)), th=P.threshold??25;
+    const n2=n;
+    const tr=new Float64Array(n2), pdm=new Float64Array(n2), mdm=new Float64Array(n2);
+    for(let i=1;i<n2;i++){
+      tr[i]=Math.max(d.h[i]-d.l[i],Math.abs(d.h[i]-d.c[i-1]),Math.abs(d.l[i]-d.c[i-1]));
+      const up=d.h[i]-d.h[i-1], dn=d.l[i-1]-d.l[i];
+      pdm[i]=(up>dn&&up>0)?up:0; mdm[i]=(dn>up&&dn>0)?dn:0;
+    }
+    let atr=0,pdi=0,mdi=0; const ax=new Float64Array(n2).fill(NaN);
+    const pdiA=new Float64Array(n2).fill(NaN), mdiA=new Float64Array(n2).fill(NaN);
+    for(let i=1;i<n2;i++){
+      atr=(atr*(p-1)+tr[i])/p; pdi=(pdi*(p-1)+pdm[i])/p; mdi=(mdi*(p-1)+mdm[i])/p;
+      if(i<p)continue;
+      const pp=atr>0?100*pdi/atr:0, mm=atr>0?100*mdi/atr:0;
+      pdiA[i]=pp; mdiA[i]=mm;
+      const dx=(pp+mm)>0?100*Math.abs(pp-mm)/(pp+mm):0;
+      ax[i]=i===p?dx:(ax[i-1]*(p-1)+dx)/p;
+    }
+    osc={adx:ax,plusDI:pdiA,minusDI:mdiA};
+    for(let i=0;i<n2;i++){
+      if(isNaN(ax[i]))continue;
+      if(ax[i]<th){pos[i]=i>0?pos[i-1]:0;}
+      else pos[i]=pdiA[i]>mdiA[i]?1:-1;
+    }
+  } else if(ind==='LRSlope'){
+    // Linear-regression slope of close over len bars (ordinary least squares,
+    // causal window). Sign gives direction; flat slope holds.
+    const L=Math.max(3,Math.round(P.length||14));
+    const denom=L*(L-1)*(L+1)/12; // Σ(j-mean)² for j=0..L-1
+    for(let i=0;i<n;i++){
+      if(i<L-1)continue;
+      let s=0;const m=(L-1)/2;
+      for(let j=0;j<L;j++)s+=(j-m)*d.c[i-L+1+j];
+      const slope=s/denom;
+      if(slope>0)pos[i]=1;else if(slope<0)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='PctB'){
+    // Bollinger %B mean-reversion: %B<thresholds.lo → long, >thresholds.hi → short.
+    const b=bollinger(d.c,P.length||20,P.mult||2);
+    const lo=P.lo??0.2, hi=P.hi??0.8;
+    overlay={mid:b.mid,up:b.up,lo:b.lo};osc={pctB:new Float64Array(n).fill(NaN)};
+    for(let i=0;i<n;i++){
+      if(isNaN(b.up[i]))continue;
+      const pb=(d.c[i]-b.lo[i])/Math.max(1e-12,b.up[i]-b.lo[i]);
+      osc.pctB[i]=pb;
+      if(pb<lo)pos[i]=1;else if(pb>hi)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='VWAPDev'){
+    // Distance from session VWAP in percent vs ±threshold; fade the stretch.
+    const v=vwapSeries(d), th=P.thresh??1.0;
+    overlay={vwap:v};osc={vwapDev:new Float64Array(n).fill(NaN)};
+    for(let i=0;i<n;i++){
+      if(isNaN(v[i])||v[i]===0)continue;
+      const dev=100*(d.c[i]-v[i])/Math.abs(v[i]);
+      osc.vwapDev[i]=dev;
+      if(dev<-th)pos[i]=1;else if(dev>th)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='ATRPct'){
+    // ATR-as-%-of-price expansion breakout: ATR% above its own SMA × mult →
+    // trade the EMA-bias direction; contraction → hold.
+    const p=Math.max(2,Math.round(P.length||14)), mult=P.mult||1.5;
+    const at=atr(d.h,d.l,d.c,p), e=ema(d.c,Math.max(5,Math.round(P.emaLen||20)));
+    const ap=new Float64Array(n).fill(NaN);
+    for(let i=0;i<n;i++)ap[i]=d.c[i]>0?100*at[i]/d.c[i]:NaN;
+    const apma=sma(ap.filter(v=>!isNaN(v)).length?Float64Array.from(ap.map(v=>isNaN(v)?0:v)):ap,p);
+    osc={atrPct:ap};overlay={atrEma:e};
+    for(let i=0;i<n;i++){
+      if(isNaN(ap[i])||isNaN(apma[i])||isNaN(e[i]))continue;
+      if(ap[i]>apma[i]*mult)pos[i]=d.c[i]>e[i]?1:-1;
+      else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='BBWidth'){
+    // Bollinger BandWidth expansion: width above its trailing-min × mult →
+    // expansion breakout in the direction of close vs mid; else hold.
+    const L=Math.max(5,Math.round(P.length||20)), mult=P.mult||1.5, lb=Math.max(20,Math.round(P.lookback||100));
+    const b=bollinger(d.c,L,2);
+    overlay={mid:b.mid};
+    for(let i=0;i<n;i++){
+      if(isNaN(b.up[i]))continue;
+      const w=(b.up[i]-b.lo[i])/Math.max(1e-12,Math.abs(b.mid[i]));
+      let mn=Infinity;
+      for(let j=Math.max(L,i-lb+1);j<=i;j++){
+        if(isNaN(b.up[j]))continue;
+        const wj=(b.up[j]-b.lo[j])/Math.max(1e-12,Math.abs(b.mid[j]));
+        if(wj<mn)mn=wj;
+      }
+      if(isFinite(mn)&&w>mn*mult)pos[i]=d.c[i]>b.mid[i]?1:-1;
+      else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='ORB'){
+    // Opening Range Breakout (IST day): range = high/low of the first orMin
+    // minutes of the session day. Break above (+volume confirm) → long, below
+    // → short, once direction is set it holds until the opposite break or EOD
+    // (session mask). ENTRY BAR = the break bar itself (documented). O(n):
+    // day segments + OR levels are precomputed once, not scanned per bar.
+    const orMin=Math.max(5,Math.round(P.rangeMin||30)), volMult=P.volMult||2;
+    const va=sma(d.v,20);
+    const segs=daySegments(d);
+    const orH=new Float64Array(n).fill(NaN), orL=new Float64Array(n).fill(NaN);
+    for(const sg of segs){
+      const p0=istParts(d.t[sg.s]);
+      const openMin=p0.h*60+p0.m;
+      let e=sg.s;
+      while(e<sg.e){const pe=istParts(d.t[e]);if(pe.h*60+pe.m>=openMin+orMin)break;e++;}
+      let rh=-Infinity,rl=Infinity;
+      for(let j=sg.s;j<e&&j<sg.e;j++){if(d.h[j]>rh)rh=d.h[j];if(d.l[j]<rl)rl=d.l[j];}
+      if(!isFinite(rh))continue;
+      for(let j=e;j<sg.e;j++){orH[j]=rh;orL[j]=rl;}
+    }
+    overlay={orbH:orH,orbL:orL};
+    for(let i=0;i<n;i++){
+      if(isNaN(orH[i])||isNaN(va[i])){if(!isNaN(va[i]))pos[i]=i>0?pos[i-1]:0;continue;}
+      const conf=d.v[i]>volMult*va[i];
+      if(d.h[i]>orH[i]&&conf)pos[i]=1;
+      else if(d.l[i]<orL[i]&&conf)pos[i]=-1;
+      else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='InsideBar'){
+    // Inside Bar (mode 1/2/3 = single/double/triple): count consecutive
+    // inside bars; break of the mother range → signal. ENTRY BAR = break bar.
+    const mode=Math.min(3,Math.max(1,Math.round(P.mode||1)));
+    let run=0, mh=0, ml=0;
+    for(let i=0;i<n;i++){
+      if(i===0){pos[i]=0;continue;}
+      const inside=d.h[i]<=d.h[i-1]&&d.l[i]>=d.l[i-1];
+      if(inside){
+        if(run===0){mh=d.h[i-1];ml=d.l[i-1];}
+        run++;
+        pos[i]=i>0?pos[i-1]:0;
+        continue;
+      }
+      // not inside: possible break of a qualified mother range
+      if(run>=mode&&mh>ml){
+        if(d.c[i]>mh)pos[i]=1;
+        else if(d.c[i]<ml)pos[i]=-1;
+        else pos[i]=i>0?pos[i-1]:0;
+      } else pos[i]=i>0?pos[i-1]:0;
+      run=0;
+    }
+  } else if(ind==='NR7'){
+    // Narrow Range 7: range[i] is the smallest of the last 7 → setup; next
+    // bars break high/low → signal. ibOnly=1 additionally requires the NR7
+    // bar itself to be inside (NR7+IB). ENTRY BAR = break bar.
+    const ibOnly=P.ibOnly?1:0;
+    const setup=new Int8Array(n);
+    for(let i=0;i<n;i++){
+      if(i<6){continue;}
+      let mn=Infinity;
+      for(let j=i-6;j<=i;j++){const r=d.h[j]-d.l[j];if(r<mn)mn=r;}
+      const isNR=(d.h[i]-d.l[i])<=mn+1e-12;
+      const isIB=i>0&&d.h[i]<=d.h[i-1]&&d.l[i]>=d.l[i-1];
+      if(isNR&&(!ibOnly||isIB))setup[i]=1;
+    }
+    let armed=-1, ah=0, al=0;
+    for(let i=0;i<n;i++){
+      if(setup[i]){armed=i;ah=d.h[i];al=d.l[i];pos[i]=i>0?pos[i-1]:0;continue;}
+      if(armed>=0&&i-armed<=3){
+        if(d.c[i]>ah){pos[i]=1;armed=-1;}
+        else if(d.c[i]<al){pos[i]=-1;armed=-1;}
+        else pos[i]=i>0?pos[i-1]:0;
+      } else {armed=-1;pos[i]=i>0?pos[i-1]:0;}
+    }
+  } else if(ind==='VolRate'){
+    // Volume-confirmed trend: EMA bias only on bars with volume ≥ mult×SMA.
+    const L=Math.max(2,Math.round(P.length||20)), mult=P.mult||1.5, ep=Math.max(2,Math.round(P.emaLen||20));
+    const va=sma(d.v,L), e=ema(d.c,ep);
+    overlay={volEma:e};
+    for(let i=0;i<n;i++){
+      if(isNaN(va[i])||isNaN(e[i]))continue;
+      if(d.v[i]>=mult*va[i])pos[i]=d.c[i]>e[i]?1:-1;
+      else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='VolSpike'){
+    // Volume spike burst: vol ≥ mult×SMA(len) → trade the bar's direction,
+    // else hold. ENTRY BAR = spike bar (next-bar fill recommended).
+    const L=Math.max(2,Math.round(P.length||20)), mult=P.mult||2;
+    const va=sma(d.v,L);
+    for(let i=0;i<n;i++){
+      if(isNaN(va[i]))continue;
+      if(d.v[i]>=mult*va[i])pos[i]=d.c[i]>=d.o[i]?1:-1;
+      else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='VolReg'){
+    // Volatility-regime gate: BB-width percentile over lookback; compressed
+    // (pctile<gate) → flat; else EMA-bias trend. Router input AND entry filter
+    // are the same series — config states which use is active.
+    const L=Math.max(5,Math.round(P.length||20)), lb=Math.max(50,Math.round(P.lookback||100));
+    const gate=P.gate??40, ep=Math.max(5,Math.round(P.maPeriod||30));
+    const b=bollinger(d.c,L,2), e=ema(d.c,ep);
+    osc={volGate:new Float64Array(n).fill(NaN)};overlay={volEma:e};
+    for(let i=0;i<n;i++){
+      if(isNaN(b.up[i])||isNaN(e[i]))continue;
+      const w=(b.up[i]-b.lo[i])/Math.max(1e-12,Math.abs(b.mid[i]));
+      // trailing percentile by counting (no per-bar sort — O(n·lb) total)
+      let rank=0, cnt=0;
+      for(let j=Math.max(L,i-lb+1);j<=i;j++){
+        if(isNaN(b.up[j]))continue;cnt++;
+        if((b.up[j]-b.lo[j])/Math.max(1e-12,Math.abs(b.mid[j]))<=w)rank++;
+      }
+      if(cnt<20){pos[i]=i>0?pos[i-1]:0;continue;}
+      const pct=100*rank/cnt;
+      osc.volGate[i]=pct;
+      pos[i]=pct<gate?0:(d.c[i]>e[i]?1:-1);
+    }
+  } else if(ind==='KaufER'){
+    // Kaufman Efficiency Ratio gate: ER>trendTh → EMA trend; ER<rangeTh →
+    // flat; between → hold. Entry-filter use and router-input use are the
+    // same series — config states which use is active.
+    const erP=Math.max(2,Math.round(P.erPeriod||10)), tT=P.trendTh??0.3, rT=P.rangeTh??0.15;
+    const ep=Math.max(2,Math.round(P.maPeriod||20));
+    const e=ema(d.c,ep);
+    osc={ker:new Float64Array(n).fill(NaN)};overlay={kerEma:e};
+    for(let i=0;i<n;i++){
+      if(i<erP||isNaN(e[i]))continue;
+      const chg=Math.abs(d.c[i]-d.c[i-erP]);
+      let vol=0;
+      for(let j=0;j<erP;j++)vol+=Math.abs(d.c[i-j]-d.c[i-j-1]);
+      const er=vol>0?chg/vol:0;
+      osc.ker[i]=er;
+      if(er>tT)pos[i]=d.c[i]>e[i]?1:-1;
+      else if(er<rT)pos[i]=0;
+      else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='DecaySlope'){
+    // PREMIUM decay slope (NOT theta): linear-regression slope of log-premium
+    // over len bars, in %/bar. slope>thresh → premium appreciating (long);
+    // slope<-thresh → decaying (short/flat leg). Causal window. Buy-only is
+    // enforced at the desk, not here.
+    const L=Math.max(3,Math.round(P.length||20)), th=P.thresh??0.05;
+    const denom=L*(L-1)*(L+1)/12, m0=(L-1)/2;
+    osc={decay:new Float64Array(n).fill(NaN)};
+    for(let i=0;i<n;i++){
+      if(i<L-1||d.c[i-L+1]<=0)continue;
+      let s=0,ok=true;
+      for(let j=0;j<L;j++){const px=d.c[i-L+1+j];if(!(px>0)){ok=false;break;}s+=(j-m0)*Math.log(px);}
+      if(!ok)continue;
+      const slope=100*s/denom; // %/bar
+      osc.decay[i]=slope;
+      if(slope>th)pos[i]=1;else if(slope<-th)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='TrendFollow'){
+    // Preset P1: EMA-ribbon alignment + SuperTrend direction + ADX gate +
+    // optional volume confirm. ALL legs must agree; else hold.
+    const ef=ema(d.c,P.fast||8), em=ema(d.c,P.med||21), es=ema(d.c,P.slow||55);
+    const st=supertrend(d.h,d.l,d.c,P.atrP||10,P.stMult||3);
+    const ax=adx(d.h,d.l,d.c,P.adxP||14), th=P.adxTh??25;
+    const useVol=P.useVol?1:0, va=sma(d.v,Math.max(2,Math.round(P.volLen||20))), vm=P.volMult||2;
+    overlay={tfEmaF:ef,tfST:st.st};osc={tfAdx:ax};
+    for(let i=0;i<n;i++){
+      if(isNaN(ef[i])||isNaN(em[i])||isNaN(es[i])||isNaN(st.st[i])||isNaN(ax[i]))continue;
+      const bull=ef[i]>em[i]&&em[i]>es[i]&&st.dir[i]===1&&ax[i]>th;
+      const bear=ef[i]<em[i]&&em[i]<es[i]&&st.dir[i]===-1&&ax[i]>th;
+      const vok=!useVol||(!isNaN(va[i])&&d.v[i]>vm*va[i]);
+      if(!vok){pos[i]=i>0?pos[i-1]:0;continue;}
+      if(bull)pos[i]=1;else if(bear)pos[i]=-1;else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='VWAPMR'){
+    // Preset P2: VWAP mean-reversion with RSI confirm. Below lower band +
+    // oversold → long leg (maps to LONG CE on the options desk); above upper
+    // + overbought → short leg (maps to LONG PE). Buy-only enforced at desk.
+    const vb=vwapBands(d,P.sd1??1,P.sd2??2);
+    const r=rsi(d.c,P.rsiP||14), os=P.oversold??30, ob=P.overbought??70;
+    overlay={vwap:vb.vwap,up:vb.up1,lo:vb.lo1};osc={mrRsi:r};
+    for(let i=0;i<n;i++){
+      if(isNaN(vb.up1[i])||isNaN(r[i]))continue;
+      const revUp=i>0&&!isNaN(vb.up1[i-1])&&d.c[i-1]>vb.up1[i-1]&&d.c[i]<=vb.up1[i];
+      const revDn=i>0&&!isNaN(vb.lo1[i-1])&&d.c[i-1]<vb.lo1[i-1]&&d.c[i]>=vb.lo1[i];
+      if(d.c[i]<vb.lo1[i]&&r[i]<os)pos[i]=1;
+      else if(d.c[i]>vb.up1[i]&&r[i]>ob)pos[i]=-1;
+      else if(revUp||revDn)pos[i]=i>0?pos[i-1]:0;
+      else pos[i]=i>0?pos[i-1]:0;
+    }
+  } else if(ind==='PAIR'){
+    // Stage-2 discovery combination: AND-agreement of two base legs on the
+    // SAME bars (params a/ap/b/bp encode {indicator, params} JSON each).
+    // Created only by the pair post-pass — never gridded directly (SCHEMA
+    // PAIR is empty). Both legs are causal, so the combination is causal.
+    // Nested PAIR legs are refused (flat) to bound recursion.
+    let pa=null, pb=null;
+    try{
+      const a={indicator:P.a,params:JSON.parse(P.ap||'null')};
+      const b={indicator:P.b,params:JSON.parse(P.bp||'null')};
+      if(a.indicator&&a.indicator!=='PAIR'&&a.params)pa=buildSignals(d,{indicator:a.indicator,params:a.params}).pos;
+      if(b.indicator&&b.indicator!=='PAIR'&&b.params)pb=buildSignals(d,{indicator:b.indicator,params:b.params}).pos;
+    }catch(e){/* malformed legs → flat */}
+    osc={pairAgree:new Float64Array(n).fill(NaN)};
+    let ag=0, tot=0;
+    for(let i=0;i<n;i++){
+      const ok=pa&&pb&&pa[i]!==0&&pa[i]===pb[i];
+      pos[i]=ok?pa[i]:0;
+      if(pa&&pb&&pa[i]!==0&&pb[i]!==0){tot++;if(ok)ag++;}
+      osc.pairAgree[i]=tot?ag/tot:NaN;
+    }
   }
   return {pos,overlay,osc};
 }
@@ -975,7 +1300,30 @@ const ROUTER={
   Keltner:[0,1,2],Squeeze:[0,1,2],SqueezeBreak:[0,1,2],ChandeKroll:[0,1,2],
   POC:[2,3],FVG:[2,3],Cyber:[2,3],
   Chop:[0,1,2,3],Regime:[0,1,2,3],
-  ITrend:[0,1],HilbertDC:[0,1,2,3],AdaptRSI:[2,3],AdaptBB:[2,3]
+  ITrend:[0,1],HilbertDC:[0,1,2,3],AdaptRSI:[2,3],AdaptBB:[2,3],
+  Ribbon:[0,1],VWAPSlope:[0,1],MACDSlope:[0,1],ADXDI:[0,1],LRSlope:[0,1],
+  ATRPct:[0,1,2],TrendFollow:[0,1],KaufER:[0,1],VolReg:[0,1,2,3],
+  PctB:[2,3],VWAPDev:[2,3],VWAPMR:[2,3],
+  BBWidth:[0,1,2],ORB:[0,1,2],InsideBar:[0,1,2,3],NR7:[0,1,2,3],
+  VolRate:[0,1,2,3],VolSpike:[0,1,2],
+  DecaySlope:[0,1,2,3]
+};
+// Indicator family tags for diversity tracking (no optimization score is
+// built from these — they only describe information content so reviewers and
+// the run log can spot redundant all-momentum stacks).
+const FAMILY={
+  EMA:'trend',SMA:'trend',HMA:'trend',DEMA:'trend',KAMA:'trend',VWMA:'trend',
+  MACD:'momentum',MACDSlope:'momentum',RSI:'momentum',CRSI:'momentum',CMO:'momentum',
+  Stochastic:'momentum',Fisher:'momentum',Cyber:'momentum',Aroon:'momentum',
+  Bollinger:'meanrev',PctB:'meanrev',Keltner:'vol',BBWidth:'vol',Squeeze:'vol',
+  SuperTrend:'trend',ADX:'trend',ADXDI:'trend',ChandeKroll:'vol',ITrend:'trend',
+  Ribbon:'trend',LRSlope:'trend',TrendRegime:'preset',TrendFollow:'preset',
+  SqueezeBreak:'preset',VWAP:'meanrev',VWAPBands:'meanrev',VWAPRev:'preset',VWAPMR:'preset',
+  VWAPDev:'meanrev',VWAPSlope:'trend',POC:'volume',CVD:'volume',VolRate:'volume',
+  VolSpike:'volume',ATRPct:'vol',ORB:'vol',InsideBar:'pattern',NR7:'pattern',FVG:'pattern',
+  Regime:'regime',Chop:'regime',VolReg:'regime',KaufER:'regime',
+  HilbertDC:'regime',AdaptRSI:'meanrev',AdaptBB:'meanrev',DecaySlope:'options',
+  PAIR:'preset',
 };
 function regimeMask(regimes, indicator){
   const allow=ROUTER[indicator];
@@ -1417,6 +1765,69 @@ function buildExpiryMask(d, excludeExpiry){
   return out;
 }
 
+// ---------- Days-to-expiry mask (contract metadata, no Greeks inferred) ----------
+// 1 when minDte ≤ DTE ≤ maxDte (null bound = open side). No contract meta →
+// all-pass. DTE = (expiryMs - barTime) / day.
+function dteMask(d, minDte, maxDte){
+  const n=d.c.length, out=new Int8Array(n).fill(1);
+  const ex=d.contract&&isFinite(d.contract.expiryMs)?d.contract.expiryMs:null;
+  if(ex==null||(minDte==null&&maxDte==null))return out;
+  for(let i=0;i<n;i++){
+    const dte=(ex-d.t[i])/86400000;
+    if((minDte!=null&&dte<minDte)||(maxDte!=null&&dte>maxDte))out[i]=0;
+  }
+  return out;
+}
+// ---------- Underlying-led signals (honest cross-series execution) ----------
+// Signals computed on the UNDERLYING series, executed on the OPTION series.
+// Both resampled to tf, then each option bar is paired with the latest
+// underlying bar at/under its timestamp (last-known quote — causal, never
+// future; option bars themselves are never filled). Returns option bars +
+// aligned position array, ready for backtest(optD, pos, opts).
+function underlyingSignal(optD, undD, tf, sigCfg){
+  const od=resample(optD, tf), ud=resample(undD, tf);
+  const n=od.t.length, pos=new Int8Array(n);
+  if(!ud.t.length||!n)return {d:od, pos, aligned:0};
+  // signal on the full underlying series, then sample per option bar
+  const usig=buildSignals(ud, sigCfg).pos;
+  let j=0, aligned=0;
+  for(let i=0;i<n;i++){
+    while(j+1<ud.t.length&&ud.t[j+1]<=od.t[i])j++;
+    if(ud.t[j]<=od.t[i]){pos[i]=usig[j];aligned++;}
+    else pos[i]=i>0?pos[i-1]:0;
+  }
+  return {d:od, pos, aligned};
+}
+
+// ---------- ATM universe selection (universe-level, documented) ----------
+// Per calendar (IST) day, finds the strike nearest the underlying close using
+// ONLY that day's underlying bar (no future knowledge across days — each
+// day's ATM is independent). Returns per-day records + the union of strikes
+// within ±legs (the tradable universe for the sample).
+// HONEST SCOPE: this selects the UNIVERSE (which datasets to enable), not
+// per-bar contract switching; backtests run per-contract independently on
+// option prices only. Universe selection from full-sample underlying is
+// standard practice and is logged, not hidden.
+function atmStrikes(uT, uC, strikes, legs){
+  legs=Math.max(0,Math.round(legs||1));
+  const ss=[...strikes].sort((a,b)=>a-b);
+  const perDay=[];
+  let lastDay='';
+  for(let i=0;i<uT.length;i++){
+    const day=istDayKey(uT[i]);
+    if(day===lastDay)continue;
+    lastDay=day;
+    const px=uC[i];
+    let best=ss[0], bd=Math.abs(px-best);
+    for(const s of ss){const dd=Math.abs(px-s);if(dd<bd){bd=dd;best=s;}}
+    const bi=ss.indexOf(best), band=[];
+    for(let j=Math.max(0,bi-legs);j<=Math.min(ss.length-1,bi+legs);j++)band.push(ss[j]);
+    perDay.push({day, underlying:+px.toFixed(2), atm:best, band});
+  }
+  const union=[...new Set(perDay.flatMap(r=>r.band))].sort((a,b)=>a-b);
+  return {perDay, union};
+}
+
 // Precompute once per timeframe (NOT per combo): 1 if bar is inside session, else 0.
 // Building this costs ~1M Date() calls — callers must cache it across grid combos.
 function buildSessionMask(d, startStr, endStr){
@@ -1483,10 +1894,10 @@ function backtest(d, sigPos, opts){
   const beLock=(opts.beLock||0)/100; // locked profit once triggered (0 = flat breakeven)
   const atrMult=opts.atrTrailMult||3;
   let atrArr=null;
-  if(exitMode==='atr')atrArr=atr(d.h,d.l,d.c,Math.max(2,Math.round(opts.atrTrailPeriod||14)));
+  if(exitMode==='atr'||exitMode==='atrTP')atrArr=atr(d.h,d.l,d.c,Math.max(2,Math.round(opts.atrTrailPeriod||14)));
   let ckArr=null;
   if(exitMode==='ck')ckArr=chandeKroll(d.h,d.l,d.c,Math.max(2,Math.round(opts.ckPeriod||10)),opts.ckMult||3);
-  let hiEntry=0, loEntry=0, beDone=false;
+  let hiEntry=0, loEntry=0, beDone=false, barsHeld=0, atrEntryPx=0;
   const useMask=mask; // null = trade everywhere (carry, or no filters at all)
   const tmask=opts.tradeMask||null; // regime router: 1 = may trade this bar
   // Explicit fill timing (anti-lookahead): 'close' fills signal trades at the
@@ -1525,6 +1936,7 @@ function backtest(d, sigPos, opts){
     prevAct=actTgt;
     // manage open position: SL / target / trailing / signal flip / session exit
     if(position!==0){
+      barsHeld++;
       const ret=position===1?(px-entryPx)/entryPx:(entryPx-px)/entryPx;
       if(position===1){if(px>trailPeak)trailPeak=px;if(d.h[i]>hiEntry)hiEntry=d.h[i];}
       else{if(px<trough||trough===0)trough=px; if(trough===0)trough=px;if(d.l[i]<loEntry||loEntry===0)loEntry=d.l[i];}
@@ -1544,6 +1956,16 @@ function backtest(d, sigPos, opts){
         const chL=hiEntry-atrMult*atrArr[i], chS=loEntry+atrMult*atrArr[i];
         if(position===1&&d.l[i]<=chL){stopHit=true;reason='ATR';}
         if(position===-1&&d.h[i]>=chS){stopHit=true;reason='ATR';}
+      } else if(exitMode==='atrTP'&&atrArr&&!isNaN(atrArr[i])){
+        // ATR stop + ATR target: chandelier stop + fixed ATR-multiple target
+        // measured from ATR at entry (volatility-normalized R, not %).
+        const chL=hiEntry-atrMult*atrArr[i], chS=loEntry+atrMult*atrArr[i];
+        const k=opts.atrTpMult||3, ae=atrEntryPx>0?atrEntryPx:atrArr[i];
+        const tL=entryPx+k*ae, tS=entryPx-k*ae;
+        if(position===1&&d.l[i]<=chL){stopHit=true;reason='ATR';}
+        if(position===-1&&d.h[i]>=chS){stopHit=true;reason='ATR';}
+        if(!stopHit&&position===1&&d.h[i]>=tL){stopHit=true;reason='ATRTP';}
+        if(!stopHit&&position===-1&&d.l[i]<=tS){stopHit=true;reason='ATRTP';}
       } else if(exitMode==='ck'&&ckArr&&!isNaN(ckArr.longStop[i])){
         // Chande-Kroll structural stop: exit longs below longStop; replaces fixed SL
         if(position===1&&d.l[i]<=ckArr.longStop[i]){stopHit=true;reason='CK';}
@@ -1559,6 +1981,8 @@ function backtest(d, sigPos, opts){
         if(position===1){const tp2=trailPeak*(1-trailPct);if(d.l[i]<=tp2&&ret>0){stopHit=true;reason='TRAIL';}}
         else{const tp2=trough*(1+trailPct);if(d.h[i]>=tp2&&ret>0){stopHit=true;reason='TRAIL';}}
       }
+      const maxHold=Math.max(0,Math.round(opts.maxHoldBars||0));
+      if(!stopHit&&maxHold>0&&barsHeld>=maxHold){stopHit=true;reason='TIME';}
       const tgt=actTgt;
       const flip=!noSig&&tgt!==0&&tgt!==position;
       const flatSignal=!noSig&&tgt===0;
@@ -1571,6 +1995,8 @@ function backtest(d, sigPos, opts){
           else if(reason==='ATR')exitPx=position===1?(hiEntry-atrMult*atrArr[i]):(loEntry+atrMult*atrArr[i]);
           else if(reason==='CK')exitPx=position===1?ckArr.longStop[i]:ckArr.shortStop[i];
           else if(reason==='TP')exitPx=position===1?entryPx*(1+tpPct):entryPx*(1-tpPct);
+          else if(reason==='ATRTP'){const k2=opts.atrTpMult||3, ae2=atrEntryPx>0?atrEntryPx:(atrArr?atrArr[i]:0);exitPx=position===1?entryPx+k2*ae2:entryPx-k2*ae2;}
+          else if(reason==='TIME')exitPx=px; // time stop: known only at bar close
           else exitPx=position===1?trailPeak*(1-trailPct):trough*(1+trailPct);
         }
         const units=qty*lotSize;
@@ -1584,7 +2010,8 @@ function backtest(d, sigPos, opts){
         if(liveEq<=0){ruined=true;for(let j=i;j<n;j++)eqMtm[j]=liveEq;lastExitBar=i;break;}
         // immediate re-entry on flip (mask already enforced via tgt)
         if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&(!opts.premiumFloor||!(fillPx<opts.premiumFloor))&&!expired){
-          position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;
+          position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;barsHeld=0;
+          atrEntryPx=(atrArr&&isFinite(atrArr[i]))?atrArr[i]:0;
           hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
         }
         lastExitBar=i;
@@ -1595,7 +2022,8 @@ function backtest(d, sigPos, opts){
       const allowEntry=!trigOnly||(edge&&i>lastExitBar);
       const premOk=!opts.premiumFloor||!(fillPx<opts.premiumFloor); // options: never buy dust (sub-floor premium)
       if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry&&premOk&&!expired){
-        position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;
+        position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;barsHeld=0;
+        atrEntryPx=(atrArr&&isFinite(atrArr[i]))?atrArr[i]:0;
         hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
       }
     }
@@ -1693,6 +2121,26 @@ const SCHEMA={
   ITrend:[{key:'alpha',min:0.03,max:0.15,def:0.07}],
   AdaptRSI:[{key:'baseLen',min:8,max:21,def:14},{key:'oversold',min:10,max:40,def:30},{key:'overbought',min:60,max:90,def:70}],
   AdaptBB:[{key:'baseLen',min:15,max:30,def:20},{key:'mult',min:1,max:3,def:2}],
+  Ribbon:[{key:'fast',min:3,max:8,def:5},{key:'med',min:8,max:21,def:13},{key:'slow',min:21,max:55,def:34}],
+  VWAPSlope:[{key:'slopeLen',min:3,max:10,def:5}],
+  MACDSlope:[{key:'fast',min:8,max:12,def:12},{key:'slow',min:21,max:26,def:26},{key:'signal',min:5,max:9,def:9},{key:'slopeLen',min:2,max:5,def:3}],
+  ADXDI:[{key:'length',min:10,max:20,def:14},{key:'threshold',min:20,max:30,def:25}],
+  LRSlope:[{key:'length',min:10,max:20,def:14}],
+  PctB:[{key:'length',min:10,max:20,def:20},{key:'mult',min:1.5,max:2,def:2},{key:'lo',min:0.1,max:0.2,def:0.2},{key:'hi',min:0.8,max:0.9,def:0.8}],
+  VWAPDev:[{key:'thresh',min:0.5,max:2,def:1}],
+  ATRPct:[{key:'length',min:10,max:20,def:14},{key:'mult',min:1.2,max:2,def:1.5},{key:'emaLen',min:10,max:30,def:20}],
+  BBWidth:[{key:'length',min:10,max:20,def:20},{key:'mult',min:1.2,max:2,def:1.5},{key:'lookback',min:50,max:200,def:100}],
+  ORB:[{key:'rangeMin',min:15,max:45,def:30},{key:'volMult',min:2,max:4,def:2}],
+  InsideBar:[{key:'mode',min:1,max:3,def:1}],
+  NR7:[{key:'ibOnly',min:0,max:1,def:0}],
+  VolRate:[{key:'length',min:10,max:20,def:20},{key:'mult',min:1.5,max:3,def:2},{key:'emaLen',min:10,max:30,def:20}],
+  VolSpike:[{key:'length',min:10,max:20,def:20},{key:'mult',min:1.5,max:3,def:2}],
+  VolReg:[{key:'length',min:10,max:20,def:20},{key:'lookback',min:50,max:200,def:100},{key:'gate',min:30,max:60,def:40},{key:'maPeriod',min:20,max:50,def:30}],
+  KaufER:[{key:'erPeriod',min:10,max:20,def:10},{key:'trendTh',min:0.25,max:0.4,def:0.3},{key:'rangeTh',min:0.1,max:0.25,def:0.15},{key:'maPeriod',min:10,max:30,def:20}],
+  DecaySlope:[{key:'length',min:10,max:30,def:20},{key:'thresh',min:0.02,max:0.1,def:0.05}],
+  TrendFollow:[{key:'fast',min:5,max:13,def:8},{key:'med',min:13,max:34,def:21},{key:'slow',min:34,max:89,def:55},{key:'atrP',min:7,max:14,def:10},{key:'stMult',min:2,max:3,def:3},{key:'adxP',min:10,max:20,def:14},{key:'adxTh',min:20,max:30,def:25},{key:'useVol',min:0,max:1,def:0},{key:'volLen',min:10,max:30,def:20},{key:'volMult',min:1.5,max:3,def:2}],
+  VWAPMR:[{key:'sd1',min:1,max:2,def:1},{key:'sd2',min:2,max:3,def:2},{key:'rsiP',min:7,max:21,def:14},{key:'oversold',min:20,max:40,def:30},{key:'overbought',min:60,max:80,def:70}],
+  PAIR:[],
 };
 
 function cartesian(arrays){
@@ -1718,13 +2166,16 @@ const INT_KEYS={period:1,fast:1,slow:1,signal:1,k:1,d:1,emaPeriod:1,atrPeriod:1,
 function paramNeighbors(row, steps, riskSteps){
   const out=[];
   const P=row.params||{};
+  const schema=(typeof SCHEMA!=='undefined'&&SCHEMA[row.indicator])||[];
+  const bound=k=>{const p=schema.find(q=>q.key===k);return p?{min:p.min,max:p.max}:null;};
   for(const k of Object.keys(steps||{})){
     if(!(k in P))continue;
     const st=+steps[k]||0; if(st<=0)continue;
-    const cur=+P[k];
+    const cur=+P[k], bd=bound(k);
     for(const dir of [-1,1]){
       let v=+(cur+dir*st).toFixed(4);
       if(!isFinite(v)||v<=0||v===cur)continue;
+      if(bd&&(v<bd.min||v>bd.max))continue; // never leave the declared research range
       if(INT_KEYS[k]&&(!Number.isInteger(v)||v<2))continue;
       const np=Object.assign({},P);np[k]=v;
       const c={timeframe:row.timeframe,indicator:row.indicator,params:np,exit:row.exit||'fixed',carry:!!row.carry};
@@ -1932,13 +2383,19 @@ function bayesianRefine(rows, stepsByInd, nPropose){
   if(!out.length){
     // Degenerate space (all EI candidates already evaluated): fall back to
     // ±1-step neighbors of the best row so callers always get proposals.
+    // Clamped to the declared SCHEMA range (never walk out of bounds).
     const b=top[0], st=stepsByInd[b.indicator]||{};
+    const schema=(typeof SCHEMA!=='undefined'&&SCHEMA[b.indicator])||[];
+    const bound=k=>{const p=schema.find(q=>q.key===k);return p?{min:p.min,max:p.max}:null;};
     for(const k of keys){
       const step=st[k]||((hi[k]-lo[k])/10)||1;
+      const bd=bound(k);
       for(const dir of [-1,1]){
         if(out.length>=nPropose)break;
         const params=Object.assign({},b.params);
-        params[k]=+(params[k]+dir*step).toFixed(6);
+        let pv=+(params[k]+dir*step).toFixed(6);
+        if(bd&&(pv<bd.min||pv>bd.max))continue;
+        params[k]=pv;
         const kk=JSON.stringify(params);
         if(seen.has(kk))continue;seen.add(kk);
         const c={timeframe:b.timeframe,indicator:b.indicator,params,exit:b.exit||'fixed',carry:!!b.carry,refined:true};
@@ -2082,7 +2539,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

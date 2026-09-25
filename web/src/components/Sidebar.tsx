@@ -266,6 +266,13 @@ function ExecSection() {
         onClick={() => set({ direction: 'Long', entry: 'trigger', fill: 'next' })}>
         ⚡ Options buy-only preset (Long · trigger · next-bar)
       </button>
+      <label className="lbl">Signal source (options desk)</label>
+      <div className="flex gap-3 text-xs my-1.5">
+        {[['prices', 'Option prices'], ['underlying', 'Underlying ★']].map(([v, l]) => (
+          <label key={v} className="flex items-center gap-1" title={v === 'underlying' ? 'Signals from the first enabled futures dataset, executed on option bars (causal last-known align)' : 'Signals from each contract’s own OHLCV'}>
+            <input type="radio" checked={st.sigSource === v} onChange={() => set({ sigSource: v as any })} /> {l}</label>
+        ))}
+      </div>
       <label className="lbl">Entries</label>
       <select value={st.entry} className="w-full mt-1 mb-1" onChange={e => set({ entry: e.target.value })}>
         <option value="trigger">Signal trigger only (no auto re-entry)</option>
@@ -318,7 +325,7 @@ function ExecSection() {
       <div className="mt-2 rounded-lg border border-amber-900 bg-amber-950/20 p-2">
         <div className="lbl mb-1.5">Exit logic — searched dimensions</div>
         <div className="flex flex-col gap-1 text-[12px]">
-          {[['fixed', 'Fixed SL / TP'], ['breakeven', 'Moving SL — breakeven + trail'], ['atr', 'ATR Chandelier trailing stop'], ['ck', 'CK structural stop (presets)']].map(([v, l]) => (
+          {[['fixed', 'Fixed SL / TP'], ['breakeven', 'Moving SL — breakeven + trail'], ['atr', 'ATR Chandelier trailing stop'], ['atrTP', 'ATR stop + ATR target ★'], ['ck', 'CK structural stop (presets)']].map(([v, l]) => (
             <label key={v} className="flex items-center gap-2 cursor-pointer">
               <input type="checkbox" checked={st.exits.includes(v)} onChange={() => set({ exits: st.exits.includes(v) ? st.exits.filter(x => x !== v) : [...st.exits, v] })} /> {l}</label>
           ))}
@@ -328,6 +335,8 @@ function ExecSection() {
           <Num label="BE lock %" value={st.beLock} onChange={(v: number) => set({ beLock: v })} />
           <Num label="ATR period" value={st.atrP} onChange={(v: number) => set({ atrP: v || 14 })} />
           <Num label="ATR mult" value={st.atrM} onChange={(v: number) => set({ atrM: v })} />
+          <Num label="ATR TP mult" value={st.atrTpMult} onChange={(v: number) => set({ atrTpMult: v || 3 })} />
+          <Num label="Time stop bars (0=off)" value={st.maxHoldBars} onChange={(v: number) => set({ maxHoldBars: Math.max(0, Math.round(v || 0)) })} />
           <Num label="CK period" value={st.ckP} onChange={(v: number) => set({ ckP: v || 10 })} />
           <Num label="CK mult" value={st.ckM} onChange={(v: number) => set({ ckM: v })} />
         </div>
@@ -357,9 +366,9 @@ function ExecSection() {
         <input type="checkbox" checked={st.useSession} onChange={() => set({ useSession: !st.useSession })} />
         Enforce intraday session filter (flat outside hours, no overnight)</label>
       <div className="mt-1.5">
-        <div className="lbl mb-1">Trade windows (uncheck to drop a chop zone)</div>
+        <div className="lbl mb-1">Trade windows (uncheck to drop a chop zone; NSE clock)</div>
         <div className="grid grid-cols-2 gap-1">
-          {[['b1', '09:15–10:00'], ['b2', '10:00–12:00'], ['b3', '12:00–14:00'], ['b4', '14:00–15:30']].map(([v, l]) => (
+          {[['b1', '09:15–10:00'], ['b2', '10:00–12:00'], ['b3', '12:00–14:00'], ['b4', '14:00–15:30'], ['b5', '10:00–11:00 ★'], ['b6', '11:00–12:00 ★'], ['b7', '14:00–15:00 ★'], ['b8', '15:00–15:15 ★']].map(([v, l]) => (
             <label key={v} className="flex items-center gap-1.5 text-[11px] text-zinc-300 cursor-pointer">
               <input type="checkbox" checked={st.tradeWindows.includes(v)}
                 onChange={() => set({ tradeWindows: st.tradeWindows.includes(v) ? st.tradeWindows.filter(x => x !== v) : [...st.tradeWindows, v] })} />
@@ -418,6 +427,24 @@ function RegimeSection() {
   );
 }
 
+function FamLine({ inds }: { inds: Record<string, { on: boolean }> }) {
+  // Family diversity readout (descriptive only — never an optimization score).
+  const fam = (engine as any).FAMILY || {};
+  const counts: Record<string, number> = {};
+  for (const k of Object.keys(inds)) if ((inds as any)[k]?.on) {
+    const f = fam[k] || '?';
+    counts[f] = (counts[f] || 0) + 1;
+  }
+  const parts = Object.entries(counts).map(([f, n]) => `${f}×${n}`).join(' ');
+  const mom = counts.momentum || 0, others = Object.entries(counts).filter(([f]) => f !== 'momentum').reduce((a, [, n]) => a + (n as number), 0);
+  return (
+    <div className="text-[10px] text-zinc-500 mb-2 num">
+      families: {parts || '—'}
+      {mom >= 3 && others === 0 && <span className="text-amber-300"> ⚠ all-momentum stack (correlated signals)</span>}
+    </div>
+  );
+}
+
 function IndSection() {
   const inds = useStore(s => s.inds);
   const set = useStore(s => s.set);
@@ -447,6 +474,7 @@ function IndSection() {
         <input type="checkbox" checked={useStore(s => s.adaptive)} onChange={e => set({ adaptive: e.target.checked })} />
         Adaptive — auto-expand to B/C if best is weak (Sharpe &lt;1.2)
       </label>
+      <FamLine inds={inds} />
       <div className="space-y-2">
         {IND_META.map((m, ix) => {
           if (m.cat) return <div key={ix} className="lbl !text-green-400 pt-1">{m.cat}</div>;

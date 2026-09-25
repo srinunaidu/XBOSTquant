@@ -24,7 +24,7 @@ export type Trade = {
 };
 
 export type BoardRow = {
-  i: number; timeframe: number; indicator: string; params: Record<string, number>;
+  i: number; timeframe: number; indicator: string; params: Record<string, any>;
   slPct: number; tpPct: number; trailPct: number;
   exit: string; carry: boolean; refined?: boolean; m: Metrics; err?: string;
   symbol: string;
@@ -32,6 +32,7 @@ export type BoardRow = {
   oosFolds?: { net: number; wr: number; n: number; sharpe?: number; skipped: boolean }[];
   robustScore?: number; robustness?: any;
   rawRank?: number; rawObjective?: { key: string; value: number };
+  pair?: boolean;
   oosSharpe?: number | null; oosDegr?: number | null;
 };
 
@@ -44,7 +45,7 @@ export interface Engine {
   combineMasks(a: Int8Array | null, b: Int8Array | null): Int8Array | null;
   sessionMaskFor(d: OHLCV, opts: Record<string, any>): Int8Array | null;
   rsi(close: Float64Array, p: number): Float64Array;
-  buildSignals(d: OHLCV, cfg: { indicator: string; params: Record<string, number> }): {
+  buildSignals(d: OHLCV, cfg: { indicator: string; params: Record<string, any> }): {
     pos: Int8Array; overlay: Record<string, any>; osc: Record<string, any>;
   };
   backtest(d: OHLCV, sigPos: Int8Array, opts: Record<string, any>): {
@@ -63,6 +64,10 @@ export interface Engine {
   adaptivePeriod(base: number, cycle: number | null, min?: number, max?: number): number;
   rankResults(rows: BoardRow[], objective: string): BoardRow[];
   RESEARCH_OBJS: [string, string][];
+  FAMILY: Record<string, string>;
+  dteMask(d: OHLCV, minDte?: number | null, maxDte?: number | null): Int8Array;
+  atmStrikes(uT: Float64Array, uC: Float64Array, strikes: number[], legs?: number): { perDay: { day: string; underlying: number; atm: number; band: number[] }[]; union: number[] };
+  underlyingSignal(optD: OHLCV, undD: OHLCV, tf: number, sigCfg: { indicator: string; params: Record<string, number> }): { d: OHLCV; pos: Int8Array; aligned: number };
   researchValue(m: any, key: string): number;
   researchCmp(key: string): (a: BoardRow, b: BoardRow) => number;
   auditRankingIntegrity(allRows: BoardRow[], displayed: BoardRow[]): { objective: string; key: string; pass: boolean; maxRow: string | null; maxValue: number | null; displayed: string | null }[];

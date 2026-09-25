@@ -28,6 +28,14 @@ async function runGridSearch(msg) {
     c: new Float64Array(msg.c),
     v: new Float64Array(msg.v)
   };
+  const und1m = msg.und ? {
+    t: new Float64Array(msg.und.t),
+    o: new Float64Array(msg.und.o),
+    h: new Float64Array(msg.und.h),
+    l: new Float64Array(msg.und.l),
+    c: new Float64Array(msg.und.c),
+    v: new Float64Array(msg.und.v)
+  } : null;
   const grid = msg.grid;
   const tradeOpts = msg.tradeOpts;
   const objective = msg.objective;
@@ -124,7 +132,16 @@ async function runGridSearch(msg) {
     const k = cfg.timeframe + '|' + cfg.indicator + '|' + JSON.stringify(cfg.params);
     if(sigCache.key !== k){
       const dd = getTF(cfg.timeframe);
-      sigCache = { key: k, sig: E.buildSignals(dd.d, cfg) };
+      if(tradeOpts.sigSource === 'underlying' && und1m){
+        const al = E.underlyingSignal(dd.d, und1m, cfg.timeframe, cfg);
+        if(!sigCache.undLogged || sigCache.undLogged !== cfg.timeframe){
+          sigCache.undLogged = cfg.timeframe;
+          routeNotices.push(cfg.timeframe + 'm: underlying-led signals (' + al.aligned + '/' + al.pos.length + ' bars aligned, causal last-known)');
+        }
+        sigCache = { key: k, sig: { pos: al.pos }, undLogged: sigCache.undLogged };
+      } else {
+        sigCache = { key: k, sig: E.buildSignals(dd.d, cfg) };
+      }
     }
     return sigCache.sig;
   }
@@ -244,6 +261,13 @@ async function runGridSearch(msg) {
           const rbo = Object.assign({}, tradeOpts);
           const tm = tradeMaskFor(cand);
           if (tm) rbo.tradeMask = tm;
+          // Session mask WITH expiry/IV/window overlays (mirrors testCfg) —
+          // effOptsFor preserves caller masks and rebuilds only if absent.
+          try {
+            const dd = getTF(cand.timeframe);
+            rbo.sessionMask = cand.carry ? dd.maskCarry : dd.maskIn;
+          } catch (e) { /* effOptsFor rebuilds from session hours */ }
+          if (tradeOpts.sigSource === 'underlying' && und1m) { rbo.undD = und1m; rbo.undTF = cand.timeframe; }
           const r = await Rb.robustnessFor(d0, cand, rbo, null, totalCombos, i + 1);
           cand.robustness = r;
           cand.robustScore = r.final.adjusted;

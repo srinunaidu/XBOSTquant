@@ -1,7 +1,7 @@
 // Grid-search runner: worker-first with main-thread fallback, stop support,
 // live progress, hill-climb refinement. Faithful port of the validated logic.
 import engine, { type BoardRow, type OHLCV } from './engine';
-import { EXIT_LBL, IND_META } from './config';
+import { EXIT_LBL, IND_META, WIN_MAP } from './config';
 import { useStore } from './store';
 import { fmtMoney, fmtParams } from './format';
 import { enabledSymbols, filterData, dataHealth } from './data';
@@ -120,13 +120,32 @@ export function tradeOpts(): Record<string, any> {
     ivMaxRank: s.ivMaxRank,
     beTrigger: s.beTrigger, beLock: s.beLock,
     atrTrailPeriod: s.atrP, atrTrailMult: s.atrM,
+    atrTpMult: s.atrTpMult, maxHoldBars: s.maxHoldBars,
     ckPeriod: s.ckP, ckMult: s.ckM,
     fill: s.fill, entry: s.entry,
     regimeOn: s.regimeOn, regimeSource: s.regimeSource,
     granularity: s.granularity, confGate: (s.confGate ?? 60) / 100,
     routerV2: s.routerV2, routerPersist: s.routerPersist, routerHyst: s.routerHyst,
     purgeBars: s.purgeBars, embargoBars: s.embargoBars,
+    sigSource: s.sigSource || 'prices',
+    tradeWindows: sess.exchange !== 'NSE' ? [] : s.tradeWindows.map((w: string) => WIN_MAP[w]).filter(Boolean),
   };
+}
+
+// Underlying dataset for underlying-led signals: first enabled non-options
+// dataset different from `except`. Null = no underlying available.
+export function underlyingFor(except?: string): [string, OHLCV] | null {
+  const st = useStore.getState();
+  const isOpt = (k: string) => {
+    const kk = (k || '').toUpperCase().replace(/[^A-Z]/g, '');
+    return /(CE|PE)$/.test(kk) || kk.includes('OPTION');
+  };
+  for (const k of Object.keys(st.datasets)) {
+    if (k === except) continue;
+    const ds = st.datasets[k];
+    if (!isOpt(k) && ds.enabled !== false && ds.raw.t.length > 100) return [k, filterData(ds.raw, st.fromDate, st.toDate)];
+  }
+  return null;
 }
 
 function stepsOf(arr: number[]) {
@@ -210,7 +229,7 @@ export function stopRun() {
 
 function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, objective: string, topN: number,
   onBatch: (done: number, total: number | string, top: BoardRow[], cur: any, stage: string, pass: number) => void,
-  paramSteps: any, risk: any): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[]; route?: string[]; robustnessLogs?: string[] }> {
+  paramSteps: any, risk: any, undData?: OHLCV | null): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[]; route?: string[]; robustnessLogs?: string[] }> {
   return new Promise((resolve, reject) => {
     let w: Worker;
     try { w = new Worker('/worker.js'); } catch (e) { return reject(e); }
@@ -248,6 +267,7 @@ function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, object
     (w as any).onerror = (e: any) => { settle(); try { w.terminate(); } catch { /* noop */ } worker = null; rejecter = null; reject(e.message || e); };
     w.postMessage({
       type: 'run', symbol: sym, t: d.t, o: d.o, h: d.h, l: d.l, c: d.c, v: d.v,
+      und: undData ? { t: undData.t, o: undData.o, h: undData.h, l: undData.l, c: undData.c, v: undData.v } : null,
       grid, tradeOpts: opts, objective, topN, paramSteps: paramSteps || {},
       slStep: risk && risk.sl ? stepsOf(risk.sl) : 0,
       tpStep: risk && risk.tp ? stepsOf(risk.tp) : 0,
@@ -261,6 +281,7 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
   paramSteps: any, risk: any, mySeq: number, dataSrc?: OHLCV, sym: string = '') {
   const data = (dataSrc || useStore.getState().data) as OHLCV;
   let tfCache: any = null, sigCache: any = { key: null, sig: null };
+  const undRaw = opts.sigSource === 'underlying' ? ((underlyingFor(sym) || [])[1] || data) : null;
   const res: BoardRow[] = [];
   const getTF = (tf: number) => {
     if (!tfCache || tfCache.tf !== tf) {
@@ -291,8 +312,13 @@ async function runAsync(grid: any[], opts: any, objective: string, topN: number,
     const xof = engine.exitOptsFromParams(cfg.indicator, cfg.params || {});
     if (xof) { eff.ckPeriod = xof.ckPeriod; eff.ckMult = xof.ckMult; }
     if (routed.mask) eff.tradeMask = routed.mask;
-    const sk = cfg.timeframe + '|' + cfg.indicator + '|' + JSON.stringify(cfg.params);
-    if (sigCache.key !== sk) sigCache = { key: sk, sig: engine.buildSignals(d, cfg) };
+    const sk = (opts.sigSource === 'underlying' ? 'U:' : '') + cfg.timeframe + '|' + cfg.indicator + '|' + JSON.stringify(cfg.params);
+    if (sigCache.key !== sk) {
+      if (opts.sigSource === 'underlying' && undRaw) {
+        const al = engine.underlyingSignal(tfc.d, undRaw, cfg.timeframe, cfg);
+        sigCache = { key: sk, sig: { pos: al.pos } };
+      } else sigCache = { key: sk, sig: engine.buildSignals(tfc.d, cfg) };
+    }
     const bt = engine.backtest(d, sigCache.sig.pos, eff);
     return {
       i: idx, symbol: sym, timeframe: cfg.timeframe, indicator: cfg.indicator, params: cfg.params,
@@ -509,6 +535,13 @@ export async function runGrid() {
   const samplerNote = st.gridMode === 'halton' ? ` halton${st.haltonN}` : ' cartesian';
   const v2Note = opts.routerV2 ? ` routerv2(${opts.routerPersist}+${opts.routerHyst})` : '';
   const purgeNote = (opts.purgeBars || opts.embargoBars) ? ` purge${opts.purgeBars}/emb${opts.embargoBars}` : '';
+  // Family diversity readout (descriptive — never a score).
+  const famCount: Record<string, number> = {};
+  for (const s of sels) {
+    const f = (((engine as any).FAMILY || {})[s.indicator] || '?') as string;
+    famCount[f] = (famCount[f] || 0) + 1;
+  }
+  const famLine = Object.entries(famCount).map(([f, n]) => `${f}×${n}`).join(' ');
   const grandTotal = grid.length * symData.length;
   const mySeq = seq + 1; seq = mySeq;
   // NOTE: never mutate a captured snapshot (st.* = …) — any set() in between
@@ -520,7 +553,7 @@ export async function runGrid() {
   let lastRender = 0;
   const setRun = (p: Partial<typeof st.run>) => useStore.getState().set({ run: { ...useStore.getState().run, ...p } });
   setRun({ running: true, done: 0, total: grandTotal, stage: 'grid', pass: 0, perSec: 0, eta: '', current: 'warming up…', errCount: 0, refined: 0, passes: 0, summary: `0 / ${grandTotal}` });
-  logLine(`run start: ${syms.map(([s, d]) => `${s} ${(d.t.length / 1000).toFixed(0)}k`).join(' + ')} bars ex=${opts.exchange}(${opts.sessionStart}→${opts.sessionEnd})` + ` objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote}${samplerNote}${v2Note}${purgeNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost}${opts.costMode === 'signal' ? '(SIGNAL-ONLY)' : ''}${opts.premiumFloor ? ` premFloor=${opts.premiumFloor}` : ''}${opts.ivMaxRank != null && opts.ivMaxRank < 1 ? ` ivRank≤${opts.ivMaxRank}` : ''}${opts.excludeExpiry ? ' noExpiryDay' : ''} grid=${grid.length}x${symData.length}sym`);
+  logLine(`run start: ${syms.map(([s, d]) => `${s} ${(d.t.length / 1000).toFixed(0)}k`).join(' + ')} bars ex=${opts.exchange}(${opts.sessionStart}→${opts.sessionEnd})` + ` tz=Asia/Kolkata(pinned) resample=O/H/L/C/V sig=${opts.sigSource || 'prices'} fams=[${famLine}] objective=${objective} dir=${opts.direction}/${opts.entry}/${opts.fill} exits=[${dims.exits.join(',')}] sess=${dims.carry.length > 1 ? 'day+carry' : dims.carry[0] ? 'carry' : 'day'} regime=${opts.regimeOn ? opts.regimeSource + '/' + (opts.granularity || 'day') : 'off'}${wfNote}${samplerNote}${v2Note}${purgeNote} cap=${opts.capital} qty=${opts.qty}x${opts.lotSize} cost=${opts.cost}${opts.costMode === 'signal' ? '(ZERO-RESEARCH)' : ''}${opts.premiumFloor ? ` premFloor=${opts.premiumFloor}` : ''}${opts.ivMaxRank != null && opts.ivMaxRank < 1 ? ` ivRank≤${opts.ivMaxRank}` : ''}${opts.excludeExpiry ? ' noExpiryDay' : ''} grid=${grid.length}x${symData.length}sym`);
   try {
     const dh = dataHealth();
     logLine(`  data health: ${dh.symbols} symbols · ${(dh.bars / 1000).toFixed(0)}k bars · ${dh.sessions} sessions · ${dh.spanDays}d span${dh.contracts ? ` · ${dh.contracts} contracts/${dh.expiries.length} expiries` : ''} — ` + dh.verdicts.map(v => `${v.ok ? 'PASS' : 'FAIL'} ${v.label} (${v.detail})`).join(' · '));
@@ -557,7 +590,9 @@ export async function runGrid() {
       onBatch(gDone, grandTotal, btop, cur ? { ...cur, sym } : cur, stage, pass);
     };
     try {
-      const out = await runWithWorker(grid, sData, sym, opts, objective, topN, wrapBatch, paramSteps, risk);
+      const undPair: [string, OHLCV] | null = opts.sigSource === 'underlying' ? (underlyingFor(sym) || [sym, sData]) : null;
+      if (opts.sigSource === 'underlying' && undPair) logLine(`[${sym}] signal source: UNDERLYING ${undPair[0]} → execute ${sym} (causal last-known align)`);
+      const out = await runWithWorker(grid, sData, sym, opts, objective, topN, wrapBatch, paramSteps, risk, undPair ? undPair[1] : null);
       allRows.push(...out.top);
       refineInfo += out.refined ? ` · ${sym}+${out.refined}r` : '';
       errSamples.push(...(out.errSamples || []));
@@ -588,6 +623,65 @@ export async function runGrid() {
     }
     doneBase += grid.length;
   }
+  // STAGE-2 discovery: AND-pairs of top singles (same symbol + timeframe).
+  // Pairs are first-class rows (indicator='PAIR', legs in params) so detail,
+  // WF, robustness and export paths work unchanged. Capped, logged, honest.
+  try {
+    const tfCacheP: Record<string, any> = {};
+    const routeCacheP: Record<string, Record<number, any>> = {};
+    const evalPair = (sym: string, tf: number, legA: BoardRow, legB: BoardRow): BoardRow | null => {
+      const sd = symData.find(([s]) => s === sym);
+      if (!sd) return null;
+      const key = sym + '|' + tf;
+      if (!tfCacheP[key]) {
+        const d = engine.resample(sd[1], tf);
+        let mi = engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd);
+        mi = engine.combineMasks(mi, engine.buildWindowMask(d.t, opts.tradeWindows)) as Int8Array;
+        mi = engine.combineMasks(mi, engine.buildExpiryMask(d, opts.excludeExpiry)) as Int8Array;
+        if (opts.ivMaxRank != null && opts.ivMaxRank < 1) mi = engine.combineMasks(mi, engine.ivRankMask(d, opts.ivMaxRank, 20, 75600).mask) as Int8Array;
+        tfCacheP[key] = { d, mi };
+      }
+      const { d, mi } = tfCacheP[key];
+      const pairCfg = { indicator: 'PAIR', params: { a: legA.indicator, ap: JSON.stringify(legA.params || {}), b: legB.indicator, bp: JSON.stringify(legB.params || {}) } };
+      const sig = engine.buildSignals(d, pairCfg);
+      const eff: any = Object.assign({}, opts, {
+        sessionMask: legA.carry ? new Int8Array(d.c.length).fill(1) : mi,
+        slPct: legA.slPct, tpPct: legA.tpPct, trailPct: legA.trailPct ?? opts.trailPct,
+        exit: legA.exit || 'fixed', carry: !!legA.carry,
+      });
+      const rc = routeCacheP[key] || (routeCacheP[key] = {});
+      const routed = routingFor(rc, tf, d, pairCfg as any, eff);
+      if (routed.mask) eff.tradeMask = routed.mask;
+      const bt = engine.backtest(d, sig.pos, eff);
+      if (!bt.metrics.totalTrades) return null;
+      return {
+        i: -1, symbol: sym, timeframe: tf, indicator: 'PAIR', params: pairCfg.params,
+        slPct: eff.slPct || 0, tpPct: eff.tpPct || 0, trailPct: eff.trailPct || 0,
+        exit: eff.exit, carry: eff.carry, refined: false, pair: true, m: bt.metrics,
+      };
+    };
+    const bySymP: Record<string, BoardRow[]> = {};
+    for (const r of allRows) {
+      if (!r.m || !r.m.totalTrades || r.indicator === 'PAIR') continue;
+      (bySymP[r.symbol || ''] = bySymP[r.symbol || ''] || []).push(r);
+    }
+    let evalN = 0, keptN = 0;
+    const CAP = 200;
+    for (const sym of Object.keys(bySymP)) {
+      if (useStore.getState().runSeq !== mySeq) break;
+      const legs = bySymP[sym].sort((a, b) => engine.objectiveValue(b.m, objective) - engine.objectiveValue(a.m, objective)).slice(0, 12);
+      for (let x = 0; x < legs.length; x++) for (let y = x + 1; y < legs.length; y++) {
+        if (legs[x].timeframe !== legs[y].timeframe) continue;
+        if (evalN >= CAP) break;
+        evalN++;
+        const pr = evalPair(sym, legs[x].timeframe, legs[x], legs[y]);
+        if (pr && pr.m.totalTrades >= 5) { pr.i = allRows.length; allRows.push(pr); keptN++; }
+      }
+      if (evalN >= CAP) break;
+    }
+    logLine(`pairs[stage-2]: evaluated=${evalN} kept=${keptN} (top-12/symbol, same-TF AND-agreement, n≥5)`);
+  } catch (e: any) { logLine('pair stage skipped: ' + (e?.message || e)); }
+
   top = engine.rankResults(allRows, objective).slice(0, topN);
   // Research union: top-20 per research objective are ALWAYS retained on the
   // board, so no discovery (high-WR, high-P&L, …) can vanish merely because
@@ -628,7 +722,7 @@ export async function runGrid() {
   // is a signal property, noted in the log).
   try {
     const pssCache = new Map<string, number | null>();
-    const tfDataCache: Record<number, any> = {};
+    const tfDataCache: Record<string, any> = {};
     const pssOf = (r: BoardRow): number | null => {
       if (r.robustness && r.robustness.paramSensitivity) return r.robustness.paramSensitivity.pss;
       const k = engine.cfgKey(r);
@@ -636,8 +730,9 @@ export async function runGrid() {
       try {
         const symD = symData.find(([s]) => s === (r.symbol || symData[0][0]));
         const src = symD ? symD[1] : symData[0][1];
-        if (!tfDataCache[r.timeframe]) tfDataCache[r.timeframe] = engine.resample(src, r.timeframe);
-        const d = tfDataCache[r.timeframe];
+        const dk = (r.symbol || '') + '|' + r.timeframe;
+        if (!tfDataCache[dk]) tfDataCache[dk] = engine.resample(src, r.timeframe);
+        const d = tfDataCache[dk];
         const base = tradeOpts();
         const eff = Object.assign({}, base, {
           sessionMask: new Int8Array(d.c.length).fill(1),
@@ -655,6 +750,37 @@ export async function runGrid() {
     if (nEdge) logLine(`[KNIFE-EDGE] demoted=${nEdge}/25 knife-edge rows below clean rows (PSS≥0.5)`);
     top = demoted.concat(top.slice(25));
   } catch (e: any) { logLine('knife-edge pass skipped: ' + (e?.message || e)); }
+  // Full robustness for top-3 PAIR rows (stage-2 rows miss the worker suite).
+  // Exact execution: session/expiry/IV/window masks + regime tradeMask.
+  try {
+    const pairTops = top.filter(r => r.indicator === 'PAIR' && !r.robustness).slice(0, 3);
+    const rbCache: Record<string, any> = {};
+    const rbRoute: Record<string, Record<number, any>> = {};
+    for (const pr of pairTops) {
+      if (useStore.getState().runSeq !== mySeq) break;
+      const symD = symData.find(([s]) => s === (pr.symbol || symData[0][0]));
+      const src = symD ? symD[1] : symData[0][1];
+      const dk = (pr.symbol || '') + '|' + pr.timeframe;
+      if (!rbCache[dk]) { rbCache[dk] = engine.resample(src, pr.timeframe); rbRoute[dk] = {}; }
+      const d = rbCache[dk];
+      const base = tradeOpts();
+      let mi = engine.buildSessionMask(d, base.sessionStart, base.sessionEnd);
+      mi = engine.combineMasks(mi, engine.buildWindowMask(d.t, base.tradeWindows)) as Int8Array;
+      mi = engine.combineMasks(mi, engine.buildExpiryMask(d, base.excludeExpiry)) as Int8Array;
+      if (base.ivMaxRank != null && base.ivMaxRank < 1) mi = engine.combineMasks(mi, engine.ivRankMask(d, base.ivMaxRank, 20, 75600).mask) as Int8Array;
+      const eff: any = Object.assign({}, base, {
+        sessionMask: pr.carry ? new Int8Array(d.c.length).fill(1) : mi,
+        slPct: pr.slPct, tpPct: pr.tpPct, trailPct: pr.trailPct ?? base.trailPct,
+        exit: pr.exit || 'fixed', carry: !!pr.carry,
+      });
+      const routed = routingFor(rbRoute[dk], pr.timeframe, d, pr, eff);
+      if (routed.mask) eff.tradeMask = routed.mask;
+      const r = await Robust.robustnessFor(d, pr, eff, null, grid.length * symData.length, top.indexOf(pr) + 1);
+      pr.robustness = r;
+      pr.robustScore = r.final.adjusted;
+      logLine(`  pair-robust [${pr.symbol}] PAIR n=${r.baseline.totalTrades} WR=${r.baseline.winRate.toFixed(1)}% score=${(pr.robustScore || 0).toFixed(2)}/10 (${r.classification})`);
+    }
+  } catch (e: any) { logLine('pair robustness skipped: ' + (e?.message || e)); }
   // Log candidate headers for top 5 (machine-readable, §2)
   {
     const totalCombos = grid.length * symData.length;
@@ -897,7 +1023,15 @@ export function detailFor(r: BoardRow) {
   const src = ds ? filterData(ds.raw, st.fromDate, st.toDate) : st.data;
   if (!src || !src.t.length) return null;
   const d = engine.resample(src, r.timeframe);
-  const sig = engine.buildSignals(d, { indicator: r.indicator, params: r.params });
+  const sig = (() => {
+    if (useStore.getState().sigSource === 'underlying') {
+      const up = underlyingFor(r.symbol);
+      // Charts show the OPTION series; signals come from the underlying.
+      // Overlay/osc are empty (underlying legs live on another series).
+      if (up) return { pos: engine.underlyingSignal(src, up[1], r.timeframe, { indicator: r.indicator, params: r.params }).pos, overlay: {}, osc: {} };
+    }
+    return engine.buildSignals(d, { indicator: r.indicator, params: r.params });
+  })();
   const eff: any = tradeOpts();
   if (r.slPct != null) eff.slPct = r.slPct;
   if (r.tpPct != null) eff.tpPct = r.tpPct;

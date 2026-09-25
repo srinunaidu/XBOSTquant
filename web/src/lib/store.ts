@@ -48,6 +48,7 @@ type State = {
   slFix: number; tpFix: number; trail: number; cost: number; qty: number; lot: number;
   capital: number;
   beTrigger: number; beLock: number; atrP: number; atrM: number; ckP: number; ckM: number;
+  atrTpMult: number; maxHoldBars: number;
   exits: string[]; sessMode: string;
   optRisk: boolean;
   slMin: number; slMax: number; slStep: number; tpMin: number; tpMax: number; tpStep: number;
@@ -86,6 +87,7 @@ type State = {
   premiumFloor: number;
   costMode: string;
   minTradesBoard: number;
+  sigSource: string;
   detail: Detail;
   view: 'all' | 'best' | 'cmp' | 'res';
   researchObj: string;
@@ -121,6 +123,7 @@ export const useStore = create<State>((set) => ({
   slFix: 0.8, tpFix: 1.6, trail: 0.5, cost: 0, qty: 1, lot: 1,
   capital: 100000,
   beTrigger: 0.5, beLock: 0, atrP: 14, atrM: 3, ckP: 10, ckM: 3,
+  atrTpMult: 3, maxHoldBars: 0,
   exits: ['fixed', 'breakeven', 'atr'], sessMode: 'intraday',
   optRisk: true,
   slMin: 0.5, slMax: 1.1, slStep: 0.3, tpMin: 1.0, tpMax: 2.0, tpStep: 0.5,
@@ -160,6 +163,7 @@ export const useStore = create<State>((set) => ({
   premiumFloor: 0,
   costMode: 'realistic',
   minTradesBoard: 0,
+  sigSource: 'prices',
   view: 'all',
   researchObj: 'netPnL',
   boardFilter: '',

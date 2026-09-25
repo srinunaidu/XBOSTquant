@@ -53,12 +53,21 @@ function maskKey(m){
   return m.length+':'+s;
 }
 function cachedBacktest(d, indicator, params, opts){
-  const k=[indicator, JSON.stringify(params), JSON.stringify([opts.slPct,opts.tpPct,opts.trailPct,opts.exit,opts.carry,opts.direction,opts.fill,opts.entry]), maskKey(opts.sessionMask), maskKey(opts.tradeMask)].join('|');
+  const und=opts.undD&&opts.undD.t&&opts.undD.t.length?opts.undD.t.length+':'+opts.undD.t[0]+':'+opts.undD.t[opts.undD.t.length-1]:'nound';
+  const k=[indicator, JSON.stringify(params), JSON.stringify([opts.slPct,opts.tpPct,opts.trailPct,opts.exit,opts.carry,opts.direction,opts.fill,opts.entry]), maskKey(opts.sessionMask), maskKey(opts.tradeMask), String(opts.sigSource||'px'), und].join('|');
   if(_cache.has(k)) return _cache.get(k);
-  const bt=E().backtest(d, E().buildSignals(d,{indicator,params}).pos, opts);
+  const bt=E().backtest(d, sigFor(d,indicator,params), opts);
   _cache.set(k,bt); return bt;
 }
 function clearCache(){ _cache=new Map(); }
+// Signal-source hook: null = option-price signals (default). When robustness
+// runs an underlying-led candidate, robustnessFor sets SIGFN so EVERY evidence
+// (not just the baseline) evaluates the same underlying-derived positions.
+let SIGFN=null;
+function sigFor(d, indicator, params){
+  if(SIGFN){ try{ return SIGFN(d, indicator, params); }catch(e){ /* fall through to price signals */ } }
+  return E().buildSignals(d,{indicator,params}).pos;
+}
 // Effective execution for a candidate: the EXACT config the board ranked
 // (candidate SL/TP/trail/exit/carry + CK bridge + rebuilt session mask),
 // never the fallback defaults. Every evidence function must evaluate through
@@ -72,7 +81,9 @@ function effOptsFor(candidate, baseOpts, d){
   try {
     const E2=E();
     if(E2.exitOptsFromParams){ const xo=E2.exitOptsFromParams(candidate.indicator, candidate.params||{}); if(xo){ eff.ckPeriod=xo.ckPeriod; eff.ckMult=xo.ckMult; } }
-    if(E2.sessionMaskFor && d) eff.sessionMask=E2.sessionMaskFor(d, eff);
+    // Caller-computed sessionMask (with expiry/IV/window overlays) wins;
+    // rebuild from session hours only when the caller passed none.
+    if(!eff.sessionMask&&E2.sessionMaskFor&&d) eff.sessionMask=E2.sessionMaskFor(d, eff);
   } catch(e){ /* keep base masks on helper failure */ }
   return eff;
 }
@@ -126,7 +137,7 @@ const EXIT_VARIANTS=[
   {slPct:0.8,tpPct:1.5,exit:'fixed',carry:true},
 ];
 function exitIndependence(d, indicator, params, baseOpts){
-  const sig=E().buildSignals(d,{indicator,params}).pos;
+  const sig=sigFor(d,indicator,params);
   const results=EXIT_VARIANTS.map(v=>{ const o=Object.assign({},baseOpts,{slPct:v.slPct,tpPct:v.tpPct,exit:v.exit,beTrigger:v.beTrigger,beLock:v.beLock,atrTrailPeriod:v.atrTrailPeriod,atrTrailMult:v.atrTrailMult,ckPeriod:v.ckPeriod,ckMult:v.ckMult,trailPct:v.trailPct||baseOpts.trailPct,carry:!!v.carry}); const bt=E().backtest(d,sig,o); return {variant:v, bt}; });
   const sharpes=results.map(r=>r.bt.metrics.sharpe), exps=results.map(r=>r.bt.metrics.expectancy);
   return {
@@ -139,28 +150,28 @@ function exitIndependence(d, indicator, params, baseOpts){
   };
 }
 function signalPurity(d, indicator, params, baseOpts){
-  const sig=E().buildSignals(d,{indicator,params}).pos;
+  const sig=sigFor(d,indicator,params);
   const a=E().backtest(d,sig,Object.assign({},baseOpts,{slPct:0,tpPct:0,exit:'fixed',carry:true})).metrics;
   const full=E().backtest(d,sig,baseOpts).metrics;
   let regSharpe=null; try{ const reg=E().regimeSeries?E().regimeSeries(d,{}):null; if(reg){ const m=E().regimeMask(reg,indicator); regSharpe=E().backtest(d,sig,Object.assign({},baseOpts,{slPct:0,tpPct:0,tradeMask:m})).metrics.sharpe; } }catch{}
   return { indicatorOnly:{sharpe:a.sharpe,expectancy:a.expectancy,wr:a.winRate,pf:a.profitFactor}, full:{sharpe:full.sharpe,expectancy:full.expectancy}, regimeSharpe:regSharpe, ratio:full.expectancy?a.expectancy/full.expectancy:0, sharpeRatio:full.sharpe?a.sharpe/full.sharpe:0, parameters_locked:true, reoptimized:false };
 }
 function directionRobustness(d, indicator, params, baseOpts){
-  const sig=E().buildSignals(d,{indicator,params}).pos;
+  const sig=sigFor(d,indicator,params);
   const mk=dir=>E().backtest(d,sig,Object.assign({},baseOpts,{direction:dir})).metrics;
   const both=mk('Both'), lo=mk('Long'), sh=mk('Short');
   const bal=both.sharpe?1-Math.abs(lo.sharpe-sh.sharpe)/(Math.abs(lo.sharpe)+Math.abs(sh.sharpe)+1e-9):0;
   return {both,long:lo,short:sh, longSharpe:lo.sharpe, shortSharpe:sh.sharpe, balance:bal, longPnl:lo.netPnL, shortPnl:sh.netPnL, longContribution:both.netPnL?lo.netPnL/both.netPnL:0, shortContribution:both.netPnL?sh.netPnL/both.netPnL:0, parameters_locked:true, reoptimized:false};
 }
 function regimeRobustness(d, indicator, params, baseOpts){
-  const sig=E().buildSignals(d,{indicator,params}).pos;
+  const sig=sigFor(d,indicator,params);
   const regs=E().regimeSeries?E().regimeSeries(d,{}):new Int8Array(d.t.length).fill(3);
   const buckets=[0,1,2,3].map(r=>{ const mask=new Int8Array(d.t.length); for(let i=0;i<d.t.length;i++) if(regs[i]===r) mask[i]=1; const bt=E().backtest(d,sig,Object.assign({},baseOpts,{tradeMask:mask})); return {regime:r, bt:bt.metrics}; });
   const exps=buckets.map(b=>b.bt.expectancy), shs=buckets.map(b=>b.bt.sharpe);
   return {buckets, profitableRegimes:buckets.filter(b=>b.bt.netPnL>0).length, posExpRegimes:buckets.filter(b=>b.bt.expectancy>0).length, medianExpectancy:median(exps), worstExpectancy:Math.min(...exps), medianSharpe:median(shs), worstSharpe:Math.min(...shs), dispersion:shs.length>1?Math.sqrt(shs.reduce((s,x)=>s+(x-median(shs))**2,0)/shs.length):0, parameters_locked:true, reoptimized:false};
 }
 function timeRobustness(d, indicator, params, baseOpts){
-  const sig=E().buildSignals(d,{indicator,params}).pos;
+  const sig=sigFor(d,indicator,params);
   const wins=[[555,600],[600,720],[720,840],[840,930]], labels=['09:15–10:00','10:00–12:00','12:00–14:00','14:00–15:30'];
   const buckets=wins.map(([a,b],idx)=>{ const mask=E().buildWindowMask?E().buildWindowMask(d.t,[[a,b]]):new Int8Array(d.t.length).fill(1); const bt=E().backtest(d,sig,Object.assign({},baseOpts,{tradeMask:mask})); return {label:labels[idx], bt:bt.metrics}; });
   const exps=buckets.map(b=>b.bt.expectancy);
@@ -168,13 +179,13 @@ function timeRobustness(d, indicator, params, baseOpts){
   return {buckets, medianExpectancy:median(exps), worstExpectancy:Math.min(...exps), profitableWindows:buckets.filter(b=>b.bt.netPnL>0).length, concentration:sorted[0]/total, medianSharpe:median(buckets.map(b=>b.bt.sharpe)), worstSharpe:Math.min(...buckets.map(b=>b.bt.sharpe)), parameters_locked:true, reoptimized:false};
 }
 function entryPerturbation(d, indicator, params, baseOpts){
-  const vars=[0,1,2].map(shift=>{ const sig=E().buildSignals(d,{indicator,params}).pos; if(shift===0) return sig; const s2=new Int8Array(sig.length); for(let i=shift;i<sig.length;i++) s2[i]=sig[i-shift]; return s2; });
+  const vars=[0,1,2].map(shift=>{ const sig=sigFor(d,indicator,params); if(shift===0) return sig; const s2=new Int8Array(sig.length); for(let i=shift;i<sig.length;i++) s2[i]=sig[i-shift]; return s2; });
   const res=vars.map(s=>E().backtest(d,s,baseOpts).metrics);
   return {variants:res.length, profitable:res.filter(r=>r.netPnL>0).length, posExp:res.filter(r=>r.expectancy>0).length, medianExpectancy:median(res.map(r=>r.expectancy)), medianSharpe:median(res.map(r=>r.sharpe)), bestSharpe:Math.max(...res.map(r=>r.sharpe)), worstSharpe:Math.min(...res.map(r=>r.sharpe)), parameters_locked:true, reoptimized:false};
 }
 function inputPerturbation(d, indicator, params, baseOpts){ const p=paramStability(d,indicator,params,baseOpts); return {medianExpectancy:median(p.neighborMetrics.map(n=>n.expectancy)), medianSharpe:median(p.neighborMetrics.map(n=>n.sharpe)), worstSharpe:p.worstSharpe, bestSharpe:p.bestSharpe, profitable:p.profitable, total:p.neighbors, parameters_locked:true, reoptimized:false}; }
 function jitterResilience(d, indicator, params, baseOpts){
-  const baseSig=E().buildSignals(d,{indicator,params}).pos; const levels=[0,0.1,0.3,0.6];
+  const baseSig=sigFor(d,indicator,params); const levels=[0,0.1,0.3,0.6];
   const out=levels.map(j=>{ let sig=baseSig; if(j>0){ sig=new Int8Array(baseSig.length); for(let i=0;i<baseSig.length;i++){ if(Math.random()<j*0.1) sig[i]=baseSig[i]===1?-1:baseSig[i]===-1?1:0; else sig[i]=baseSig[i]; } } return E().backtest(d,sig,baseOpts).metrics; });
   return {levels, results:out, jitterFragile:out[3].sharpe<out[0].sharpe*0.5, parameters_locked:true, reoptimized:false};
 }
@@ -195,7 +206,7 @@ function worstTradeRemoval(trades){
 }
 function regimeRemoval(d, indicator, params, baseOpts){
   const regs=E().regimeSeries?E().regimeSeries(d,{}):new Int8Array(d.t.length).fill(0);
-  const sig=E().buildSignals(d,{indicator,params}).pos; const full=E().backtest(d,sig,baseOpts).metrics;
+  const sig=sigFor(d,indicator,params); const full=E().backtest(d,sig,baseOpts).metrics;
   const vars=[0,1,2,3].map(r=>{ const mask=new Int8Array(d.t.length); for(let i=0;i<d.t.length;i++) mask[i]=regs[i]===r?0:1; const bt=E().backtest(d,sig,Object.assign({},baseOpts,{tradeMask:mask})); return {regime:r,sharpe:bt.metrics.sharpe,exp:bt.metrics.expectancy,pnl:bt.metrics.netPnL, parameters_locked:true, reoptimized:false}; });
   return {fullSharpe:full.sharpe, variants:vars, parameters_locked:true, reoptimized:false};
 }
@@ -286,7 +297,11 @@ function leakageAudit(d){
 async function robustnessFor(d, candidate, baseOpts, datasets, totalCombos, rank){
   clearCache();
   const eff=effOptsFor(candidate, baseOpts, d);
-  const baselineBt=E().backtest(d,E().buildSignals(d,{indicator:candidate.indicator,params:candidate.params}).pos,eff);
+  // Underlying-led candidates: route ALL evidence through underlying signals.
+  SIGFN=(eff.sigSource==='underlying'&&eff.undD&&eff.undD.t&&eff.undD.t.length)
+    ? ((dd,ind,pp)=>E().underlyingSignal(dd,eff.undD,eff.undTF||5,{indicator:ind,params:pp}).pos)
+    : null;
+  const baselineBt=E().backtest(d,sigFor(d,candidate.indicator,candidate.params),eff);
   const baseline=Object.assign({},baselineBt.metrics,extendMetrics(baselineBt.trades));
   const trades=baselineBt.trades;
   const conc=concentrationMetrics(trades), worst=worstTradeRemoval(trades), distr=distributionQuality(trades), clustering=clusteringMetrics(trades);

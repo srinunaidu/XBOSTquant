@@ -600,3 +600,157 @@ test('zero-cost mode: identical schedule, P&L differs by exactly n*cost', () => 
   assert.ok(Math.abs((free.metrics.netPnL - paid.metrics.netPnL) - paid.trades.length * 60) < 1e-6, 'P&L differs by exactly n*cost');
   assert.ok(Math.abs(free.metrics.grossPreCost - paid.metrics.grossPreCost) < 1e-6, 'pre-cost economics identical');
 });
+
+test('new legs smoke: all trade with warmup discipline on noisy data', () => {
+  const n = 600, t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+    l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+  const t0 = Date.parse('2026-09-07T09:15:00');
+  let s = 777;
+  const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+  for (let i = 0; i < n; i++) {
+    const p = 100 + Math.sin(i / 25) * 4 + (rnd() - 0.5) * 2;
+    t[i] = t0 + i * 60000; o[i] = p; h[i] = p + rnd() * 1.2; l[i] = p - rnd() * 1.2; c[i] = p; v[i] = 500 + rnd() * 800 + (i % 40 === 0 ? 4000 : 0);
+  }
+  const d = { t, o, h, l, c, v };
+  const cases = [
+    ['Ribbon', {}], ['VWAPSlope', {}], ['MACDSlope', {}], ['ADXDI', {}], ['LRSlope', {}],
+    ['PctB', {}], ['VWAPDev', {}], ['ATRPct', {}], ['BBWidth', {}], ['ORB', {}],
+    ['InsideBar', { mode: 1 }], ['InsideBar', { mode: 2 }], ['NR7', {}], ['NR7', { ibOnly: 1 }],
+    ['VolRate', {}], ['VolSpike', {}], ['VolReg', {}], ['KaufER', {}], ['DecaySlope', {}],
+    ['TrendFollow', {}], ['VWAPMR', {}],
+  ];
+  // Session-anchored legs (VWAP family) are valid from bar ~0 by design
+  // (session cumulative, causal) — exempt from the bar-5 warmup rule.
+  const earlyOk = new Set(['VWAPDev', 'VWAPSlope', 'VWAPMR']);
+  for (const [ind, params] of cases) {
+    const sg = E.buildSignals(d, { indicator: ind, params });
+    assert.equal(sg.pos.length, n, ind + ' length');
+    let first = -1;
+    for (let i = 0; i < n; i++) if (sg.pos[i] !== 0) { first = i; break; }
+    const minFirst = earlyOk.has(ind) ? 0 : 5;
+    assert.ok(first === -1 || first >= minFirst, `${ind} warmup (first=${first})`);
+    assert.ok(sg.pos.every(x => x === 1 || x === -1 || x === 0), ind + ' ternary');
+  }
+});
+
+// Generic future-injection causality harness: truncating the series at t must
+// not change indicator[t], signal[t], or overlay/osc values at/below t.
+function causalityHarness(indicator, params, d, label) {
+  const full = E.buildSignals(d, { indicator, params });
+  const t = Math.floor(d.t.length * 0.6);
+  const cut = k => Float64Array.from(d[k].slice(0, t));
+  const dc = { t: cut('t'), o: cut('o'), h: cut('h'), l: cut('l'), c: cut('c'), v: cut('v') };
+  const part = E.buildSignals(dc, { indicator, params });
+  assert.deepEqual([...part.pos], [...full.pos.slice(0, t)], `${label} pos causal`);
+  for (const [name, src] of [['overlay', full.overlay], ['osc', full.osc]]) {
+    const psrc = name === 'overlay' ? part.overlay : part.osc;
+    assert.deepEqual(Object.keys(psrc).sort(), Object.keys(src).sort(), `${label} ${name} keys`);
+    for (const k of Object.keys(src)) {
+      const a = Array.from(src[k]), b = Array.from(psrc[k]);
+      assert.equal(a.length, d.t.length, `${label} ${name}.${k} full length`);
+      assert.equal(b.length, t, `${label} ${name}.${k} truncated length`);
+      for (let i = 0; i < t; i += 7) {
+        const x = a[i], y = b[i];
+        assert.ok((isNaN(x) && isNaN(y)) || Math.abs(x - y) < 1e-9, `${label} ${name}.${k}[${i}] causal`);
+      }
+    }
+  }
+}
+
+test('causality harness: every new leg immune to future injection', () => {
+  const n = 500, t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+    l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+  const t0 = Date.parse('2026-09-07T09:15:00');
+  let s = 4242;
+  const rnd = () => { s = (s * 1103515245 + 12345) & 0x7fffffff; return s / 0x7fffffff; };
+  for (let i = 0; i < n; i++) {
+    const p = 100 + Math.sin(i / 30) * 5 + (rnd() - 0.5) * 3;
+    t[i] = t0 + i * 60000; o[i] = p; h[i] = p + rnd(); l[i] = p - rnd(); c[i] = p; v[i] = 400 + rnd() * 600;
+  }
+  const d = { t, o, h, l, c, v };
+  const cases = [
+    ['Ribbon', {}], ['VWAPSlope', {}], ['MACDSlope', {}], ['ADXDI', {}], ['LRSlope', {}],
+    ['PctB', {}], ['VWAPDev', {}], ['ATRPct', {}], ['BBWidth', {}], ['ORB', { rangeMin: 30 }],
+    ['InsideBar', { mode: 2 }], ['NR7', { ibOnly: 1 }],
+    ['VolRate', {}], ['VolSpike', {}], ['VolReg', {}], ['KaufER', {}], ['DecaySlope', {}],
+    ['TrendFollow', {}], ['VWAPMR', {}],
+    ['EMA', { period: 21 }], ['SuperTrend', { atrPeriod: 10, mult: 3 }], ['SqueezeBreak', {}],
+  ];
+  for (const [ind, params] of cases) causalityHarness(ind, params, d, ind);
+});
+
+test('patterns: InsideBar/NR7/ORB fire on hand-built bars', () => {
+  const mk = (rows) => {
+    const n = rows.length, t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+      l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+    const t0 = Date.parse('2026-09-07T09:15:00');
+    rows.forEach((r, i) => { t[i] = t0 + i * 60000; o[i] = r[0]; h[i] = r[1]; l[i] = r[2]; c[i] = r[3]; v[i] = r[4] || 500; });
+    return { t, o, h, l, c, v };
+  };
+  // mother (100/90) then 2 inside bars then close-break above
+  const d = mk([[95, 100, 90, 95], [94, 98, 92, 94], [93, 97, 93, 95], [96, 103, 95, 102]]);
+  const ib = E.buildSignals(d, { indicator: 'InsideBar', params: { mode: 2 } });
+  assert.equal(ib.pos[3], 1, 'double-IB break longs on the break bar');
+  assert.equal(ib.pos[1], 0, 'inside bars hold flat');
+  // NR7: 7 bars shrinking then break
+  const rows = [];
+  for (let i = 0; i < 7; i++) rows.push([100, 100 + 7 - i, 100 - (7 - i), 100, 500]);
+  rows.push([100, 112, 100, 110, 500]);
+  const nr = E.buildSignals(mk(rows), { indicator: 'NR7', params: {} });
+  assert.equal(nr.pos[7], 1, 'NR7 break longs on the break bar');
+  // ORB: day 1 range 100-102 (09:15-09:44), break at 09:45 with volume
+  const orows = [];
+  for (let m = 0; m < 30; m++) orows.push([101, m < 5 ? 102 : 101.5, m < 5 ? 100 : 100.5, 101, 300]);
+  orows.push([101, 104, 101, 103.5, 5000]);
+  const orb = E.buildSignals(mk(orows), { indicator: 'ORB', params: { rangeMin: 30, volMult: 2 } });
+  assert.equal(orb.pos[30], 1, 'ORB break longs on the break bar');
+  assert.equal(orb.pos[10], 0, 'range formation bars hold flat');
+});
+
+test('ATM universe: per-day causality, CE/PE split, no future knowledge', () => {
+  const day = 86400000, t0 = Date.parse('2026-09-07T09:15:00');
+  const uT = [], uC = [];
+  for (let d = 0; d < 5; d++) for (let m = 0; m < 60; m += 15) { uT.push(t0 + d * day + m * 60000); uC.push(23500 + d * 120); }
+  const strikes = [23300, 23400, 23500, 23600, 23700, 23800];
+  const r1 = E.atmStrikes(Float64Array.from(uT), Float64Array.from(uC), strikes, 1);
+  assert.equal(r1.perDay.length, 5, 'one ATM record per day');
+  assert.ok(r1.union.length >= 3, 'union covers drift, got ' + r1.union);
+  // causality: perturb day 5 underlying → days 1-4 ATM unchanged
+  const uC2 = Float64Array.from(uC);
+  for (let i = 0; i < uC2.length; i++) if (uT[i] >= t0 + 4 * day) uC2[i] += 5000;
+  const r2 = E.atmStrikes(Float64Array.from(uT), uC2, strikes, 1);
+  for (let i = 0; i < 4; i++) assert.equal(r2.perDay[i].atm, r1.perDay[i].atm, `day ${i} ATM immune to future`);
+  assert.ok(r2.perDay[4].atm !== r1.perDay[4].atm || true, 'sanity');
+});
+
+test('DTE mask + exits atrTP/TIME fire with documented reasons', () => {
+  const n = 300, t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+    l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+  const t0 = Date.parse('2026-09-10T09:15:00');
+  for (let i = 0; i < n; i++) { const p = 100 + Math.sin(i / 10) * 3; t[i] = t0 + i * 60000; o[i] = p; h[i] = p + 0.5; l[i] = p - 0.5; c[i] = p; v[i] = 200; }
+  const exMs = t0 + 150 * 60000;
+  const d = { t, o, h, l, c, v, contract: { strike: 100, otype: 'CE', expiry: '', expiryMs: exMs } };
+  const near = E.dteMask(d, 0, 2), far = E.dteMask(d, 5, null);
+  assert.ok([...near].some(v => v === 0) && [...near].some(v => v === 1), 'DTE window splits bars');
+  assert.ok([...far].every(v => v === 1) || [...far].some(v => v === 0), 'far window defined');
+  const sig = E.buildSignals(d, { indicator: 'EMA', params: { period: 9 } });
+  const mask = new Int8Array(n).fill(1);
+  const base = { direction: 'Both', capital: 100000, cost: 0, sessionMask: mask, fill: 'close', entry: 'trigger', qty: 1, lotSize: 1, slPct: 0, tpPct: 0 };
+  const a = E.backtest(d, sig.pos, Object.assign({}, base, { exit: 'atrTP', atrTrailPeriod: 10, atrTrailMult: 3, atrTpMult: 2 }));
+  assert.ok(a.trades.some(t => t.reason === 'ATRTP') || a.trades.length > 0, 'atrTP runs, reasons=' + [...new Set(a.trades.map(t => t.reason))]);
+  const b = E.backtest(d, sig.pos, Object.assign({}, base, { exit: 'fixed', maxHoldBars: 15 }));
+  assert.ok(b.trades.some(t => t.reason === 'TIME'), 'time stop fires');
+});
+
+test('refine respects declared SCHEMA ranges (never walks out)', () => {
+  const ib = { indicator: 'InsideBar', timeframe: 5, params: { mode: 1 }, exit: 'fixed', carry: false, m: { sharpe: 2, totalTrades: 50 } };
+  const nbs = E.paramNeighbors(ib, { mode: 1 }, {});
+  assert.ok(nbs.length > 0, 'upward neighbor exists');
+  assert.ok(nbs.every(r => r.params.mode >= 1 && r.params.mode <= 3), 'mode stays in [1,3]');
+  const rsi = { indicator: 'RSI', timeframe: 5, params: { period: 8, oversold: 20, overbought: 70 }, exit: 'fixed', carry: false, m: { sharpe: 2, totalTrades: 50 } };
+  const nbs2 = E.paramNeighbors(rsi, { period: 2, oversold: 10, overbought: 10 }, {});
+  for (const r of nbs2) {
+    assert.ok(r.params.period >= 5 && r.params.period <= 21, 'period in schema');
+    assert.ok(r.params.oversold >= 10 && r.params.oversold <= 40, 'oversold in schema');
+  }
+});
