@@ -626,6 +626,15 @@ export async function runGrid() {
     }
     doneBase += grid.length;
   }
+  // Memory guardrail: retained rows are bounded (symbols × topN normally,
+  // but a huge topN cap could OOM the tab). Prune to the best 40k by the
+  // run objective — logged, never silent.
+  if (allRows.length > 40000) {
+    const kept = engine.rankResults(allRows, objective).slice(0, 40000);
+    logLine(`memory guard: retained ${kept.length}/${allRows.length} rows (best by ${objective})`);
+    allRows.length = 0;
+    allRows.push(...kept);
+  }
   // STAGE-2 discovery: AND-pairs of top singles (same symbol + timeframe).
   // Pairs are first-class rows (indicator='PAIR', legs in params) so detail,
   // WF, robustness and export paths work unchanged. Capped, logged, honest.
@@ -1532,7 +1541,14 @@ export function detailFor(r: BoardRow) {
 export function selectRow(r: BoardRow, auto?: boolean) {
   const st = useStore.getState();
   if (!auto) useStore.getState().set({ userPickedSeq: st.runSeq || 0 });
-  const det = detailFor(r);
+  let det = null;
+  try {
+    det = detailFor(r);
+  } catch (e: any) {
+    useStore.getState().set({ alert: `Could not render [${r.symbol}] ${r.indicator}: ${(e?.message || e)}` });
+    logLine(`detail ERROR: ${(e?.message || e)}`);
+    return;
+  }
   if (!det) return;
   useStore.getState().set({ sel: r, detail: det });
 }

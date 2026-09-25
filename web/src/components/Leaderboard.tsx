@@ -192,7 +192,7 @@ export default function Leaderboard() {
             columnDefs={COLS as any}
             rowSelection={{ mode: 'singleRow' }}
             onRowClicked={e => selectRow((e.data as any)._r)}
-            getRowId={p => String((p.data as any)._r.i) + (p.data as any)._r.indicator}
+            getRowId={p => `${(p.data as any)._r.symbol}|${(p.data as any)._r.timeframe}|${(p.data as any)._r.indicator}|${(p.data as any)._r.i}`}
             animateRows={false}
           />
         </div>
