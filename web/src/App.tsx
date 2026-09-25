@@ -4,6 +4,7 @@ import { me } from './lib/api';
 import Header from './components/Header';
 import Sidebar from './components/Sidebar';
 import MainView from './components/MainView';
+import ErrorBoundary from './components/ErrorBoundary';
 import Login from './pages/Login';
 import Users from './pages/Users';
 import Home from './pages/Home';
@@ -71,7 +72,9 @@ export default function App() {
         <aside className="sb-aside w-full lg:w-[330px] shrink-0 lg:h-[calc(100vh-57px)] lg:sticky lg:top-[57px] lg:overflow-y-auto border-r border-[#232329] p-3">
           <Sidebar />
         </aside>
-        <MainView />
+        <ErrorBoundary name="Terminal workspace">
+          <MainView />
+        </ErrorBoundary>
       </div>
     </div>
   );

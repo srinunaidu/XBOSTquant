@@ -176,6 +176,7 @@ export default function Sidebar() {
         <div className="lbl mb-2">🛠 Developer panel — live-data audit</div>
         <button className="btn-run w-full text-[13px]" onClick={() => runValidation()}>🔬 Debug &amp; Validate on live data</button>
         <button className="btn-ghost btn-xs w-full mt-2" onClick={() => downloadLog()}>⬇ Download session log (.txt)</button>
+        <div className="text-[10px] text-zinc-500 mt-1 num">Heap: {heapMB()} · {boardLen()} board rows · {dataBars()} bars loaded</div>
         <button className="btn-ghost btn-xs w-full mt-2" onClick={() => downloadAuditArtifact()}>⤓ Export audit artifact (research JSON)</button>
         <label className="btn-ghost btn-xs w-full mt-2 text-center cursor-pointer">⤴ Replay audit file
           <input type="file" accept=".json" className="hidden" onChange={e => {
@@ -545,6 +546,23 @@ function IndSection() {
       </div>
     </section>
   );
+}
+
+function heapMB(): string {
+  try {
+    const m = (performance as any)?.memory?.usedJSHeapSize;
+    return m ? Math.round(m / 1048576) + 'MB' : 'n/a';
+  } catch { return 'n/a'; }
+}
+function boardLen(): number {
+  try { return useStore.getState().board.length; } catch { return 0; }
+}
+function dataBars(): string {
+  try {
+    const ds = useStore.getState().datasets;
+    const n = Object.values(ds).reduce((a: number, d: any) => a + (d.raw?.t?.length || 0), 0);
+    return n >= 1e6 ? (n / 1e6).toFixed(1) + 'M' : Math.round(n / 1000) + 'k';
+  } catch { return '—'; }
 }
 
 function ValidationOut() {

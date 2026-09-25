@@ -208,6 +208,13 @@ export function routingFor(cache: Record<number, any>, tf: number, d: any, cfg: 
   return { mask: engine.regimeMask(regArr, cfg.indicator), notices: notes };
 }
 
+function heapNote(): string {
+  try {
+    const m = (performance as any)?.memory?.usedJSHeapSize;
+    return m ? ` · heap ${Math.round(m / 1048576)}MB` : '';
+  } catch { return ''; }
+}
+
 export function logLine(s: string) {
   const st = useStore.getState();
   const ts = new Date().toLocaleTimeString('en-IN', { hour12: false });
@@ -867,7 +874,7 @@ export async function runGrid() {
       useStore.getState().set({ board: useStore.getState().board });
     }
     setRun({ running: false, refined: 0, passes: 0, summary: `done · ${tested} combos in ${secs.toFixed(1)}s${refineInfo}${errs ? ` · ⚠ ${errs} errored` : ''}${wfMsg ? ` · ${wfMsg}` : ''}` });
-    logLine(`run done (${runMode}): ${tested} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${s3._refineAt ? ` + refine ${(secs - gridSecs).toFixed(1)}s` : ''}] ${(tested / Math.max(secs, 0.01)).toFixed(0)}/s objective=${objective} errors=${errs}${refineInfo}${wfMsg ? ' · ' + wfMsg : ''}`);
+    logLine(`run done (${runMode}): ${tested} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${s3._refineAt ? ` + refine ${(secs - gridSecs).toFixed(1)}s` : ''}] ${(tested / Math.max(secs, 0.01)).toFixed(0)}/s objective=${objective} errors=${errs}${refineInfo}${wfMsg ? ' · ' + wfMsg : ''}${heapNote()}`);
     errSamples.forEach((e: any) => logLine(`  combo error: ${e}`));
   }
   const bd = useStore.getState().board;
