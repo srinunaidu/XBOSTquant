@@ -92,6 +92,28 @@ app.get('/api/me', (req, res) => {
   res.json({ user: req.session.user });
 });
 
+// Client crash/error reports: the tab may die right after sending, so the
+// browser beacons errors here and the SERVER log (Railway dashboard →
+// Deployments → View Logs) keeps the evidence. Public endpoint (a dying tab
+// may have no session), throttled per IP, payload truncated server-side.
+const errHits = new Map();
+app.post('/api/client-error', (req, res) => {
+  try {
+    const ip = req.ip;
+    const now = Date.now();
+    const h = errHits.get(ip) || { n: 0, until: 0 };
+    if (now > h.until) { h.n = 0; h.until = now + 60000; }
+    h.n++;
+    errHits.set(ip, h);
+    if (h.n > 20) return res.status(429).json({ error: 'throttled' });
+    const b = req.body || {};
+    const s = v => String(v == null ? '' : v).slice(0, 500);
+    const stack = String(b.stack || '').split('\n').slice(0, 4).join(' | ').slice(0, 800);
+    console.error(`[client-error] ip=${ip} user=${req.session && req.session.user ? req.session.user.username : '-'} msg=${s(b.message)} stack=${stack} url=${s(b.url)} run=${s(b.run)} heap=${s(b.heap)} board=${s(b.board)} tail=${s(b.tail)}`);
+  } catch { /* never fail the reporter */ }
+  res.json({ ok: true });
+});
+
 function requireAdmin(req, res, next) {
   if (!req.session.user) return res.status(401).json({ error: 'unauthorized' });
   if (req.session.user.role !== 'admin') return res.status(403).json({ error: 'admin only' });

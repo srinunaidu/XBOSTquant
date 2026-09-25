@@ -25,13 +25,24 @@ function ddOf(pnls: number[], capital: number): number {
 
 // Monte Carlo trade permutation: shuffle P&Ls N times, distribution of
 // worst-case drawdowns. Answers: was my MaxDD luck of sequence or structure?
+// SAFETY: input capped at 20k trades (strided) and iters scaled so
+// iters×n ≤ 20M ops — uncapped, a 50k-trade strategy × 5000 iters = 500B ops
+// and kills the tab. Returns itersUsed + capped flag (logged, never silent).
 export function monteCarloDD(trades: Trade[], capital: number, iters = 1000, seed = 42) {
   const base = trades.map(t => t.pnl);
   if (!base.length) return null;
+  let pool = base, capped = false;
+  if (pool.length > 20000) {
+    const stride = pool.length / 20000, out: number[] = [];
+    for (let i = 0; i < 20000; i++) out.push(pool[Math.floor(i * stride)]);
+    pool = out; capped = true;
+  }
+  const n = pool.length;
+  iters = Math.max(100, Math.min(iters, Math.floor(20000000 / Math.max(1, n))));
   const rnd = mulberry(seed);
   const out = new Float64Array(iters);
   for (let k = 0; k < iters; k++) {
-    const arr = base.slice();
+    const arr = pool.slice();
     for (let i = arr.length - 1; i > 0; i--) {
       const j = Math.floor(rnd() * (i + 1));
       const tmp = arr[i]; arr[i] = arr[j]; arr[j] = tmp;
@@ -41,7 +52,8 @@ export function monteCarloDD(trades: Trade[], capital: number, iters = 1000, see
   const s = Array.from(out).sort((a, b) => a - b);
   const q = (p: number) => s[Math.min(iters - 1, Math.floor(p * iters))];
   return {
-    iters, mean: s.reduce((a, b) => a + b, 0) / iters,
+    iters, capped, nTrades: pool.length,
+    mean: s.reduce((a, b) => a + b, 0) / iters,
     p5: q(0.05), p50: q(0.5), p95: q(0.95), worst: s[0],
   };
 }

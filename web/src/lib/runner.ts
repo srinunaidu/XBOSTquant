@@ -939,7 +939,7 @@ export async function runGrid() {
           const rankedH = ht.slice().sort((a,b) => b.pnl - a.pnl);
           const bestH = rankedH.find(h => h.n >= 5) || rankedH[0] || null;
           stress = mc ? {
-            mcN: mc.iters, mcP5: +mc.p5.toFixed(1), mcMed: +mc.p50.toFixed(1), mcWorst: +mc.worst.toFixed(1),
+            mcN: mc.iters, mcCapped: mc.capped, mcP5: +mc.p5.toFixed(1), mcMed: +mc.p50.toFixed(1), mcWorst: +mc.worst.toFixed(1),
             maxLossStreak: sk.maxLossStreak, p4: +sk.p4.toFixed(3), p5: +sk.p5.toFixed(3), p6: +sk.p6.toFixed(3),
             avgMAE: ex ? Math.round(ex.avgMAE) : null, avgMFE: ex ? Math.round(ex.avgMFE) : null,
             heat: ht.map(h => ({ w: h.label, n: h.n, wr: +h.wr.toFixed(1), pnl: Math.round(h.pnl) })),
@@ -980,7 +980,7 @@ export async function runGrid() {
     (L.bestPerSymbol || []).forEach((t: any) => logLine(t.ind ? `  best[${t.sym}]: ${t.tf}m ${t.ind} WR=${t.wr}% n=${t.n} pnl=${t.pnl} sharpe=${t.sharpe}` : `  best[${t.sym}]: no rows`));
     if (L.stress) {
       const S = L.stress;
-      logLine(`stress[best]: MC1000 maxDD p5=${S.mcP5}% med=${S.mcMed}% worst=${S.mcWorst}% · lossStreak max=${S.maxLossStreak} P4=${(100 * S.p4).toFixed(1)}% P5=${(100 * S.p5).toFixed(1)}% P6=${(100 * S.p6).toFixed(1)}% · avgMAE=${S.avgMAE} avgMFE=${S.avgMFE}`);
+      logLine(`stress[best]: MC${S.mcN}${S.mcCapped ? '(capped)' : ''} maxDD p5=${S.mcP5}% med=${S.mcMed}% worst=${S.mcWorst}% · lossStreak max=${S.maxLossStreak} P4=${(100 * S.p4).toFixed(1)}% P5=${(100 * S.p5).toFixed(1)}% P6=${(100 * S.p6).toFixed(1)}% · avgMAE=${S.avgMAE} avgMFE=${S.avgMFE}`);
       S.heat.forEach((h: any) => logLine(`  heat ${h.w}: n=${h.n} WR=${h.wr}% pnl=${h.pnl}`));
       if (S.bestTime) logLine(`  bestTime[best]: ${S.bestTime.w} WR=${S.bestTime.wr}% n=${S.bestTime.n} pnl=${S.bestTime.pnl}`);
     }

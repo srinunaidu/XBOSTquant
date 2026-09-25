@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useStore } from './lib/store';
 import { me } from './lib/api';
+import { installCrashReporter } from './lib/reporter';
 import Header from './components/Header';
 import Sidebar from './components/Sidebar';
 import MainView from './components/MainView';
@@ -21,6 +22,7 @@ export default function App() {
   const [booted, setBooted] = useState(false);
 
   useEffect(() => {
+    installCrashReporter();
     const onHash = () => setR(route());
     window.addEventListener('hashchange', onHash);
     me().then(u => {

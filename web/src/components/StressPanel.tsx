@@ -52,7 +52,7 @@ export default function StressPanel() {
       const heat0 = heatmap(bt.trades, bucketsFor(d.cfg.symbol, s.exchange));
       const bestH = heat0.slice().sort((a,b) => b.pnl - a.pnl).find(h => h.n >= 5) || heat0.slice().sort((a,b) => b.pnl - a.pnl)[0] || null;
       const exc0 = excursionStats(bt.trades);
-      logLine(`stress [${d.cfg.symbol || ''} ${d.cfg.timeframe}m ${d.cfg.indicator}]: MC${mcN} p5-DD=${mc0 ? mc0.p5.toFixed(1) : '—'}% median=${mc0 ? mc0.p50.toFixed(1) : '—'}% worst=${mc0 ? mc0.worst.toFixed(1) : '—'}%`);
+      logLine(`stress [${d.cfg.symbol || ''} ${d.cfg.timeframe}m ${d.cfg.indicator}]: MC${mc0 ? mc0.iters : mcN}${mc0 && mc0.capped ? ' (capped 20k trades)' : ''} p5-DD=${mc0 ? mc0.p5.toFixed(1) : '—'}% median=${mc0 ? mc0.p50.toFixed(1) : '—'}% worst=${mc0 ? mc0.worst.toFixed(1) : '—'}%`);
       logLine(`  streaks: maxLoss=${st0.maxLossStreak} P(4)=${(100 * st0.p4).toFixed(1)}% P(5)=${(100 * st0.p5).toFixed(1)}% P(6)=${(100 * st0.p6).toFixed(1)}%`);
       heat0.forEach(h => logLine(`  heat ${h.label}: n=${h.n} WR=${h.wr.toFixed(1)}% pnl=${h.pnl.toFixed(0)}`));
       if (bestH) logLine(`  bestTime: ${bestH.label} WR=${bestH.wr.toFixed(1)}% n=${bestH.n} pnl=${bestH.pnl.toFixed(0)}`);
