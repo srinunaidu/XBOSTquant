@@ -2,6 +2,7 @@
 // Generates machine + human reports per spec §1-17.
 // All numbers are recomputed from underlying candidate/trade data.
 import type { BoardRow } from './engine';
+import engine from './engine';
 
 export function candidateId(r: BoardRow): string {
   return `${r.symbol || 'UNK'}_${r.timeframe}m_${r.indicator}_${Object.values(r.params || {}).join('_')}`.replace(/[^A-Za-z0-9_]/g, '_').slice(0, 80);
@@ -46,10 +47,13 @@ export function formatCandidateHeader(r: BoardRow, totalCombos: number, rank: nu
 }
 
 export function sampleTier(n: number): string {
-  if (n < 30) return 'INSUFFICIENT';
-  if (n < 100) return 'LOW_SAMPLE';
-  if (n < 200) return 'STANDARD';
-  return 'PAPER_READY';
+  // Single vocabulary, delegated to the engine (RAW/INSUFFICIENT/
+  // EXPLORATORY/RANKABLE + ROBUST_ELIGIBLE at paper depth).
+  try {
+    const t = engine.sampleTier(n);
+    if (t === 'RANKABLE' && n >= 200) return 'RANKABLE/ROBUST_ELIGIBLE';
+    return t;
+  } catch { return n < 10 ? 'INSUFFICIENT' : n < 30 ? 'EXPLORATORY' : 'RANKABLE'; }
 }
 
 export function formatCoreSignal(r: any) {

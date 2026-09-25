@@ -8,6 +8,7 @@ import { estimateCombos } from '../lib/runner';
 import { applyDateFilter, loadFile, selectATM } from '../lib/data';
 import { downloadLog } from '../lib/export';
 import { runValidation } from '../lib/validate';
+import { downloadAuditArtifact, replayArtifactFile } from '../lib/runner';
 
 function Section({ n, children }: { n: string; children: React.ReactNode }) {
   return (
@@ -119,11 +120,12 @@ export default function Sidebar() {
             ))}
           </div>
           <div className="grid grid-cols-3 gap-1.5 mt-1.5">
-            {[['ins', 'Insuff <'], ['exp', 'Explor <'], ['dev', 'Rankable ≥']].map(([k, l]) => (
+            {[['ins', 'Insuff <'], ['rank', 'Rankable ≥']].map(([k, l]) => (
               <div key={k}><label className="lbl">{l}</label>
                 <input type="number" className="w-full mt-1 num" value={(st.sampleT as any)[k] ?? 0}
                   onChange={e => set({ sampleT: { ...st.sampleT, [k]: Math.max(2, Math.round(+e.target.value || 0)) } as any })} /></div>
             ))}
+            <div className="text-[10px] text-zinc-500 self-end">EXPLORATORY = between the two. ROBUST_ELIGIBLE = paper min trades.</div>
           </div>
           <div className="text-[10px] text-zinc-500 mt-1">Sharpe is 10% of selection, winsorized ±20 and sample-shrunk. Tiers gate rankability, never visibility.</div>
         </details>
@@ -174,6 +176,14 @@ export default function Sidebar() {
         <div className="lbl mb-2">🛠 Developer panel — live-data audit</div>
         <button className="btn-run w-full text-[13px]" onClick={() => runValidation()}>🔬 Debug &amp; Validate on live data</button>
         <button className="btn-ghost btn-xs w-full mt-2" onClick={() => downloadLog()}>⬇ Download session log (.txt)</button>
+        <button className="btn-ghost btn-xs w-full mt-2" onClick={() => downloadAuditArtifact()}>⤓ Export audit artifact (research JSON)</button>
+        <label className="btn-ghost btn-xs w-full mt-2 text-center cursor-pointer">⤴ Replay audit file
+          <input type="file" accept=".json" className="hidden" onChange={e => {
+            const f = e.target.files && e.target.files[0];
+            if (f) replayArtifactFile(f).catch((err: any) => useStore.getState().set({ alert: 'Replay failed: ' + (err?.message || err) }));
+            e.target.value = '';
+          }} />
+        </label>
         <div className="text-[10px] text-zinc-500 mt-1">Audits the loaded file + engine identities. Zero synthetic data.</div>
         <ValidationOut />
       </section>

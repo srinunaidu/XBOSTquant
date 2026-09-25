@@ -145,9 +145,9 @@ export default function Leaderboard() {
       list = [...list].sort(engine.researchCmp(rk));
     }
     if (view === 'all') {
-      // Final-selection view: composite order, rankable rows first, thin
-      // rows retained below (visible, labelled — never hidden).
-      const isRankable = (r: BoardRow) => (r.compositeScore && r.compositeScore.tier !== 'INSUFFICIENT') ? 1 : 0;
+      // Final-selection view: composite order, RANKABLE rows first, thin and
+      // exploratory rows retained below (visible, labelled — never hidden).
+      const isRankable = (r: BoardRow) => (r.compositeScore && r.compositeScore.tier === 'RANKABLE') ? 1 : 0;
       list = [...list].sort((a, b) =>
         (isRankable(b) - isRankable(a)) ||
         (((b.compositeScore || {}).composite || 0) - ((a.compositeScore || {}).composite || 0)) ||

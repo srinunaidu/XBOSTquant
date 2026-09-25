@@ -822,14 +822,134 @@ test('pareto: dominated rows excluded, trade-offs retained, no ranks', () => {
 test('tiers: configurable cutoffs drive rankability, reliability scale', () => {
   assert.equal(E.sampleTier(5), 'INSUFFICIENT');
   assert.equal(E.sampleTier(15), 'EXPLORATORY');
-  assert.equal(E.sampleTier(25), 'DEVELOPING');
+  assert.equal(E.sampleTier(25), 'EXPLORATORY');
   assert.equal(E.sampleTier(30), 'RANKABLE');
-  assert.equal(E.sampleTier(9, { insufficient: 5, exploratory: 8, developing: 12 }), 'DEVELOPING', 'custom cutoffs apply');
-  assert.equal(E.sampleTier(15, { insufficient: 5, exploratory: 8, developing: 12 }), 'RANKABLE', 'custom rankable');
+  assert.equal(E.sampleTier(9, { insufficient: 5, rankable: 12 }), 'EXPLORATORY', 'custom cutoffs apply');
+  assert.equal(E.sampleTier(15, { insufficient: 5, rankable: 12 }), 'RANKABLE', 'custom rankable');
   assert.equal(E.sharpeReliability(5), 'LOW');
   assert.equal(E.sharpeReliability(15), 'MEDIUM');
   assert.equal(E.sharpeReliability(100), 'HIGH');
   const m = { netPnL: 10, totalTrades: 25, winRate: 60, expectancy: 0.4, profitFactor: 1.5, sharpe: 2, maxDD: -3, grossProfit: 20, grossLoss: 10 };
-  assert.equal(E.rankableScore(m), null, 'default developing not rankable');
-  assert.ok(E.rankableScore(m, { tiers: { insufficient: 10, exploratory: 20, developing: 25 } }) !== null, 'custom developing rankable');
+  assert.equal(E.rankableScore(m), null, 'n=25 exploratory not rankable by default');
+  assert.ok(E.rankableScore(m, { tiers: { insufficient: 10, rankable: 25 } }) !== null, 'custom rankable cutoff applies');
+});
+
+test('tiers §20: n=2/9 not rankable, n=10/29 exploratory, n=30 rankable, none→NONE', () => {
+  const mk = (n) => ({ m: { netPnL: n * 2, totalTrades: n, winRate: 60, expectancy: 2, profitFactor: 2, sharpe: 3, maxDD: -5, grossProfit: n * 3, grossLoss: n } });
+  assert.equal(E.rankableScore(mk(2).m), null, '1. n=2 cannot become rankable');
+  assert.equal(E.rankableScore(mk(9).m), null, '2. n=9 cannot become rankable');
+  assert.equal(E.strategyScore(mk(10).m).tier, 'EXPLORATORY', '3. n=10 exploratory');
+  assert.equal(E.strategyScore(mk(29).m).tier, 'EXPLORATORY', '4. n=29 exploratory');
+  assert.equal(E.strategyScore(mk(30).m).tier, 'RANKABLE', '5. n=30 rankable');
+  assert.ok(E.rankableScore(mk(30).m) !== null);
+  const allThin = [2, 5, 7].map(n => mk(n));
+  assert.equal(allThin.filter(r => E.rankableScore(r.m) !== null).length, 0, '6. NONE when all thin');
+});
+
+test('whyNotRanked: every exclusion carries an explicit reason', () => {
+  const thin = { m: { netPnL: 5, totalTrades: 7, winRate: 80, expectancy: 1, profitFactor: 2, sharpe: 5, maxDD: -1, grossProfit: 10, grossLoss: 5 } };
+  assert.equal(E.whyNotRanked(thin), 'INSUFFICIENT_TRADES');
+  const expl = { m: { netPnL: 30, totalTrades: 15, winRate: 70, expectancy: 2, profitFactor: 2.5, sharpe: 4, maxDD: -2, grossProfit: 40, grossLoss: 10 } };
+  assert.equal(E.whyNotRanked(expl), 'EXPLORATORY_ONLY');
+  const tiny = { m: { netPnL: 1, totalTrades: 3, winRate: 100, expectancy: 1, profitFactor: 99, sharpe: 50, maxDD: 0, grossProfit: 2, grossLoss: 0 } };
+  assert.equal(E.whyNotRanked(tiny), 'INSUFFICIENT_TRADES');
+  const bad = {
+    m: { netPnL: 100, totalTrades: 100, winRate: 55, expectancy: 1, profitFactor: 1.8, sharpe: 2, maxDD: -8, grossProfit: 200, grossLoss: 100 },
+    robustScore: 4, robustness: {}, survived: false,
+  };
+  assert.equal(E.whyNotRanked(bad), 'ROBUSTNESS_FAILURE');
+  const oosFail = {
+    m: { netPnL: 100, totalTrades: 100, winRate: 55, expectancy: 1, profitFactor: 1.8, sharpe: 2, maxDD: -8, grossProfit: 200, grossLoss: 100 },
+    robustScore: 9.6, robustness: { surrogate: { p: 0.001 }, paramSensitivity: { knifeEdge: false } }, survived: false,
+  };
+  assert.equal(E.whyNotRanked(oosFail), 'OOS_FAILURE');
+  const ok = {
+    m: { netPnL: 100, totalTrades: 100, winRate: 55, expectancy: 1, profitFactor: 1.8, sharpe: 2, maxDD: -8, grossProfit: 200, grossLoss: 100 },
+    robustScore: 9.6, robustness: { surrogate: { p: 0.001 }, paramSensitivity: { knifeEdge: false } }, survived: true,
+  };
+  assert.equal(E.whyNotRanked(ok), '');
+});
+
+test('tiers exported consistently: engine tiers match rankable gate', () => {
+  assert.deepEqual(Object.keys(E.SCORE_DEF.tiers).sort(), ['insufficient', 'rankable']);
+  assert.equal(E.SCORE_DEF.tiers.rankable, 30);
+});
+
+test('researchUnion: top-20/objective retained, deterministic, no silent deletion', () => {
+  const rows = [];
+  for (let i = 0; i < 60; i++) rows.push({
+    i, timeframe: 5, indicator: 'EMA', params: { period: 5 + (i % 20) }, exit: 'fixed', carry: false,
+    m: { netPnL: (i * 53) % 400 - 50, winRate: (i * 29) % 100, totalTrades: 10 + (i % 40), profitFactor: 0.5 + (i % 9) * 0.3, expectancy: ((i * 53) % 400 - 50) / (10 + (i % 40)), sharpe: (i % 11) - 5, maxDD: -(i % 6), sortino: 0, grossProfit: 100, grossLoss: 50 },
+  });
+  const u1 = E.researchUnion(rows, 10, 'sharpe');
+  const u2 = E.researchUnion(rows, 10, 'sharpe');
+  assert.deepEqual(u1.board.map(r => E.cfgKey(r)), u2.board.map(r => E.cfgKey(r)), '17/20 deterministic');
+  assert.ok(u1.board.length >= 10 && u1.board.length <= 10 + 5 * 20, `bounded board (${u1.board.length})`);
+  // every research top-3 is present (no silent deletion)
+  for (const [key] of E.RESEARCH_OBJS) {
+    const tops = rows.slice().sort(E.researchCmp(key)).slice(0, 3).map(r => E.cfgKey(r));
+    const have = new Set(u1.board.map(r => E.cfgKey(r)));
+    for (const k of tops) assert.ok(have.has(k), `20. ${key} top retained`);
+  }
+});
+
+test('replay: full cycle PASS, tamper detected with field details', () => {
+  const mk = (id, pnl, n, wr) => ({ candidate_id: id, net_pnl: pnl, trade_count: n, _row_hash: E.hashRecord([id, pnl, n]), metrics: { netPnL: pnl, totalTrades: n, winRate: wr, expectancy: pnl / Math.max(1, n), profitFactor: 2, sharpe: 2, maxDD: -3, grossProfit: Math.max(0, pnl) + 10, grossLoss: 10 }, sample_tier: E.sampleTier(n), composite: (() => { const s = E.strategyScore({ netPnL: pnl, totalTrades: n, winRate: wr, expectancy: pnl / Math.max(1, n), profitFactor: 2, sharpe: 2, maxDD: -3, grossProfit: Math.max(0, pnl) + 10, grossLoss: 10 }); return { score: s.composite, tier: s.tier }; })(), robustScore: null });
+  const cands = [mk('A', 500, 100, 60), mk('B', 300, 80, 55), mk('C', 50, 5, 90)];
+  const cfg = { scoreW: E.SCORE_DEF.weights, sampleTiers: E.SCORE_DEF.tiers };
+  const art = {
+    candidate_results: cands,
+    ranking_results: {
+      input_count: 3,
+      per_objective: Object.fromEntries(E.RESEARCH_OBJS.map(([k]) => [k, cands.map(c => ({ m: c.metrics, _id: c.candidate_id })).sort(E.researchCmp(k)).slice(0, 20).map(r => r._id)])),
+      pareto: E.paretoFrontier(cands.map(c => ({ m: c.metrics, _id: c.candidate_id }))).map(r => r._id),
+    },
+    robustness_results: [], config: cfg,
+    hashes: {
+      config: { algo: 'FNV-1a-32', hash: E.hashRecord(cfg) },
+      results: { algo: 'FNV-1a-32', hash: E.hashRecord(cands.map(c => [c.candidate_id, c.metrics.netPnL, c.metrics.totalTrades])) },
+    },
+  };
+  const ok = E.replayAudit(art);
+  assert.equal(ok.pass, true, JSON.stringify(ok.checks.filter(c => !c.pass)));
+  assert.ok(ok.checks.some(c => c.name === 'REPLAY_STATUS' && c.pass));
+  // 13/14. tamper config + results → detected with details
+  const bad = JSON.parse(JSON.stringify(art));
+  bad.config.scoreW.ret = 0.99;
+  const r1 = E.replayAudit(bad);
+  assert.equal(r1.pass, false, '12. config tamper detected');
+  assert.ok(r1.mismatches.some(m => m.field === 'config_hash'), '14. config hash mismatch named');
+  const bad2 = JSON.parse(JSON.stringify(art));
+  bad2.candidate_results[0].net_pnl = 99999;
+  const r2 = E.replayAudit(bad2);
+  assert.equal(r2.pass, false, '12. candidate tamper detected');
+  assert.ok(r2.mismatches.some(m => m.candidate_id === 'A'), '15. candidate mismatch named');
+});
+
+test('trade-level metrics reproduce candidate metrics (16)', () => {
+  const d = (() => {
+    const n = 300, t = new Float64Array(n), o = new Float64Array(n), h = new Float64Array(n),
+      l = new Float64Array(n), c = new Float64Array(n), v = new Float64Array(n);
+    const t0 = Date.parse('2026-09-10T09:15:00');
+    for (let i = 0; i < n; i++) { const p = 100 + Math.sin(i / 9) * 2.5; t[i] = t0 + i * 60000; o[i] = p; h[i] = p + 0.4; l[i] = p - 0.4; c[i] = p; v[i] = 150; }
+    return { t, o, h, l, c, v };
+  })();
+  const sig = E.buildSignals(d, { indicator: 'RSI', params: { period: 14, oversold: 30, overbought: 70 } });
+  const bt = E.backtest(d, sig.pos, { direction: 'Both', sessionMask: new Int8Array(d.t.length).fill(1), capital: 100000, qty: 1, lotSize: 1, cost: 0, slPct: 1, tpPct: 2 });
+  const m = bt.metrics, ts = bt.trades;
+  assert.equal(m.totalTrades, ts.length);
+  assert.equal(m.winRate, ts.length ? ts.filter(t => t.pnl > 0).length / ts.length * 100 : 0);
+  assert.ok(Math.abs(m.netPnL - ts.reduce((a, t) => a + t.pnl, 0)) < 1e-6);
+  assert.ok(Math.abs(m.expectancy - m.netPnL / Math.max(1, ts.length)) < 1e-9);
+  const gp = ts.filter(t => t.pnl > 0).reduce((a, t) => a + t.pnl, 0);
+  assert.ok(Math.abs(m.grossProfit - gp) < 1e-6);
+});
+
+test('no hidden seeds/normalization (18/19): weights logged sum to 1, Halton fixed', () => {
+  const w = E.SCORE_DEF.weights;
+  assert.ok(Math.abs(w.ret + w.winExp + w.pf + w.sample + w.risk + w.sharpe - 1) < 1e-9, 'weights sum to 1');
+  const h1 = E.haltonSequence(32, 4), h2 = E.haltonSequence(32, 4);
+  assert.deepEqual(h1, h2, 'sampler deterministic, no hidden seed');
+  const m = { netPnL: 200, totalTrades: 60, winRate: 58, expectancy: 3.3, profitFactor: 2.2, sharpe: 4.1, maxDD: -7, grossProfit: 300, grossLoss: 100 };
+  assert.equal(E.strategyScore(m).composite, E.strategyScore(m).composite, 'score independent of population');
 });

@@ -64,6 +64,7 @@ export interface Engine {
   itrend(close: Float64Array, alpha?: number): { trend: Float64Array; trig: Float64Array };
   adaptivePeriod(base: number, cycle: number | null, min?: number, max?: number): number;
   rankResults(rows: BoardRow[], objective: string): BoardRow[];
+  researchUnion(allRows: BoardRow[], topN: number, objective: string): { board: BoardRow[]; extra: number };
   RESEARCH_OBJS: [string, string][];
   FAMILY: Record<string, string>;
   dteMask(d: OHLCV, minDte?: number | null, maxDte?: number | null): Int8Array;
@@ -73,12 +74,16 @@ export interface Engine {
   researchCmp(key: string): (a: BoardRow, b: BoardRow) => number;
   auditRankingIntegrity(allRows: BoardRow[], displayed: BoardRow[]): { objective: string; key: string; pass: boolean; maxRow: string | null; maxValue: number | null; displayed: string | null }[];
   SCORE_DEF: { weights: Record<string, number>; sampleK: number; ddScale: number; sharpeCap: number; shrK: number; tiers: { insufficient: number; exploratory: number; developing: number } };
-  sampleTier(n: number, tiers?: { insufficient: number; exploratory: number; developing: number }): string;
+  sampleTier(n: number, tiers?: { insufficient: number; rankable: number }): string;
+  whyNotRanked(row: BoardRow, over?: any): string;
   sharpeAdj(sharpeRaw: number, n: number, shrK?: number): number;
   sharpeReliability(n: number): string;
   strategyScore(m: any, over?: any): { composite: number; parts: Record<string, number>; sharpeRaw: number; sharpeAdj: number; tier: string; reliability: string; n: number };
   rankableScore(m: any, over?: any): { composite: number } | null;
   paretoFrontier(rows: BoardRow[], keys?: [string, number][]): BoardRow[];
+  fnv1a(s: any): string;
+  hashRecord(o: any): string;
+  replayAudit(art: any): { checks: { name: string; pass: boolean; detail?: string }[]; mismatches: any[]; pass: boolean };
   IST_OFFSET_MS: number;
   istParts(t: number): { h: number; m: number; y: number; mo: number; day: number };
   istDayKey(t: number): string;

@@ -39,8 +39,17 @@ test('blockBootstrapCI: deterministic, shaped, insufficient-trades note', () => 
   assert.deepEqual(a, b, 'seeded deterministic');
   assert.ok(a.sharpe[0] <= a.sharpe[1] && a.wr[0] <= a.wr[1], 'ordered CIs');
   assert.equal(a.nSamples, 200);
+  assert.equal(a.status, 'OK');
+  assert.equal(a.method, 'block');
+  assert.equal(a.block, 20);
+  assert.equal(a.seed, 7);
+  assert.equal(a.n, 120);
   const thin = R.blockBootstrapCI(trades.slice(0, 5), 20, 200, 7);
-  assert.equal(thin.nSamples, 0, 'thin trade list refused');
+  assert.equal(thin.status, 'SKIPPED', 'thin trade list refused with status');
+  assert.equal(thin.reason, 'INSUFFICIENT_SAMPLE');
+  assert.equal(thin.sharpe, null, 'skipped CI is null, never [0,0]');
+  assert.equal(thin.wr, null);
+  assert.equal(thin.pf, null);
 });
 
 test('surrogateTest: noise ≈ 0.5, deterministic, thin refused', () => {

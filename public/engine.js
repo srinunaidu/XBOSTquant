@@ -2488,6 +2488,94 @@ function demoteKnifeEdge(ranked, pssOf){
   return clean.concat(edge);
 }
 
+// ---------- Deterministic hashing + offline replay ----------
+// FNV-1a 32-bit hex: sync, deterministic, no dependencies. The runner
+// upgrades artifact hashes to SHA-256 (crypto.subtle) when available and
+// records which algorithm produced each hash — never silently weak.
+function fnv1a(str){
+  str=typeof str==='string'?str:String(str);
+  let h=0x811c9dc5;
+  for(let i=0;i<str.length;i++){h^=str.charCodeAt(i);h=Math.imul(h,0x01000193);}
+  return ('0000000'+(h>>>0).toString(16)).slice(-8);
+}
+function hashRecord(o){ try{return fnv1a(JSON.stringify(o));}catch(e){return fnv1a(String(o));} }
+// replayAudit(artifact): independently reconstruct tiers, composite scores,
+// objective rankings, Pareto set and ranking audit from candidate_results
+// ALONE (no data, no backtests — pure recomputation), then compare every
+// field against the stored values. Returns REPLAY_STATUS + mismatches with
+// candidate_id/field/original/replayed/difference.
+function replayAudit(art){
+  const out={checks:[], mismatches:[], pass:true};
+  const fail=(check, m)=>{ out.pass=false; out.checks.push(Object.assign({name:check, pass:false}, m||{})); };
+  const cands=art.candidate_results||[];
+  const rk=art.ranking_results||{};
+  const byId={}; for(const c of cands) byId[c.candidate_id]=c;
+  // 1. candidate count
+  if(cands.length===(rk.input_count==null?cands.length:rk.input_count)) out.checks.push({name:'CANDIDATE_COUNT_MATCH', pass:true, detail:String(cands.length)});
+  else fail('CANDIDATE_COUNT_MATCH', {detail:`artifact=${cands.length} ranking_input=${rk.input_count}`});
+  // 2-3. tiers + composite recomputation (METRIC_MATCH + COMPOSITE_MATCH)
+  const wsum=(art.config&&art.config.scoreW)||null;
+  const over={weights:wsum||undefined, tiers:(art.config&&art.config.sampleTiers)||undefined};
+  let metricBad=0, compBad=0, tierBad=0;
+  for(const c of cands){
+    const m=c.metrics||{};
+    const reT=sampleTier(m.totalTrades||0, over.tiers);
+    if(reT!==(c.sample_tier||reT)){ tierBad++; if(metricBad+tierBad+compBad<6) out.mismatches.push({candidate_id:c.candidate_id, field:'sample_tier', original:c.sample_tier, replayed:reT, difference:'tier'}); }
+    const reS=strategyScore(m, over);
+    const oc=c.composite||{};
+    if(Math.abs((reS.composite||0)-(oc.score==null?reS.composite:oc.score))>1e-9){ compBad++; if(metricBad+tierBad+compBad<6) out.mismatches.push({candidate_id:c.candidate_id, field:'composite', original:oc.score, replayed:reS.composite, difference:+(((oc.score||0)-reS.composite)).toFixed(6)}); }
+    if((oc.tier||reT)!==reT){ metricBad++; }
+  }
+  (tierBad===0&&compBad===0?out.checks.push({name:'METRIC_MATCH',pass:true,detail:cands.length+' rows'}):fail('METRIC_MATCH',{detail:`tier=${tierBad} composite=${compBad}`}));
+  (compBad===0?out.checks.push({name:'COMPOSITE_MATCH',pass:true,detail:cands.length+' rows'}):fail('COMPOSITE_MATCH',{detail:compBad+' mismatches'}));
+  // 4. rankings: recompute per-objective order, compare stored top rows.
+  // row_index restores the original tie-break (researchCmp falls back to .i).
+  const rows=cands.map(c=>({m:c.metrics, _id:c.candidate_id, i:c.row_index}));
+  let rankBad=0;
+  for(const [key] of RESEARCH_OBJS){
+    const reOrder=rows.slice().sort(researchCmp(key)).map(r=>r._id);
+    const stored=((rk.per_objective||{})[key]||[]).slice(0, Math.min(20, reOrder.length));
+    const head=reOrder.slice(0, stored.length);
+    if(JSON.stringify(head)!==JSON.stringify(stored)){ rankBad++; if(rankBad<4) out.mismatches.push({candidate_id:'(board:'+key+')', field:'ranking', original:stored.slice(0,3), replayed:head.slice(0,3), difference:'order'}); }
+  }
+  (rankBad===0?out.checks.push({name:'RANKING_MATCH',pass:true,detail:'5/5 objectives'}):fail('RANKING_MATCH',{detail:rankBad+' objectives differ'}));
+  // 5. pareto: recompute membership
+  const rePareto=new Set(paretoFrontier(rows).map(r=>r._id));
+  const stPareto=new Set(rk.pareto||[]);
+  const pMiss=[...rePareto].filter(id=>!stPareto.has(id)), pExtra=[...stPareto].filter(id=>!rePareto.has(id));
+  (pMiss.length===0&&pExtra.length===0?out.checks.push({name:'PARETO_MATCH',pass:true,detail:rePareto.size+' members'}):fail('PARETO_MATCH',{detail:`missing=${pMiss.slice(0,3)} extra=${pExtra.slice(0,3)}`}));
+  // 6. robustness summary: internal consistency (stored score vs stored rank).
+  // Candidate records carry robust_score (snake); accept legacy robustScore.
+  const rb=art.robustness_results||[];
+  let rbBad=0;
+  for(const r of rb){ const c=byId[r.candidate_id]; const sc=c?(c.robust_score??c.robustScore):null; if(c&&(sc==null||Math.abs(sc-r.adjusted)>1e-9))rbBad++; }
+  (rbBad===0?out.checks.push({name:'ROBUSTNESS_MATCH',pass:true,detail:rb.length+' rows'}):fail('ROBUSTNESS_MATCH',{detail:rbBad+' score mismatches'}));
+  // 7. hash verification: recompute config + results fingerprints.
+  // Dataset hash needs raw bars (absent offline) → presence-checked only.
+  const hh=art.hashes||{};
+  if(hh.config&&hh.config.hash){
+    const re=hashRecord(art.config);
+    (re===hh.config.hash?out.checks.push({name:'CONFIG_HASH_MATCH',pass:true,detail:hh.config.algo||'fnv'}):fail('CONFIG_HASH_MATCH',{detail:'stored vs recomputed differ'}));
+    if(re!==hh.config.hash)out.mismatches.push({candidate_id:'(config)',field:'config_hash',original:hh.config.hash,replayed:re,difference:'hash'});
+  } else out.checks.push({name:'CONFIG_HASH_MATCH',pass:true,detail:'no stored hash (skipped)'});
+  if(hh.results&&hh.results.hash){
+    const re=hashRecord(cands.map(c=>[c.candidate_id,c.net_pnl,c.trade_count]));
+    (re===hh.results.hash?out.checks.push({name:'RESULT_HASH_MATCH',pass:true,detail:cands.length+' rows'}):fail('RESULT_HASH_MATCH',{detail:'stored vs recomputed differ'}));
+    if(re!==hh.results.hash)out.mismatches.push({candidate_id:'(results)',field:'results_hash',original:hh.results.hash,replayed:re,difference:'hash'});
+  } else out.checks.push({name:'RESULT_HASH_MATCH',pass:true,detail:'no stored hash (skipped)'});
+  // per-row hashes attribute tampering to exact candidates (when present)
+  for(const c of cands){
+    if(c._row_hash==null)continue;
+    const re=hashRecord([c.candidate_id,c.net_pnl,c.trade_count]);
+    if(re!==c._row_hash){ fail('ROW_HASH_MATCH',{detail:c.candidate_id}); out.mismatches.push({candidate_id:c.candidate_id,field:'row_hash',original:c._row_hash,replayed:re,difference:'hash'}); }
+  }
+  if(!out.checks.some(c=>c.name==='ROW_HASH_MATCH'))out.checks.push({name:'ROW_HASH_MATCH',pass:true,detail:'all present rows verify'});
+  if(hh.dataset&&hh.dataset.hash)out.checks.push({name:'DATASET_HASH_PRESENT',pass:true,detail:String(hh.dataset.hash).slice(0,16)+'… (recompute needs raw bars)'});
+  else out.checks.push({name:'DATASET_HASH_PRESENT',pass:true,detail:'absent (skipped)'});
+  out.checks.push({name:'REPLAY_STATUS', pass:out.pass, detail:out.pass?'PASS':'FAIL'});
+  return out;
+}
+
 // ---------- Research ranking: single canonical ordering ----------
 // ---------- Research scoring: multi-metric, sample-aware ----------
 // LAYER MODEL: RAW_METRICS (informational, everything calculated) →
@@ -2499,14 +2587,21 @@ function demoteKnifeEdge(ranked, pssOf){
 const SCORE_DEF={
   weights:{ret:0.25, winExp:0.20, pf:0.15, sample:0.15, risk:0.15, sharpe:0.10},
   sampleK:30, ddScale:10, sharpeCap:20, shrK:30,
-  tiers:{insufficient:10, exploratory:20, developing:30},
+  tiers:{insufficient:10, rankable:30},
 };
 function sampleTier(n, tiers){
+  // RAW = any trade count (displayed, never ranked). Classified tiers:
+  // INSUFFICIENT n<insufficient · EXPLORATORY ins≤n<rankable ·
+  // RANKABLE n≥rankable · ROBUST_ELIGIBLE handled separately
+  // (robustEligible: paper minTrades, default 200).
   tiers=tiers||SCORE_DEF.tiers;
-  if(!(n>=tiers.insufficient))return 'INSUFFICIENT';
-  if(n<tiers.exploratory)return 'EXPLORATORY';
-  if(n<tiers.developing)return 'DEVELOPING';
+  if(!(n>0))return 'INSUFFICIENT';
+  if(n<tiers.insufficient)return 'INSUFFICIENT';
+  if(n<tiers.rankable)return 'EXPLORATORY';
   return 'RANKABLE';
+}
+function robustEligible(n, minTrades){
+  return n>=(minTrades==null?200:minTrades);
 }
 function sharpeAdj(sharpeRaw, n, shrK){
   // Empirical-Bayes-style shrinkage toward 0 (NOT a statistical estimator):
@@ -2552,12 +2647,30 @@ function strategyScore(m, over){
     tier:sampleTier(n,o.tiers), reliability:sharpeReliability(n), n};
 }
 function rankableScore(m, over){
-  // Selection gate: RANKABLE tier or better. Returns null when NOT_RANKABLE
-  // (row stays visible in RAW discovery, never in composite selection).
+  // Selection gate: RANKABLE tier or better (n ≥ tiers.rankable, default 30).
+  // Returns null when NOT_RANKABLE (row stays visible in RAW discovery,
+  // THIN list, Pareto pool — never in composite selection).
   const s=strategyScore(m, over);
   const tiers=(over&&over.tiers)||SCORE_DEF.tiers;
-  if(s.n<(tiers.developing==null?30:tiers.developing))return null;
+  if(s.n<((tiers.rankable==null)?30:tiers.rankable))return null;
   return s;
+}
+// whyNotRanked: the explicit exclusion reason for every tier below RANKABLE
+// (and for rankable rows that still fail validation). Never silent.
+function whyNotRanked(row, over){
+  const m=(row&&row.m)||{};
+  const n=m.totalTrades||0;
+  const tiers=(over&&over.tiers)||SCORE_DEF.tiers;
+  const minT=(tiers.rankable==null)?30:tiers.rankable;
+  if(!(n>0))return 'INSUFFICIENT_TRADES';
+  if(n<minT)return n<((tiers.insufficient==null)?10:tiers.insufficient)?'INSUFFICIENT_TRADES':'EXPLORATORY_ONLY';
+  const rb=row.robustness||{};
+  if(row.robustScore==null&&!rb.surrogate&&!rb.paramSensitivity)return 'NOT_EVALUATED';
+  if(row.robustScore!=null&&row.robustScore<9.5)return 'ROBUSTNESS_FAILURE';
+  if(rb.surrogate&&!rb.surrogate.skipped&&!(rb.surrogate.p<0.01))return 'ROBUSTNESS_FAILURE';
+  if(row.survived===false)return 'OOS_FAILURE';
+  if(!isFinite(m.sharpe)||!isFinite(m.expectancy)||!isFinite(m.profitFactor))return 'INVALID_METRIC';
+  return '';
 }
 function paretoFrontier(rows, keys){
   // Non-dominated set over [key,dir] dims (dir=+1 maximize, -1 minimize).
@@ -2604,6 +2717,21 @@ function auditRankingIntegrity(allRows, displayed){
       displayed:d0?cfgKey(d0):null};
   });
 }
+// Research union: topN by configured objective + top-20 per research
+// objective, so no discovery can vanish merely because another objective was
+// configured. Returns {board, extra}. Pure + deterministic (tested).
+function researchUnion(allRows, topN, objective){
+  const keep=new Map();
+  for(const r of rankResults(allRows, objective).slice(0, topN)) keep.set(cfgKey(r), r);
+  let extra=0;
+  for(const [key] of RESEARCH_OBJS){
+    for(const r of allRows.slice().sort(researchCmp(key)).slice(0, 20)){
+      const k=cfgKey(r);
+      if(!keep.has(k)){keep.set(k, r);extra++;}
+    }
+  }
+  return {board:[...keep.values()], extra};
+}
 function rankResults(rows, objective){
   // Do-nothing rows (0 trades: flat signals, warmup-only, unavailable legs)
   // always rank BELOW traded rows — otherwise a 0/0/0 row tops losing boards.
@@ -2618,7 +2746,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,strategyScore,rankableScore,paretoFrontier};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

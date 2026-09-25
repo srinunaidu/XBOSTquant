@@ -7,6 +7,7 @@ import { fmtMoney, fmtParams } from './format';
 import { enabledSymbols, filterData, dataHealth } from './data';
 import Robust from './robustness';
 import { candidateId, formatCandidateHeader, formatCoreSignal, formatIsOos } from './report';
+import { BUILD_INFO } from './buildinfo';
 
 const IND_TIER: Record<string, string> = {};
 for (const m of IND_META) if (m.n && m.tier) IND_TIER[m.n] = m.tier;
@@ -544,10 +545,11 @@ export async function runGrid() {
   const famLine = Object.entries(famCount).map(([f, n]) => `${f}×${n}`).join(' ');
   const grandTotal = grid.length * symData.length;
   const mySeq = seq + 1; seq = mySeq;
+  const runId = 'R' + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, '') + '-' + Math.floor(Math.random() * 65536).toString(16).padStart(4, '0');
   // NOTE: never mutate a captured snapshot (st.* = …) — any set() in between
   // (e.g. logLine) replaces the state object and silently drops the write,
   // which used to wedge runs at "warming up" forever. Always use set().
-  useStore.getState().set({ runSeq: mySeq });
+  useStore.getState().set({ runSeq: mySeq, runId });
   st.set({ alert: null });
   const t0 = performance.now();
   let lastRender = 0;
@@ -579,6 +581,7 @@ export async function runGrid() {
   };
   let top: BoardRow[] = [], refineInfo = '', errSamples: any[] = [], runMode = 'worker', stopped = false;
   let refinedN = 0, passesN = 0;
+  const stageStats: any = { unionExtra: 0, demoted: 0 };
   let mlInfo: any[] = [], routeInfo: string[] = [], robustnessLogs: string[] = [];
   const allRows: BoardRow[] = [];
   useStore.getState().set({ _refineAt: null });
@@ -687,17 +690,9 @@ export async function runGrid() {
   // board, so no discovery (high-WR, high-P&L, …) can vanish merely because
   // another objective was configured. Raw ranks stamped BEFORE any demotion.
   try {
-    const keep = new Map<string, BoardRow>();
-    for (const r of top) keep.set(engine.cfgKey(r), r);
-    let extra = 0;
-    for (const [key] of (engine.RESEARCH_OBJS as [string, string][])) {
-      for (const r of [...allRows].sort(engine.researchCmp(key)).slice(0, 20)) {
-        const k = engine.cfgKey(r);
-        if (!keep.has(k)) { keep.set(k, r); extra++; }
-      }
-    }
-    top = [...keep.values()];
-    if (extra) logLine(`research union: +${extra} rows retained (top-20 per objective beyond top-${topN})`);
+    const u = engine.researchUnion(allRows, topN, objective);
+    top = u.board;
+    if (u.extra) logLine(`research union: +${u.extra} rows retained (top-20 per objective beyond top-${topN})`);
   } catch (e: any) { logLine('research union skipped: ' + (e?.message || e)); }
   try {
     const fullRank = engine.rankResults(allRows, objective);
@@ -723,7 +718,7 @@ export async function runGrid() {
     const sst = useStore.getState();
     const cfg: any = {
       weights: sst.scoreW,
-      tiers: { insufficient: sst.sampleT.ins, exploratory: sst.sampleT.exp, developing: sst.sampleT.dev },
+      tiers: { insufficient: sst.sampleT.ins, rankable: sst.sampleT.rank },
     };
     for (const r of top) {
       try { r.compositeScore = engine.strategyScore(r.m, cfg); }
@@ -761,6 +756,7 @@ export async function runGrid() {
     const head = top.slice(0, 25);
     const demoted = engine.demoteKnifeEdge(head, pssOf);
     const nEdge = head.filter(r => { const p = pssOf(r); return p != null && isFinite(p) && p >= 0.5; }).length;
+    stageStats.demoted = nEdge;
     if (nEdge) logLine(`[KNIFE-EDGE] demoted=${nEdge}/25 knife-edge rows below clean rows (PSS≥0.5)`);
     top = demoted.concat(top.slice(25));
   } catch (e: any) { logLine('knife-edge pass skipped: ' + (e?.message || e)); }
@@ -831,7 +827,7 @@ export async function runGrid() {
         : `CONFIG_IDENTITY = PASS :: ${engine.cfgKey(champ).slice(0, 100)} (candidate=core=robustness=display)`);
     }
   } catch (e: any) { logLine('CONFIG_IDENTITY = SKIP (' + (e?.message || e) + ')'); }
-  useStore.getState().set({ board: top });
+  useStore.getState().set({ board: top, lastAllRows: allRows });
   const s3 = useStore.getState();
   if (s3.stoppedFlag) stopped = true;
   useStore.getState().set({ stoppedFlag: false });
@@ -952,6 +948,42 @@ export async function runGrid() {
       logLine(`MODE=${st.instrumentMode || 'futures'} DATASET=${syms.map(([s]) => s).join('+')} SESSIONS=${sessions.size} CONTRACTS=${dh.contracts || syms.length} EXPIRIES=${dh.expiries.length || 1} TIMEZONE=Asia/Kolkata(pinned) COST_MODE=${opts.costMode === 'signal' ? 'ZERO' : 'REAL(' + opts.cost + ')'}`);
       logLine(`CANDIDATES_GENERATED=${grid.length * symData.length} CANDIDATES_EVALUATED=${tested} CANDIDATES_DISPLAYED=${useStore.getState().board.length}`);
       logLine(`OPTIONS_RESEARCH_READY=${st.instrumentMode === 'options' ? 'YES' : 'N/A'} OPTIONS_VALIDATION_READY=NO GENERALIZATION=UNVERIFIED MULTI_EXPIRY=${dh.expiries.length > 1 ? 'AVAILABLE' : 'NOT_AVAILABLE'}`);
+      // ---- §18 human-readable final report (sections) ----
+      logLine('===== RUN IDENTITY =====');
+      logLine(`run_id=${useStore.getState().runId || 'unsaved'} engine=v${BUILD_INFO.version} commit=${BUILD_INFO.commit} built=${BUILD_INFO.builtAt} mode=${runMode} objective=${objective}`);
+      logLine('===== DATA HEALTH =====');
+      dh.verdicts.forEach((v: any) => logLine(`  ${v.ok ? 'PASS' : 'FAIL'} ${v.label} (${v.detail})`));
+      logLine('===== SEARCH CONFIG =====');
+      logLine(`  sampler=${st.gridMode}${st.gridMode === 'halton' ? `(${st.haltonN})` : ''} bayes=${st.bayesRefine} exits=[${dims.exits.join(',')}] sltp=${st.optRisk ? `${st.slMin}-${st.slMax}/${st.tpMin}-${st.tpMax}` : `${st.slFix}/${st.tpFix}`} cost=${opts.cost}(${opts.costMode}) sig=${opts.sigSource || 'prices'}`);
+      logLine('===== DISCOVERY SUMMARY =====');
+      {
+        const tiers: Record<string, number> = {};
+        for (const r of allRows) {
+          const t = engine.sampleTier(r.m?.totalTrades || 0, { insufficient: st.sampleT.ins, rankable: st.sampleT.rank });
+          tiers[t] = (tiers[t] || 0) + 1;
+        }
+        logLine(`  tiers: ${Object.entries(tiers).map(([t, n]) => `${t}=${n}`).join(' ')}`);
+      }
+      logLine('===== RAW OBJECTIVE LEADERS ===== (discovery views — not recommendations)');
+      logLine('===== EXPLORATORY LEADERS ===== (10–29 trades, visible, never validated)');
+      logLine('===== RANKABLE LEADERS ===== (n≥30 composite selection; NONE if absent)');
+      logLine('===== ROBUST LEADERS =====');
+      {
+        const rb = allRows.filter(r => (r as any).robustScore != null)
+          .sort((a, b) => (((b as any).robustScore || 0) - ((a as any).robustScore || 0))).slice(0, 3);
+        if (!rb.length) logLine('  BEST_ROBUST = NONE (no robustness evaluated)');
+        rb.forEach((r, i) => logLine(`  robust${i + 1}: [${r.symbol || '?'}] ${r.timeframe}m ${r.indicator} score=${((r as any).robustScore || 0).toFixed(2)} n=${r.m.totalTrades}`));
+      }
+      logLine('===== PARETO FRONTIER ===== (unranked — see PARETO CANDIDATES above)');
+      logLine('===== WALK-FORWARD SUMMARY ===== (see WF lines above)');
+      logLine('===== ROBUSTNESS SUMMARY ===== (see [FINAL]/classification lines above)');
+      logLine('===== SAMPLE-TIER SUMMARY ===== (see DISCOVERY SUMMARY tiers)');
+      logLine('===== RANKING DECISIONS ===== (composite selection over rankable rows; raw views preserved; demotion logged; RANKING_INTEGRITY above)');
+      logLine('===== WHY CANDIDATES WERE EXCLUDED ===== (see WHY_NOT_RANKED + THIN-SAMPLE + PAPER verdict lines)');
+      logLine('===== OFFLINE AUDIT ARTIFACTS ===== (use ⤓ Export audit JSON in the dev panel)');
+      logLine('===== HASHES ===== (dataset/config/results hashes inside the exported artifact)');
+      logLine('===== FINAL VERDICT =====');
+      logLine('  BEST AVAILABLE SAMPLE RESULT ≠ VALIDATED GENERAL STRATEGY. Research discovery only.');
     } catch (e: any) { logLine('research audit skipped: ' + (e?.message || e)); }
     logLine('===== END SUMMARY =====');
   } catch (e: any) { logLine('summary build failed: ' + (e?.message || e)); }
@@ -998,7 +1030,9 @@ export async function runGrid() {
 // Pure discovery + honest labels — never hides rows, never manufactures.
 export function logSelection(bd: BoardRow[]) {
   try {
-    const ranked = bd.filter(r => r.compositeScore && r.compositeScore.tier !== 'INSUFFICIENT')
+    // RANKABLE = tier RANKABLE only (n ≥ configured threshold). EXPLORATORY
+    // rows are NEVER promoted — they get their own BEST_EXPLORATORY line.
+    const ranked = bd.filter(r => r.compositeScore && r.compositeScore.tier === 'RANKABLE')
       .sort((a, b) => ((b.compositeScore || {}).composite || 0) - ((a.compositeScore || {}).composite || 0));
     const best = ranked[0] || null;
     if (best && best.compositeScore) {
@@ -1006,9 +1040,32 @@ export function logSelection(bd: BoardRow[]) {
       logLine(`BEST_RANKABLE_COMPOSITE: [${best.symbol || '?'}] ${best.timeframe}m ${best.indicator} ${fmtParams(best.params)} score=${c.composite} tier=${c.tier} n=${c.n} pnl=${Math.round(best.m.netPnL)} wr=${best.m.winRate.toFixed(1)}% exp=${best.m.expectancy.toFixed(2)} pf=${best.m.profitFactor.toFixed(2)} sharpe=${best.m.sharpe.toFixed(2)}(adj ${c.sharpeAdj}) dd=${best.m.maxDD.toFixed(2)}%`);
       const p = c.parts || {};
       logLine(`  RANKING_BREAKDOWN: return=${p.ret} winExp=${p.winExp} pf=${p.pf} sample=${p.sample} risk=${p.risk} sharpe=${p.sharpe} → COMPOSITE=${c.composite}`);
-      logLine(`  WHY_RANKED: largest composite among ${ranked.length} rankable rows (tier≥${useStore.getState().sampleT.dev}, reliability=${c.reliability})`);
+      logLine(`  WHY_RANKED: largest composite among ${ranked.length} rankable rows (n≥${useStore.getState().sampleT.rank}, reliability=${c.reliability})`);
     } else {
-      logLine('BEST_RANKABLE_COMPOSITE = NONE (no rankable rows — all INSUFFICIENT tier; see RAW discovery)');
+      logLine('BEST_RANKABLE_COMPOSITE = NONE (no RANKABLE rows — REASON=NO_CANDIDATE_MEETS_SAMPLE_THRESHOLD; see RAW discovery)');
+    }
+    // TOP_MEANINGFUL (n≥10: exploratory + rankable — surfaces FVG/Bollinger/
+    // VWAP-type rows with reasonable counts even when below rankable cutoff).
+    // BEST_ROBUST (top robustScore among robust-eligible rows).
+    try {
+      const meanRows = bd.filter(r => (r.m?.totalTrades || 0) >= 10 && r.compositeScore)
+        .sort((a, b) => ((b.compositeScore || {}).composite || 0) - ((a.compositeScore || {}).composite || 0));
+      const mb = meanRows[0] || null;
+      if (mb && mb.compositeScore) logLine(`TOP_MEANINGFUL_SAMPLE: [${mb.symbol || '?'}] ${mb.timeframe}m ${mb.indicator} score=${mb.compositeScore.composite} tier=${mb.compositeScore.tier} n=${mb.m.totalTrades} wr=${mb.m.winRate.toFixed(1)}% pnl=${Math.round(mb.m.netPnL)}`);
+      else logLine('TOP_MEANINGFUL_SAMPLE = NONE (n<10 everywhere)');
+      const rbRows = bd.filter(r => (r as any).robustScore != null)
+        .sort((a, b) => (((b as any).robustScore || 0) - ((a as any).robustScore || 0)));
+      const rbBest = rbRows[0] || null;
+      if (rbBest) logLine(`BEST_ROBUST: [${rbBest.symbol || '?'}] ${rbBest.timeframe}m ${rbBest.indicator} score=${(((rbBest as any).robustScore || 0)).toFixed(2)} n=${rbBest.m.totalTrades} classification=${((rbBest as any).robustness || {}).classification || '?'}`);
+      else logLine('BEST_ROBUST = NONE (no robustness evaluated)');
+    } catch (e: any) { logLine('meaningful/robust lines skipped: ' + (e?.message || e)); }
+    const expl = bd.filter(r => r.compositeScore && r.compositeScore.tier === 'EXPLORATORY')
+      .sort((a, b) => ((b.compositeScore || {}).composite || 0) - ((a.compositeScore || {}).composite || 0))[0] || null;
+    if (expl && expl.compositeScore) {
+      const c = expl.compositeScore;
+      logLine(`BEST_EXPLORATORY_COMPOSITE: [${expl.symbol || '?'}] ${expl.timeframe}m ${expl.indicator} ${fmtParams(expl.params)} score=${c.composite} n=${c.n} pnl=${Math.round(expl.m.netPnL)} wr=${expl.m.winRate.toFixed(1)}% (NOT rankable — exploratory only)`);
+    } else {
+      logLine('BEST_EXPLORATORY_COMPOSITE = NONE');
     }
     const thin = bd.filter(r => !r.compositeScore || r.compositeScore.tier === 'INSUFFICIENT').slice(0, 8);
     if (thin.length) {
@@ -1032,6 +1089,371 @@ export function logSelection(bd: BoardRow[]) {
       logLine(whyNot.length ? `WHY_NOT_RANKED: ${whyNot.join('; ')}` : 'WHY_NOT_RANKED: n/a (champion is rankable)');
     }
   } catch (e: any) { logLine('selection report skipped: ' + (e?.message || e)); }
+}
+
+// ---------- Offline audit artifact (§6–9, §15–17) ----------
+// One JSON artifact per run: manifest, config, data, candidates, ranking,
+// robustness, walk-forward, trades, stages, final report + hashes. The browser
+// cannot write directories, so the spec's logs/research_runs/<id>/ layout is
+// delivered as a single research_<run_id>.json download with identical
+// sections. Trade records attach at EXPORT time (top-50 rebuild); everything
+// else is stashed at run end. No silent deletion anywhere.
+async function sha256hex(s: string): Promise<{ algo: string; hash: string }> {
+  try {
+    const subtle = (globalThis.crypto || {}).subtle;
+    if (subtle) {
+      const d = await subtle.digest('SHA-256', new TextEncoder().encode(s));
+      return { algo: 'SHA-256', hash: [...new Uint8Array(d)].map(b => b.toString(16).padStart(2, '0')).join('') };
+    }
+  } catch { /* fall through to FNV */ }
+  return { algo: 'FNV-1a-32', hash: engine.hashRecord(s) };
+}
+
+function slimRobustness(rb: any): any {
+  // Full evidence dump minus unbounded arrays (neighborMetrics capped) —
+  // documented truncation, counts preserved.
+  if (!rb || typeof rb !== 'object') return rb;
+  const out: any = Array.isArray(rb) ? [] : {};
+  for (const k of Object.keys(rb)) {
+    const v = (rb as any)[k];
+    if (Array.isArray(v) && v.length > 50) out[k] = { truncated: true, kept: 50, total: v.length, sample: v.slice(0, 50) };
+    else if (v && typeof v === 'object' && !(v instanceof Float64Array) && !(v instanceof Int8Array)) out[k] = slimRobustness(v);
+    else if (v instanceof Float64Array || v instanceof Int8Array) out[k] = { typedArray: true, length: v.length };
+    else out[k] = v;
+  }
+  return out;
+}
+
+function candidateRecord(r: BoardRow, rank: number | null, totalCombos: number, runCtx: any): any {
+  const m: any = r.m || {};
+  // Sanitize non-finite metric values (±Infinity Sharpe) to ±1e9 BEFORE
+  // everything: JSON cannot represent Infinity (→null), which would break
+  // offline replay determinism. Documented, deterministic, applied once.
+  const clean: any = {};
+  for (const k of Object.keys(m)) {
+    const v = (m as any)[k];
+    clean[k] = (typeof v === 'number' && !isFinite(v)) ? (v > 0 ? 1e9 : -1e9) : v;
+  }
+  const n = clean.totalTrades || 0;
+  const wins = Math.round((clean.winRate || 0) * n / 100);
+  const comp = (r as any).compositeScore || engine.strategyScore(clean, runCtx.scoreCfg);
+  const gross = clean.grossPreCost ?? (clean.netPnL + (clean.totalCosts || 0));
+  return {
+    candidate_id: engine.cfgKey(r as any),
+    display_id: candidateId(r),
+    row_index: (r as any).i ?? null,
+    instrument: r.symbol || '', symbol: r.symbol || '',
+    expiry: runCtx.expiries[r.symbol || ''] || null,
+    timeframe: r.timeframe, indicator: r.indicator, indicator_parameters: r.params,
+    strategy_family: (((engine as any).FAMILY || {})[r.indicator] || '?'),
+    direction: runCtx.direction, entry_mode: runCtx.entry, fill_model: runCtx.fill,
+    regime: runCtx.regime, regime_parameters: runCtx.regimeParams,
+    exit_model: r.exit || 'fixed', SL: r.slPct, TP: r.tpPct, trail: r.trailPct, carry: !!r.carry,
+    cost_mode: runCtx.costMode, parameters_locked: true, reoptimized: !!r.refined ? 'hill-climb-refine' : false,
+    trade_count: n, wins, losses: n - wins, WR: clean.winRate, gross_pnl: gross, net_pnl: clean.netPnL,
+    expectancy: clean.expectancy, profit_factor: clean.profitFactor,
+    metrics: clean,
+    payoff_ratio: (clean.grossLoss > 0 && wins > 0 && (n - wins) > 0) ? +((clean.grossProfit / wins) / (clean.grossLoss / (n - wins))).toFixed(4) : null,
+    Sharpe: clean.sharpe, Sortino: clean.sortino, maxDD: clean.maxDD,
+    avgDD: null, largest_winner: null, largest_loser: null,
+    avg_MAE: null, median_MAE: null, avg_MFE: null, median_MFE: null, MFE_MAE_ratio: null,
+    extended_from: (r as any).robustness && (r as any).robustness.baseline ? 'robustness-baseline' : null,
+    sample_tier: comp.tier, rankable: comp.tier === 'RANKABLE',
+    composite_score: comp.composite, composite_parts: comp.parts,
+    sharpe_raw: comp.sharpeRaw, sharpe_adjusted: comp.sharpeAdj, sharpe_reliability: comp.reliability,
+    robust_score: (r as any).robustScore ?? null,
+    robust_classification: (r as any).robustness?.classification ?? null,
+    oos: { net: (r as any).oosNet ?? null, wr: (r as any).oosWR ?? null, n: (r as any).oosN ?? null, survived: (r as any).survived ?? null, folds: (r as any).oosFolds ?? null },
+    why_not_ranked: engine.whyNotRanked(r as any, { tiers: runCtx.tiers }),
+    rank, search_percentile: totalCombos && rank ? +((1 - rank / totalCombos) * 100).toFixed(2) : 0,
+  };
+}
+
+export function buildAuditArtifact(): any {
+  const st = useStore.getState();
+  const allRows: BoardRow[] = st.lastAllRows?.length ? st.lastAllRows : st.board;
+  const L = st.lastRun || {};
+  const scoreCfgW = {
+    weights: st.scoreW,
+    tiers: { insufficient: st.sampleT.ins, rankable: st.sampleT.rank },
+  };
+  // ---- data manifest ----
+  const ds = st.datasets;
+  const symbols = Object.keys(ds);
+  const perSymbol = symbols.map(k => {
+    const d = ds[k].raw;
+    const step = Math.max(1, Math.floor(d.t.length / 20000));
+    const days = new Set<string>();
+    for (let i = 0; i < d.t.length; i += step) days.add(engine.istDayKey(d.t[i]));
+    const c = (d as any).contract || {};
+    return {
+      symbol: k, label: ds[k].label, bars: d.t.length,
+      sessions: days.size,
+      first_timestamp: d.t.length ? new Date(d.t[0]).toISOString() : null,
+      last_timestamp: d.t.length ? new Date(d.t[d.t.length - 1]).toISOString() : null,
+      contract: c.strike != null ? c : null,
+      filtered_bars: 0, missing_sessions: 'not-tracked (parser drops bad rows silently — see caution)',
+      duplicate_bars: 'not-tracked', bad_bars: 'dropped-at-parse-uncounted',
+    };
+  });
+  const totalBars = perSymbol.reduce((a, s) => a + s.bars, 0);
+  const expiries = [...new Set(perSymbol.map(s => s.contract?.expiry).filter(Boolean))];
+  const datasetHash = engine.hashRecord(symbols.map(k => `${k}:${ds[k].raw.t.length}:${ds[k].raw.t[0] ?? 0}:${ds[k].raw.t[ds[k].raw.t.length - 1] ?? 0}`).join('|'));
+  const dataManifest = {
+    source_files: perSymbol.map(s => s.label), symbols,
+    contracts: perSymbol.filter(s => s.contract).length,
+    expiry_dates: expiries,
+    session_count: perSymbol.reduce((a, s) => a + s.sessions, 0),
+    bars_per_symbol: Object.fromEntries(perSymbol.map(s => [s.symbol, s.bars])),
+    total_bars: totalBars,
+    timeframe: '1m source (resampled per-TF at evaluation)',
+    timezone: 'Asia/Kolkata(pinned)',
+    per_symbol: perSymbol,
+    RAW_DATA_SESSIONS: perSymbol.reduce((a, s) => a + s.sessions, 0),
+    SELECTED_CONTRACT_SESSIONS: 'see per_symbol.sessions (enabled toggles not snapshotted — see limitation)',
+    ALIGNED_RESEARCH_SESSIONS: 'per-TF inner alignment in underlying-led mode; else native bars',
+    USABLE_TRADING_SESSIONS: 'in-session bars per exchange mask (see run log data-health)',
+    alignment_rules: 'option bars never filled; underlying legs last-known-causal; resample O/H/L/C/V aggregates only',
+    selected_contract_rules: 'largest-enabled default | ATM±N union | manual ticks (see session log)',
+    dataset_hash: datasetHash, dataset_hash_algo: 'FNV-1a-32 (structural: symbol+bars+endpoints)',
+  };
+  // ---- config ----
+  const tradeOptsNow: any = {};
+  try { Object.assign(tradeOptsNow, tradeOpts()); } catch { /* pre-run */ }
+  delete tradeOptsNow.sessionMask; delete tradeOptsNow.tradeMask;
+  const config = {
+    objective: st.objective, direction: tradeOptsNow.direction, entry_mode: tradeOptsNow.entry,
+    fill_model: tradeOptsNow.fill, session_filter: [tradeOptsNow.sessionStart, tradeOptsNow.sessionEnd],
+    regime: tradeOptsNow.regimeOn ? `${tradeOptsNow.regimeSource}/${tradeOptsNow.granularity}` : 'off',
+    confidence_gate: tradeOptsNow.confGate, walk_forward_config: { on: st.wfOn, split: st.wfSplit, purge: st.purgeBars, embargo: st.embargoBars },
+    sampler: st.gridMode, sampler_seed: st.gridMode === 'halton' ? 'none (deterministic Halton)' : 'n/a (cartesian)',
+    halton_N: st.haltonN, bayesian_enabled: st.bayesRefine, top_N: st.topN, candidate_cap: st.cap,
+    board_min_trades: st.minTradesBoard, cost_mode: st.costMode, cost_per_trade: tradeOptsNow.cost,
+    sl_values: st.optRisk ? [st.slMin, st.slMax, st.slStep] : [st.slFix],
+    tp_values: st.optRisk ? [st.tpMin, st.tpMax, st.tpStep] : [st.tpFix],
+    trail_values: st.trail, exit_models: st.exits, carry_models: st.sessMode,
+    indicator_set: Object.entries(st.inds).filter(([, v]: any) => v.on).map(([k]) => k),
+    strategy_families: 'single-indicator + PAIR stage-2 + presets (SqueezeBreak/VWAPRev/TrendRegime/TrendFollow/VWAPMR)',
+    scoreW: st.scoreW, sampleTiers: { insufficient: st.sampleT.ins, rankable: st.sampleT.rank }, paperThreshold: st.paperThreshold, paperMinTrades: st.paperMinTrades,
+    parameters_locked: true, reoptimized: 'hill-climb + Bayes are search-time (logged); robustness never re-optimizes',
+  };
+  const runCtx = {
+    direction: config.direction, entry: config.entry_mode, fill: config.fill_model,
+    regime: config.regime, regimeParams: { source: tradeOptsNow.regimeSource, granularity: tradeOptsNow.granularity },
+    costMode: config.cost_mode, scoreCfg: { weights: config.scoreW, tiers: { insufficient: st.sampleT.ins, rankable: st.sampleT.rank } },
+    expiries: Object.fromEntries(perSymbol.filter(s => s.contract).map(s => [s.symbol, s.contract.expiry])),
+    tiers: { insufficient: st.sampleT.ins, rankable: st.sampleT.rank },
+  };
+  // ---- run manifest ----
+  const manifest = {
+    run_id: st.runId || 'unsaved',
+    run_start: L.at || null, run_end: new Date().toISOString(),
+    duration_ms: L.secs != null ? Math.round(L.secs * 1000) : null,
+    engine_version: BUILD_INFO, git_commit: BUILD_INFO.commit, build_version: BUILD_INFO.version,
+    worker_or_main_thread: L.mode || null,
+    browser_runtime: typeof navigator !== 'undefined' ? navigator.userAgent.slice(0, 160) : 'node',
+    os_runtime: typeof navigator !== 'undefined' ? (navigator as any).platform || 'unknown' : 'node',
+    timezone: 'Asia/Kolkata(pinned)', exchange: tradeOptsNow.exchange, market_hours: [tradeOptsNow.sessionStart, tradeOptsNow.sessionEnd],
+    mode: 'research', instrument_mode: st.instrumentMode || 'futures',
+    objective: config.objective, direction: config.direction, entry_mode: config.entry_mode,
+    fill_model: config.fill_model, session_filter: config.session_filter, regime: config.regime,
+    confidence_gate: config.confidence_gate, walk_forward_config: config.walk_forward_config,
+    purge: st.purgeBars, embargo: st.embargoBars, sampler: config.sampler, sampler_seed: config.sampler_seed,
+    halton_N: config.halton_N, bayesian_enabled: config.bayesian_enabled, top_N: config.top_N,
+    candidate_cap: config.candidate_cap, board_min_trades: config.board_min_trades,
+    cost_mode: config.cost_mode, cost_per_trade: config.cost_per_trade,
+    sl_values: config.sl_values, tp_values: config.tp_values, trail_values: config.trail_values,
+    exit_models: config.exit_models, carry_models: config.carry_models,
+    indicator_set: config.indicator_set, strategy_families: config.strategy_families,
+    parameters_locked: true, reoptimized: config.reoptimized,
+  };
+  // ---- candidates (ALL evaluated rows) ----
+  const totalCombos = allRows.length;
+  const rankedAll = engine.rankResults(allRows, st.objective);
+  const rankOf = new Map<string, number>();
+  rankedAll.forEach((r, i) => { const k = engine.cfgKey(r as any); if (!rankOf.has(k)) rankOf.set(k, i + 1); });
+  const candidate_results = allRows.map(r => {
+    const rec = candidateRecord(r, rankOf.get(engine.cfgKey(r as any)) ?? null, totalCombos, runCtx);
+    rec._row_hash = engine.hashRecord([rec.candidate_id, rec.net_pnl, rec.trade_count]);
+    return rec;
+  });
+  // ---- ranking stages ----
+  const per_objective: Record<string, string[]> = {};
+  for (const [key] of (engine.RESEARCH_OBJS as [string, string][])) {
+    per_objective[key] = [...allRows].sort(engine.researchCmp(key)).slice(0, 20).map(r => engine.cfgKey(r as any));
+  }
+  const paretoIds = engine.paretoFrontier(allRows.filter(r => r.m && r.m.totalTrades > 0)).map(r => engine.cfgKey(r as any));
+  const ranking_results = {
+    input_count: allRows.length,
+    stages: [
+      { STAGE_NAME: 'DISCOVERY_GRID', INPUT_COUNT: totalCombos, OUTPUT_COUNT: totalCombos, SORT_RULE: 'none (evaluation order)', FILTER_RULE: 'none', FILTER_PARAMETERS: {}, NORMALIZATION_RULE: 'none', SEED: config.sampler_seed },
+      { STAGE_NAME: 'REFINE_HILLCLIMB_BAYES', INPUT_COUNT: totalCombos, OUTPUT_COUNT: (L.refined || 0), SORT_RULE: 'objective-improvement', FILTER_RULE: 'untested-neighbors-only', FILTER_PARAMETERS: {}, NORMALIZATION_RULE: 'none', SEED: 'deterministic Halton proposals' },
+      { STAGE_NAME: 'RESEARCH_UNION', INPUT_COUNT: allRows.length, OUTPUT_COUNT: st.board.length, SORT_RULE: 'configured-objective + top-20/objective union', FILTER_RULE: 'topN + research-union', FILTER_PARAMETERS: { topN: config.top_N }, NORMALIZATION_RULE: 'none', SEED: 'n/a' },
+      { STAGE_NAME: 'COMPOSITE_RANK', INPUT_COUNT: st.board.length, OUTPUT_COUNT: st.board.length, SORT_RULE: 'composite desc, rankable-first', FILTER_RULE: 'none (thin retained)', FILTER_PARAMETERS: { weights: config.scoreW, tiers: config.sampleTiers }, NORMALIZATION_RULE: 'absolute bounded transforms (see strategyScore)', SEED: 'n/a' },
+    ],
+    per_objective, pareto: paretoIds,
+    audit: [],
+    board_order: st.board.map(r => engine.cfgKey(r as any)),
+  };
+  // ---- robustness / walk-forward summaries ----
+  const robustRows = allRows.filter(r => (r as any).robustness);
+  const robustness_results = robustRows.map(r => {
+    const rb: any = (r as any).robustness;
+    return {
+      candidate_id: engine.cfgKey(r as any),
+      parameter_stability: rb.paramStability ? { neighbors: rb.paramStability.neighbors, density: rb.paramStability.density, medianSharpe: rb.paramStability.medianSharpe } : null,
+      exit_independence: rb.exitIndependence ? { variants: rb.exitIndependence.variants, profitable: rb.exitIndependence.profitable } : null,
+      signal_purity: rb.signalPurity ? { ratio: rb.signalPurity.ratio } : null,
+      regime_robustness: rb.regimeRobustness ? { profitableRegimes: rb.regimeRobustness.profitableRegimes } : null,
+      time_robustness: rb.timeRobustness ? { profitableWindows: rb.timeRobustness.profitableWindows } : null,
+      entry_perturbation: rb.entryPerturbation ? { profitable: rb.entryPerturbation.profitable } : null,
+      input_perturbation: rb.inputPerturbation ? { profitable: rb.inputPerturbation.profitable } : null,
+      'P&L_concentration': rb.concentration ? { top1: rb.concentration.top1Pct, top5: rb.concentration.top5Pct } : null,
+      best_trade_removal: rb.worstTradeRemoval ? { remove1: rb.worstTradeRemoval.remove1, remove10: rb.worstTradeRemoval.remove10 } : null,
+      parameter_sensitivity: rb.paramSensitivity ? { pss: rb.paramSensitivity.pss, knifeEdge: rb.paramSensitivity.knifeEdge, skipped: !!rb.paramSensitivity.skipped } : { STATUS: 'SKIPPED', REASON: 'not evaluated' },
+      bootstrap: rb.blockBootstrap ? (rb.blockBootstrap.nSamples ? { status: 'OK', method: rb.blockBootstrap.method, iterations: rb.blockBootstrap.iters, block: rb.blockBootstrap.block, seed: rb.blockBootstrap.seed, n: rb.blockBootstrap.n, sharpe_CI: rb.blockBootstrap.sharpe, WR_CI: rb.blockBootstrap.wr, PF_CI: rb.blockBootstrap.pf } : { status: 'SKIPPED', reason: rb.blockBootstrap.reason || 'INSUFFICIENT_SAMPLE', sharpe_CI: null, WR_CI: null, PF_CI: null }) : { STATUS: 'SKIPPED', REASON: 'not evaluated' },
+      surrogate: rb.surrogate ? { p: rb.surrogate.p, n: rb.surrogate.nSurr, skipped: !!rb.surrogate.skipped } : { STATUS: 'SKIPPED', REASON: 'not evaluated' },
+      PSS: rb.paramSensitivity ? rb.paramSensitivity.pss : null,
+      multiple_testing: rb.final ? { penalty: rb.final.penalty, cap: rb.final.cap } : null,
+      free_parameter_count: rb.freeParams ?? null,
+      final_raw_score: rb.final?.raw ?? null, final_adjusted_score: rb.final?.adjusted ?? null,
+      classification: rb.classification ?? null,
+      adjusted: (r as any).robustScore ?? null,
+    };
+  });
+  const wfRows = allRows.filter(r => (r as any).oosFolds || (r as any).oosN != null);
+  const walkforward_results = {
+    config: config.walk_forward_config,
+    TOTAL_WF_CANDIDATES: wfRows.length,
+    SURVIVED_WF: wfRows.filter(r => (r as any).survived).length,
+    FAILED_WF: wfRows.filter(r => (r as any).survived === false).length,
+    SKIPPED_WF: wfRows.filter(r => (r as any).survived == null).length,
+    rows: wfRows.slice(0, 200).map(r => ({
+      candidate_id: engine.cfgKey(r as any),
+      train_period: 'IS slice (see data_manifest span + wf split)',
+      test_period: 'OOS tail (see data_manifest span + wf split)',
+      folds: (((r as any).oosFolds || []) as any[]).map((f: any, i: number) => ({
+        fold_id: i, test_n: f.n, test_pnl: +f.net.toFixed(2), test_WR: +f.wr.toFixed(2), test_sharpe: f.sharpe == null ? null : +f.sharpe.toFixed(2),
+        skipped: !!f.skipped, survived: !f.skipped && f.net > 0,
+        failure_reason: f.skipped ? 'THIN_FOLD' : (f.net > 0 ? '' : 'NEGATIVE_FOLD_PNL'),
+      })),
+      train_n: r.m.totalTrades, test_n: (r as any).oosN ?? null,
+      train_pnl: +r.m.netPnL.toFixed(2), test_pnl: (r as any).oosNet ?? null,
+      train_WR: +r.m.winRate.toFixed(2), test_WR: (r as any).oosWR ?? null,
+      train_expectancy: +r.m.expectancy.toFixed(4), test_expectancy: null,
+      train_PF: +r.m.profitFactor.toFixed(2), test_PF: null,
+      train_Sharpe: +r.m.sharpe.toFixed(2), test_Sharpe: null,
+      survived: !!(r as any).survived,
+      failure_reason: (r as any).survived ? '' : ((r as any).survived === false ? 'OOS_FOLDS_NEGATIVE' : 'NO_FOLD_VERDICT'),
+    })),
+  };
+  // ---- final report (§18 sections as data) ----
+  const byComp = (rows: any[]) => rows.map(rr => ({ r: rr, s: engine.strategyScore(rr.m, { weights: config.scoreW, tiers: { insufficient: st.sampleT.ins, rankable: st.sampleT.rank } }) })).sort((a, b) => b.s.composite - a.s.composite)[0] || null;
+  const rkBest = byComp(allRows.filter(rr => engine.rankableScore(rr.m, { weights: config.scoreW, tiers: { insufficient: st.sampleT.ins, rankable: st.sampleT.rank } }) !== null));
+  const exBest = byComp(allRows.filter(rr => engine.sampleTier(rr.m?.totalTrades || 0, { insufficient: st.sampleT.ins, rankable: st.sampleT.rank }) === 'EXPLORATORY'));
+  const rbBest = robustRows.slice().sort((a, b) => (((b as any).robustScore || 0) - ((a as any).robustScore || 0)))[0] || null;
+  const tierCounts: Record<string, number> = {};
+  for (const rr of allRows) { const t = engine.sampleTier(rr.m?.totalTrades || 0, { insufficient: st.sampleT.ins, rankable: st.sampleT.rank }); tierCounts[t] = (tierCounts[t] || 0) + 1; }
+  const bestBy: Record<string, string | null> = {};
+  for (const [key] of (engine.RESEARCH_OBJS as [string, string][])) {
+    const br = [...allRows].sort(engine.researchCmp(key))[0];
+    bestBy[key] = br ? engine.cfgKey(br as any) : null;
+  }
+  const final_report = {
+    RAW_DISCOVERY: { count: allRows.length },
+    BEST_RAW: bestBy,
+    BEST_EXPLORATORY: exBest ? engine.cfgKey(exBest.r as any) : 'NONE',
+    BEST_RANKABLE: rkBest ? engine.cfgKey(rkBest.r as any) : 'NONE',
+    BEST_ROBUST: rbBest ? engine.cfgKey(rbBest as any) : 'NONE',
+    PARETO_COUNT: paretoIds.length,
+    WF: { survived: walkforward_results.SURVIVED_WF, failed: walkforward_results.FAILED_WF, skipped: walkforward_results.SKIPPED_WF },
+    SAMPLE_TIERS: tierCounts,
+    RANKING_DECISIONS: 'composite selection over rankable rows; raw views preserved; demotion logged',
+    EXCLUSIONS: 'see candidate why_not_ranked fields',
+    VERDICT: useStore.getState().lastPaper,
+  };
+  const art: any = {
+    format: 'xbost-research-audit/1',
+    run_manifest: manifest, config, data_manifest: dataManifest,
+    candidate_results, ranking_results, robustness_results, walkforward_results,
+    trade_records: [], trade_records_note: withTradesNote(),
+    stage_summary: ranking_results.stages, final_report,
+    hashes: {
+      dataset: { algo: 'FNV-1a-32', hash: dataManifest.dataset_hash },
+      config: { algo: 'FNV-1a-32', hash: engine.hashRecord(config) },
+      results: { algo: 'FNV-1a-32', hash: engine.hashRecord(candidate_results.map(c => [c.candidate_id, c.net_pnl, c.trade_count])) },
+      engine: { version: BUILD_INFO.version, commit: BUILD_INFO.commit, builtAt: BUILD_INFO.builtAt, note: 'version stamp (source hash unavailable in browser)' },
+      artifact: null as any,
+    },
+  };
+  useStore.getState().set({ lastAudit: art });
+  logLine(`audit artifact staged (${allRows.length} candidates, ${dataManifest.total_bars} bars) — use ⤓ Export audit JSON to download with trade records + hashes`);
+  return art;
+}
+function withTradesNote() {
+  return 'trade_records attach at EXPORT (top-50 board rows rebuilt). Timestamp convention: entry/exit timestamps are FILL bars (signal-bar close when fill=close, next-bar open when fill=next); lat flag marks next-bar latency. Regime per trade: null (per-strategy CSV export carries regime columns).';
+}
+
+export async function downloadAuditArtifact() {
+  const st = useStore.getState();
+  if (!st.lastAllRows?.length && !st.board.length) { st.set({ alert: 'Nothing to export — run a grid search first.' }); return; }
+  logLine('audit export: rebuilding top-50 trade records…');
+  const art = buildAuditArtifact();
+  try {
+    const rows = (st.board || []).slice(0, 50);
+    for (const r of rows) {
+      try {
+        const det = detailFor(r);
+        if (!det) continue;
+        for (const t of det.bt.trades) {
+          const ip = engine.istParts(t.entryTime);
+          art.trade_records.push({
+            candidate_id: engine.cfgKey(r as any),
+            trade_id: t.id, symbol: r.symbol || '',
+            timestamp_signal: new Date(t.entryTime).toISOString(), timestamp_entry: new Date(t.entryTime).toISOString(), timestamp_exit: new Date(t.exitTime).toISOString(),
+            direction: t.type, entry_price: t.entryPx, exit_price: t.exitPx,
+            SL: r.slPct, TP: r.tpPct, exit_reason: t.reason,
+            gross_pnl: +(t.pnl + (st.costMode === 'signal' ? 0 : st.cost)).toFixed(2), net_pnl: +t.pnl.toFixed(2),
+            MAE: (t as any).mae ?? null, MFE: (t as any).mfe ?? null,
+            holding_bars: t.exitIdx - t.entryIdx,
+            session_date: `${ip.y}-${ip.mo}-${ip.day}`, time_bucket: `${String(ip.h).padStart(2, '0')}:${String(ip.m).padStart(2, '0')}`,
+            regime: null, regime_note: 'see per-strategy trades CSV export for regime columns',
+          });
+        }
+      } catch { /* per-row best effort */ }
+      await new Promise(rr => setTimeout(rr, 0));
+    }
+  } catch (e: any) { logLine('trade rebuild partial: ' + (e?.message || e)); }
+  art.trade_records_note = withTradesNote() + ` rebuilt=${art.trade_records.length} trades from top-${Math.min(50, (st.board || []).length)} rows.`;
+  const body = JSON.stringify(art);
+  const sha = await sha256hex(body);
+  art.hashes.artifact = sha;
+  const final = JSON.stringify(art);
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([final], { type: 'application/json' }));
+  a.download = `research_${st.runId || 'run'}.json`;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  logLine(`audit artifact downloaded: research_${st.runId || 'run'}.json (${(final.length / 1024).toFixed(0)}KB, ${art.trade_records.length} trades, sha256=${sha.hash.slice(0, 16)}…)`);
+  useStore.getState().set({ lastAudit: art });
+}
+
+export async function replayArtifactFile(f: File, onProgress?: (p: number) => void): Promise<void> {
+  const text = await f.text();
+  if (onProgress) onProgress(30);
+  let art: any;
+  try { art = JSON.parse(text); } catch { throw new Error('not valid JSON'); }
+  if (!art || !art.candidate_results) throw new Error('not an XBOST audit artifact (missing candidate_results)');
+  if (onProgress) onProgress(60);
+  const rep = engine.replayAudit(art);
+  if (onProgress) onProgress(100);
+  const out = [
+    `REPLAY ${art.run_manifest?.run_id || '?'}: ${rep.pass ? 'REPLAY_STATUS=PASS' : 'REPLAY_STATUS=FAIL'}`,
+    ...rep.checks.map((c: any) => `  ${c.name}=${c.pass ? 'PASS' : 'FAIL'}${c.detail ? ` (${c.detail})` : ''}`),
+    ...rep.mismatches.slice(0, 10).map((m: any) => `  MISMATCH ${m.candidate_id} ${m.field}: ${JSON.stringify(m.original)} vs ${JSON.stringify(m.replayed)}`),
+  ];
+  useStore.getState().set({ validation: out, valOk: rep.pass });
+  out.forEach(l => logLine('[replay] ' + l));
 }
 
 // Hard adaptive gate: raw Sharpe is necessary but never sufficient. With

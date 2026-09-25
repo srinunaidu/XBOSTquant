@@ -383,7 +383,10 @@ function blockBootstrapCI(trades, block, iters, seed){
   block=Math.max(1,Math.round(block||20)); iters=Math.max(50,Math.round(iters||1000));
   const pnls=(trades||[]).map(t=>t.pnl);
   const n=pnls.length;
-  if(n<10) return {sharpe:[0,0], wr:[0,0], pf:[0,0], netPnL:[0,0], nSamples:0, note:'insufficient trades'};
+  // Skipped calculations are null with status/reason — NEVER a fake [0,0]
+  // zero-width interval (§12/§14).
+  if(n<10) return {status:'SKIPPED', reason:'INSUFFICIENT_SAMPLE', method:'block', block, iters:0, seed:seed==null?1234:seed, n,
+    sharpe:null, wr:null, pf:null, netPnL:null, nSamples:0};
   const rnd=_rng(seed==null?1234:seed);
   const S={sharpe:[],wr:[],pf:[],netPnL:[]};
   const nBlocks=Math.ceil(n/block);
@@ -401,7 +404,8 @@ function blockBootstrapCI(trades, block, iters, seed){
     S.netPnL.push(s.reduce((a,x)=>a+x,0)*n/s.length);
   }
   const q=(a,p)=>percentile(a,p);
-  return {sharpe:[+q(S.sharpe,0.025).toFixed(3),+q(S.sharpe,0.975).toFixed(3)],
+  return {status:'OK', method:'block', block, iters, seed:seed==null?1234:seed, n,
+    sharpe:[+q(S.sharpe,0.025).toFixed(3),+q(S.sharpe,0.975).toFixed(3)],
     wr:[+q(S.wr,0.025).toFixed(2),+q(S.wr,0.975).toFixed(2)],
     pf:[+q(S.pf,0.025).toFixed(3),+q(S.pf,0.975).toFixed(3)],
     netPnL:[+q(S.netPnL,0.025).toFixed(0),+q(S.netPnL,0.975).toFixed(0)],

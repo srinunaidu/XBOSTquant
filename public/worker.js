@@ -295,8 +295,8 @@ async function runGridSearch(msg) {
         if (wt) robustnessLogs.push(`[BEST TRADE REMOVAL] remove1_sharpe=${wt.remove1.sharpe.toFixed(2)} remove3=${wt.remove3.sharpe.toFixed(2)} remove5=${wt.remove5.sharpe.toFixed(2)} remove10=${wt.remove10.sharpe.toFixed(2)}`);
         if (r.paramSensitivity) robustnessLogs.push(`[PARAM SENSITIVITY] ${r.paramSensitivity.skipped ? `SKIPPED (n=${r.paramSensitivity.baseTrades}<30)` : `pss=${r.paramSensitivity.pss} knife_edge=${r.paramSensitivity.knifeEdge ? 'YES' : 'no'} base_sharpe=${r.paramSensitivity.baseSharpe}`}`);
         if (r.blockBootstrap) {
-          if (r.blockBootstrap.nSamples) robustnessLogs.push(`[BLOCK BOOTSTRAP] sharpe_CI=[${r.blockBootstrap.sharpe}] wr_CI=[${r.blockBootstrap.wr}] pf_CI=[${r.blockBootstrap.pf}] n=${r.blockBootstrap.nSamples}`);
-          else robustnessLogs.push(`[BLOCK BOOTSTRAP] BOOTSTRAP_STATUS=SKIPPED BOOTSTRAP_REASON=INSUFFICIENT_SAMPLE (never a [0,0] interval)`);
+          if (r.blockBootstrap.status === 'OK' && r.blockBootstrap.nSamples) robustnessLogs.push(`[BLOCK BOOTSTRAP] status=OK method=block iters=${r.blockBootstrap.iters} block=${r.blockBootstrap.block} seed=${r.blockBootstrap.seed} n=${r.blockBootstrap.n} sharpe_CI=[${r.blockBootstrap.sharpe}] wr_CI=[${r.blockBootstrap.wr}] pf_CI=[${r.blockBootstrap.pf}]`);
+          else robustnessLogs.push(`[BLOCK BOOTSTRAP] BOOTSTRAP_STATUS=SKIPPED BOOTSTRAP_REASON=${(r.blockBootstrap && r.blockBootstrap.reason) || 'INSUFFICIENT_SAMPLE'} (never a [0,0] interval)`);
         }
         if (r.surrogate) robustnessLogs.push(`[SURROGATE] ${r.surrogate.skipped ? 'SKIPPED (<20 trades)' : `p=${r.surrogate.p} observed_sharpe=${r.surrogate.observedSharpe} n=${r.surrogate.nSurr}`} (edge real iff p<0.01)`);
         if (r.freeParams != null) robustnessLogs.push(`[PARAM COUNT] free_params=${r.freeParams} (cap 8)`);

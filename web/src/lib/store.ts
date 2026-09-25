@@ -81,6 +81,9 @@ type State = {
   bayesRefine: boolean;
   paperThreshold: number;
   lastPaper: { eligible: boolean; reasons: string[] } | null;
+  runId: string;
+  lastAudit: any | null;
+  lastAllRows: any[];
   exchange: string;
   ivMaxRank: number | null;
   excludeExpiry: boolean;
@@ -89,7 +92,7 @@ type State = {
   minTradesBoard: number;
   sigSource: string;
   scoreW: Record<string, number>;
-  sampleT: { ins: number; exp: number; dev: number };
+  sampleT: { ins: number; rank: number };
   paperMinTrades: number;
   detail: Detail;
   view: 'all' | 'best' | 'cmp' | 'res';
@@ -160,6 +163,9 @@ export const useStore = create<State>((set) => ({
   bayesRefine: true,
   paperThreshold: 9.5,
   lastPaper: null,
+  runId: '',
+  lastAudit: null,
+  lastAllRows: [],
   exchange: 'auto',
   ivMaxRank: null,
   excludeExpiry: false,
@@ -168,7 +174,7 @@ export const useStore = create<State>((set) => ({
   minTradesBoard: 0,
   sigSource: 'prices',
   scoreW: { ret: 0.25, winExp: 0.20, pf: 0.15, sample: 0.15, risk: 0.15, sharpe: 0.10 },
-  sampleT: { ins: 10, exp: 20, dev: 30 },
+  sampleT: { ins: 10, rank: 30 },
   paperMinTrades: 200,
   view: 'all',
   researchObj: 'netPnL',
