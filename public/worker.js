@@ -279,8 +279,9 @@ async function runGridSearch(msg) {
         } catch (e) { cand.robustError = String(e && e.message || e); cand.robustScore = Math.min(cand.robustScore || 0, 6.8); }
         // Stage heartbeat: robustness is the longest silent phase — post per
         // candidate so the UI (and the 90s watchdog) sees proof of life.
+        // Slimmed: full suites never cross the thread boundary (see slimRow).
         self.postMessage({ type: 'progress', stage: 'robust', done: i + 1, total: Math.min(ranked.length, 25),
-          top: ranked.slice(0, topN), errCount: errCount, heap: heapMB(),
+          top: ranked.slice(0, topN).map(slimRow), errCount: errCount, heap: heapMB(),
           current: { sym: msg.symbol, indicator: 'robustness', timeframe: cand.timeframe, params: { candidate: i + 1 }, slPct: 0, tpPct: 0, exit: 'fixed', carry: false } });
       }
       // build machine logs for #1 (§26)
@@ -314,6 +315,44 @@ async function runGridSearch(msg) {
       ranked = top25.concat(ranked.slice(25));
     }
   }
-  self.postMessage({ type:'done', done:total + refined, total: total + refined, top:ranked.slice(0, topN),
-    all:ranked.slice(0, topN), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo, route:routeNotices, robustnessLogs:robustnessLogs });
+  // Slim transfer: full robustness evidence stays in the worker; the main
+  // thread gets scores + scalar summaries per row. Structured-cloning 25 full
+  // suites (trade PnL arrays, neighbor tables, bootstrap samples) into a
+  // 500-row board OOMs the tab — full evidence is recomputed on demand for
+  // the selected row only (see runner pssOf / pair-robust paths).
+  function slimRobust(rb){
+    if(!rb||typeof rb!=='object')return rb;
+    const pk=(o,ks)=>{ if(!o||typeof o!=='object')return null; const s={}; for(const k of ks) if(o[k]!==undefined) s[k]=o[k]; return s; };
+    // Baseline scalars feed the CORE SIGNAL log lines (formatCoreSignal);
+    // the unbounded arrays (pnls, wins/losses, sortedDesc, maes/mfes) stay
+    // in the worker — the board metrics (r.m) already carry headline numbers.
+    const BASE_SCALARS=['avgWinner','avgLoser','medianWinner','medianLoser','medianPnL','expectancy','payoffRatio','profitFactor','mean','median','sd','skewness','kurtosis','p5','p25','p50','p75','p95','p1','p10','p90','p99','largestWinner','largestLoser','longestWinningStreak','longestLosingStreak','totalPnL','top1Pct','top5Pct','top10Pct','largestWinnerPct','top5Winners','top10Winners','avgMAE','avgMFE','medianMAE','medianMFE','winnerLossRatio','mfeMaeRatio'];
+    return {
+      baseline: rb.baseline?pk(rb.baseline,BASE_SCALARS):null,
+      paramStability: rb.paramStability?pk(rb.paramStability,['neighbors','profitable','density','medianSharpe','p5Sharpe','worstSharpe','bestSharpe','sdSharpe']):null,
+      exitIndependence: rb.exitIndependence?pk(rb.exitIndependence,['variants','profitable']):null,
+      signalPurity: rb.signalPurity?{ratio:rb.signalPurity.ratio}:null,
+      regimeRobustness: rb.regimeRobustness?pk(rb.regimeRobustness,['profitableRegimes']):null,
+      timeRobustness: rb.timeRobustness?pk(rb.timeRobustness,['profitableWindows']):null,
+      entryPerturbation: rb.entryPerturbation?pk(rb.entryPerturbation,['profitable']):null,
+      inputPerturbation: rb.inputPerturbation?pk(rb.inputPerturbation,['profitable']):null,
+      concentration: rb.concentration?pk(rb.concentration,['top1Pct','top5Pct']):null,
+      worstTradeRemoval: rb.worstTradeRemoval||null,
+      paramSensitivity: rb.paramSensitivity?pk(rb.paramSensitivity,['pss','knifeEdge','skipped','baseSharpe','baseTrades']):null,
+      blockBootstrap: rb.blockBootstrap||null,
+      surrogate: rb.surrogate?pk(rb.surrogate,['p','nSurr','observedSharpe','skipped']):null,
+      freeParams: rb.freeParams!=null?rb.freeParams:null,
+      final: rb.final?pk(rb.final,['raw','adjusted','penalty','cap']):null,
+      classification: rb.classification||null,
+    };
+  }
+  function slimRow(r){
+    if(!r||!r.robustness)return r;
+    const o=Object.assign({}, r);
+    o.robustness=slimRobust(r.robustness);
+    return o;
+  }
+  const slimTop=()=>ranked.slice(0, topN).map(slimRow);
+  self.postMessage({ type:'done', done:total + refined, total: total + refined, top:slimTop(),
+    all:slimTop(), errCount:errCount, errSamples:errSamples, refined:refined, passes:pass, ml:mlInfo, route:routeNotices, robustnessLogs:robustnessLogs });
 }

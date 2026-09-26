@@ -182,6 +182,15 @@ app.use((req, res, next) => {
   }
   return res.status(401).json({ error: 'unauthorized' });
 });
+// Worker assets: bounded client cache so each run doesn't revalidate
+// worker.js + engine.js + robustness.js (importScripts refetches them per
+// Worker construction). Filenames are unhashed, so the TTL is 1h — fresh
+// deploys converge without a hard refresh; index.html stays uncached.
+const ENGINE_ASSETS = new Set(['/worker.js', '/engine.js', '/robustness.js']);
+app.use((req, res, next) => {
+  if (ENGINE_ASSETS.has(req.path)) res.setHeader('Cache-Control', 'public, max-age=3600');
+  next();
+});
 app.use(express.static(PUBLIC_DIR, { index: 'index.html', dotfiles: 'ignore' }));
 
 if (require.main === module) {

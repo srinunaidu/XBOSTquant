@@ -215,21 +215,41 @@ function heapNote(): string {
   } catch { return ''; }
 }
 
+let logMirrorBuf: string[] = [];
+let logMirrorTimer: number | null = null;
+let logMirrorInit = false;
+
 export function logLine(s: string) {
   const st = useStore.getState();
   const ts = new Date().toLocaleTimeString('en-IN', { hour12: false });
   const log = [...st.log, `[${ts}] ${s}`];
   st.set({ log: log.length > 2000 ? log.slice(log.length - 2000) : log });
   // Crash-proof mirror: tab memory dies with Aw Snap, localStorage survives.
-  // Ring buffer (500 lines) so a post-crash reload can still show/download
-  // exactly where the run stopped.
+  // Throttled flush (≤1 write/2s): the old per-line JSON parse+stringify of a
+  // 500-line buffer was O(n²) main-thread jank during verbose runs — exactly
+  // when the thread is already saturated. Recovery lag is bounded at 2s.
   try {
-    const k = 'xbost_log_v1';
-    const prev = JSON.parse(localStorage.getItem(k) || '[]');
-    prev.push(`[${ts}] ${s}`);
-    while (prev.length > 500) prev.shift();
-    localStorage.setItem(k, JSON.stringify(prev));
+    if (!logMirrorInit) {
+      logMirrorInit = true;
+      try {
+        const prev = JSON.parse(localStorage.getItem('xbost_log_v1') || '[]');
+        if (Array.isArray(prev)) logMirrorBuf = prev.slice(-500);
+      } catch { /* start fresh */ }
+    }
+    logMirrorBuf.push(`[${ts}] ${s}`);
+    while (logMirrorBuf.length > 500) logMirrorBuf.shift();
+    if (logMirrorTimer == null) {
+      logMirrorTimer = window.setTimeout(() => {
+        logMirrorTimer = null;
+        try { localStorage.setItem('xbost_log_v1', JSON.stringify(logMirrorBuf)); } catch { /* storage blocked — session log still works */ }
+      }, 2000);
+    }
   } catch { /* storage blocked/private mode — session log still works */ }
+}
+
+function flushLogMirror() {
+  if (logMirrorTimer != null) { clearTimeout(logMirrorTimer); logMirrorTimer = null; }
+  try { localStorage.setItem('xbost_log_v1', JSON.stringify(logMirrorBuf)); } catch { /* noop */ }
 }
 
 export function recoveredLog(): string[] {
@@ -240,6 +260,7 @@ export function recoveredLog(): string[] {
 }
 
 export function clearRecoveredLog() {
+  logMirrorBuf = [];
   try { localStorage.removeItem('xbost_log_v1'); } catch { /* noop */ }
 }
 
@@ -260,8 +281,14 @@ function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, object
   onBatch: (done: number, total: number | string, top: BoardRow[], cur: any, stage: string, pass: number) => void,
   paramSteps: any, risk: any, undData?: OHLCV | null): Promise<{ top: BoardRow[]; refined: number; passes: number; errSamples: any[]; ml?: any[]; route?: string[]; robustnessLogs?: string[] }> {
   return new Promise((resolve, reject) => {
+    // Single shared worker, reused sequentially across symbols: each
+    // `new Worker()` re-fetches worker.js + engine.js + robustness.js
+    // (importScripts) and pays a fresh compile — per-symbol workers
+    // multiplied startup traffic and memory. Runs are sequential (the
+    // per-symbol loop awaits), so reassigning onmessage per call is safe.
+    // Terminated only on stop/timeout/heartbeat-loss/error (never on done).
     let w: Worker;
-    try { w = new Worker('/worker.js'); } catch (e) { return reject(e); }
+    try { w = worker || new Worker('/worker.js'); } catch (e) { return reject(e); }
     worker = w;
     const d = gData;
     const timer = window.setTimeout(() => { try { w.terminate(); } catch { /* noop */ } rejecter = null; reject(new Error('worker timeout')); }, 1000 * 60 * 30);
@@ -289,7 +316,8 @@ function runWithWorker(grid: any[], gData: OHLCV, sym: string, opts: any, object
         reject(new Error('worker: ' + (m.message || 'unknown error')));
       }
       else if (m.type === 'done') {
-        settle(); w.terminate(); worker = null; rejecter = null;
+        settle(); // keep the worker alive for the next symbol (see above)
+        rejecter = null;
         resolve({ top: m.top, refined: m.refined || 0, passes: m.passes || 0, errSamples: m.errSamples || [], ml: m.ml || [], route: m.route || [], robustnessLogs: m.robustnessLogs || [] });
       }
     };
@@ -622,11 +650,16 @@ export async function runGrid() {
     }
     const cur = current ? `${stage === 'refine' ? '🔁 refining best:' : '⚙ now running:'} ${current.sym ? `[${current.sym}] ` : ''}${current.indicator} ${current.timeframe}m · ${fmtParams(current.params)}${current.slPct != null ? ` · SL ${current.slPct}% TP ${current.tpPct}%` : ''}${current.exit ? ` · ${EXIT_LBL[current.exit] || current.exit}${current.carry ? '+carry' : ''}` : ''}` : '';
     setRun({ done: typeof done === 'number' ? done : 0, total, perSec, eta, current: cur, summary: `${done} / ${total}${stage === 'refine' ? ` · refine pass ${pass || ''}` : ''} (${pct}%) · ${perSec.toFixed(0)}/s${eta}` });
-    useStore.getState().set({ board: top });
+    // Board writes throttled to ~1/700ms: every progress batch carries a
+    // 500-row array and each set() re-renders the leaderboard — unthrottled
+    // this freezes the tab on big grids. Detail auto-select only on fire.
     const now = performance.now();
-    if (now - lastRender > 700 || done === total) { lastRender = now; useStore.getState().set({ boardTick: useStore.getState().boardTick + 1 }); }
-    const s2 = useStore.getState();
-    if (top.length && !s2.detail) selectRow(top[0], true);
+    if (now - lastRender > 700 || done === total) {
+      lastRender = now;
+      useStore.getState().set({ board: top, boardTick: useStore.getState().boardTick + 1 });
+      const s2 = useStore.getState();
+      if (top.length && !s2.detail) selectRow(top[0], true);
+    }
   };
   let top: BoardRow[] = [], refineInfo = '', errSamples: any[] = [], runMode = 'worker', stopped = false;
   let refinedN = 0, passesN = 0;
@@ -794,6 +827,7 @@ export async function runGrid() {
   // sinks below every clean row. Reuses worker robustness evidence when
   // present; otherwise probes PSS directly (session filter off — curvature
   // is a signal property, noted in the log).
+  await new Promise(rr => setTimeout(rr, 0)); // paint yield before the sync PSS probe block
   try {
     const pssCache = new Map<string, number | null>();
     const tfDataCache: Record<string, any> = {};
@@ -840,6 +874,7 @@ export async function runGrid() {
     };
     for (const pr of pairTops) {
       if (useStore.getState().runSeq !== mySeq) break;
+      await new Promise(rr => setTimeout(rr, 0)); // paint yield: full robustnessFor blocks the thread
       const symD = symData.find(([s]) => s === (pr.symbol || symData[0][0]));
       const src = symD ? symD[1] : symData[0][1];
       const dk = (pr.symbol || '') + '|' + pr.timeframe;
@@ -904,7 +939,9 @@ export async function runGrid() {
   const s3 = useStore.getState();
   if (s3.stoppedFlag) stopped = true;
   useStore.getState().set({ stoppedFlag: false });
-  worker = null;
+  // Keep the shared worker alive for the next run (stop/timeout paths
+  // terminate it explicitly). Nulling here would orphan it and force a
+  // cold restart + 3-asset refetch on every subsequent run.
   if (s3.runSeq !== mySeq && !stopped) {
     // Stale run superseded — never leave the switch stuck on "running".
     setRun({ running: false, summary: 'superseded by a newer run' });
@@ -931,6 +968,7 @@ export async function runGrid() {
       useStore.getState().set({ board: useStore.getState().board });
     }
     setRun({ running: false, refined: 0, passes: 0, summary: `done · ${tested} combos in ${secs.toFixed(1)}s${refineInfo}${errs ? ` · ⚠ ${errs} errored` : ''}${wfMsg ? ` · ${wfMsg}` : ''}` });
+    flushLogMirror(); // run tail must be in crash-recovery storage NOW, not ≤2s later
     logLine(`run done (${runMode}): ${tested} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${s3._refineAt ? ` + refine ${(secs - gridSecs).toFixed(1)}s` : ''}] ${(tested / Math.max(secs, 0.01)).toFixed(0)}/s objective=${objective} errors=${errs}${refineInfo}${wfMsg ? ' · ' + wfMsg : ''}${heapNote()}`);
     errSamples.forEach((e: any) => logLine(`  combo error: ${e}`));
   }
@@ -1058,7 +1096,19 @@ export async function runGrid() {
       logLine('===== FINAL VERDICT =====');
       logLine('  BEST AVAILABLE SAMPLE RESULT ≠ VALIDATED GENERAL STRATEGY. Research discovery only.');
     } catch (e: any) { logLine('research audit skipped: ' + (e?.message || e)); }
-    buildProfiles(bd, symData, opts, mySeq);
+    // Time-of-day profiles deferred past run completion: the top-60 ×
+    // train/OOS rebuild is the heaviest synchronous post-pass and doesn't
+    // affect the board, WF verdict, or PAPER gate — running it before
+    // `running:false` is what made finished runs feel dead. It lands in
+    // lastProfiles whenever it lands (audit export reads it lazily).
+    const profArgs: [BoardRow[], [string, OHLCV][], any, number] = [bd, symData, opts, mySeq];
+    setTimeout(() => {
+      try {
+        if (useStore.getState().runSeq !== mySeq) return;
+        buildProfiles(...profArgs);
+      } catch (e: any) { logLine('profiles deferred failed: ' + (e?.message || e)); }
+    }, 0);
+    logLine('profiles: deferred past run completion (board interactive first)');
     logLine('===== END SUMMARY =====');
   } catch (e: any) { logLine('summary build failed: ' + (e?.message || e)); }
   setRun({ current: '' });
@@ -1085,11 +1135,19 @@ export async function runGrid() {
       if (!hasB) next = 'B';
       else if (!hasC) next = 'C';
       if (next) {
-        logLine(`Adaptive: best Tier ${next === 'B' ? 'A' : 'A+B'} failed hard gate — auto-enabling Tier ${next} and re-running`);
-        const nxt: any = { ...cur };
-        for (const k of Object.keys(IND_TIER)) if (IND_TIER[k] === next) nxt[k] = { ...nxt[k], on: true };
-        useStore.getState().set({ inds: nxt });
-        setTimeout(() => runGrid(), 400);
+        // Gated escalation: an ungated auto-rerun chains full grid searches
+        // (Tier A→B→C) with no user consent — the page looks wedged/dead
+        // while 3× the work runs. Confirm; Cancel keeps the current board.
+        const ok = window.confirm(`Champion failed the hard gate — enable Tier ${next} indicators and re-run the full search? (Cancel keeps the current board)`);
+        if (!ok) {
+          logLine(`Adaptive: user declined Tier ${next} escalation — keeping current board`);
+        } else {
+          logLine(`Adaptive: best Tier ${next === 'B' ? 'A' : 'A+B'} failed hard gate — auto-enabling Tier ${next} and re-running`);
+          const nxt: any = { ...cur };
+          for (const k of Object.keys(IND_TIER)) if (IND_TIER[k] === next) nxt[k] = { ...nxt[k], on: true };
+          useStore.getState().set({ inds: nxt });
+          setTimeout(() => runGrid(), 400);
+        }
       } else {
         logLine(`Adaptive: all tiers exhausted — champion still fails hard gate (see PAPER verdict above)`);
       }
