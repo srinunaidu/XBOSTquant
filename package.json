@@ -1,6 +1,6 @@
 {
   "name": "xbost",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "XBOST institutional algo-backtesting terminal (Nifty/BankNifty) with login-gated access",
   "main": "server.js",
   "workspaces": [
