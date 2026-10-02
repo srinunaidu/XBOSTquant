@@ -8,7 +8,13 @@ import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const files = ['engine.js', 'worker.js', 'robustness.js'];
+const files = ['engine.js', 'worker.js', 'robustness.js', 'discovery-engine.js', 'discovery-worker.js'];
+// Research-tab runtime data: reference sample + precomputed bundle (canonical
+// copies live in repo-root public/; web/public copies are build artifacts).
+for (const f of ['sample-banknifty-options.csv', 'discovery-bundle.json']) {
+  try { copyFileSync(join(root, '..', 'public', f), join(root, 'public', f)); console.log(`synced public/${f}`); }
+  catch { /* optional */ }
+}
 mkdirSync(join(root, 'public'), { recursive: true });
 for (const f of files) {
   copyFileSync(join(root, '..', 'public', f), join(root, 'public', f));

@@ -246,15 +246,19 @@ def data_health(norm, meta, chain=None):
             missing += max(0, int(round((g.max() - g.min()).total_seconds() / 60)) + 1 - len(g))
     vol_cov = float((norm["volume"] > 0).mean()) if norm["volume"].notna().any() else 0.0
     # status is judged on the synchronized chain actually analyzed, not on the
-    # raw full-contract universe (illiquid contracts may legitimately be sparse)
+    # raw full-contract universe (illiquid contracts may legitimately be sparse).
+    # Sparse chains degrade to DATA_PARTIAL while usable synchronized snapshots
+    # exist; only abort when basically nothing is jointly analyzable.
     if chain:
         per = norm.assign(_c=norm["symbol"].astype(str)).groupby("timestamp")["_c"].apply(
             lambda s: sum(c in set(s.tolist()) for c in chain))
         comp = float((per == len(chain)).mean()) if len(per) else 0.0
+        usable = int((per >= 2).sum())
     else:
         comp = meta["completeness"]
+        usable = meta["synchronized_snapshots"]
     status = ("DATA_VALID" if comp >= 0.6 and vol_cov > 0.1 and meta["n_timestamps"] > 100
-              else "DATA_PARTIAL" if comp >= 0.3 else "DATA_INVALID")
+              else "DATA_PARTIAL" if usable >= 500 else "DATA_INVALID")
     return {
         "rows": int(len(norm)), "timestamps": meta["n_timestamps"],
         "unique_days": meta["n_days"], "date_start": meta["timestamp_range"][0],

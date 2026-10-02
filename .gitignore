@@ -8,4 +8,9 @@ public/HDFCBANK_minute.csv
 web/dist/
 web/public/engine.js
 web/public/worker.js
+web/public/robustness.js
+web/public/discovery-engine.js
+web/public/discovery-worker.js
+web/public/sample-banknifty-options.csv
+web/public/discovery-bundle.json
 Data test/

@@ -1,23 +1,20 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-// OPTION DISCOVERY tab — independent research console.
-// Reads ONLY the exported tab_bundle.json produced by xbost_option_discovery.
-// No imports from the futures/options strategy engine. No futures signals.
+// OPTION DISCOVERY tab — independent option-native research console.
+// Upload data (or use the shipped sample) → configure → run in a Web Worker
+// (public/discovery-engine.js, zero futures/strategy imports) → live log →
+// results → download log / candidates / bundle / report / config.
+// Nothing here reads futures signals, indicator results, or paper state.
 
-type Bundle = {
-  run_id: string; dataset_hash: string; configuration_hash: string;
-  settings: Record<string, any>;
-  status_bar: Record<string, string>;
-  data_health: Record<string, any>;
-  chain_metadata: Record<string, any>;
-  modules: Record<string, string>;
-  modules_unavailable: Record<string, string>;
-  counts: Record<string, number>;
-  filter_log: { filter: string; input_count: number; passed_count: number; rejected_count: number; rejection_reason: string }[];
-  candidates: Record<string, any>[];
-  leadlag: Record<string, any>[];
-  formulas: Record<string, string>;
-  sharpe_defs: Record<string, any>;
+type Cfg = {
+  focusStrikes: number; minEvents: number; trainFrac: number; valFrac: number;
+  seed: number; nPerms: number; sl: number; tp: number; hold: number;
+  rankingObjective: string;
+};
+
+const DEFAULT_CFG: Cfg = {
+  focusStrikes: 3, minEvents: 50, trainFrac: 0.5, valFrac: 0.2,
+  seed: 42, nPerms: 200, sl: 0.5, tp: 1.0, hold: 5, rankingObjective: 'composite',
 };
 
 const TABLE_COLS: { key: string; label: string; num: boolean }[] = [
@@ -38,20 +35,66 @@ const TABLE_COLS: { key: string; label: string; num: boolean }[] = [
 
 function fmt(v: any): string {
   if (v === null || v === undefined || v === 'NA') return 'NA';
-  if (typeof v === 'number') return Number.isInteger(v) ? String(v) : v.toFixed(3);
+  if (typeof v === 'number') {
+    if (isNaN(v)) return 'NA';
+    return Number.isInteger(v) ? String(v) : v.toFixed(3);
+  }
   const s = String(v);
-  return s.length > 42 ? s.slice(0, 42) + '…' : s;
+  return s.length > 44 ? s.slice(0, 44) + '…' : s;
 }
 
-function Spark({ data, stroke }: { data: number[]; stroke: string }) {
-  if (!data || data.length < 2) return <span className="text-zinc-600">NA</span>;
-  const mn = Math.min(...data), mx = Math.max(...data), rg = mx - mn || 1;
-  const pts = data.map((v, i) => `${(i / (data.length - 1)) * 120},${28 - ((v - mn) / rg) * 26}`).join(' ');
-  return <svg width="120" height="30" className="inline-block"><polyline points={pts} fill="none" stroke={stroke} strokeWidth="1.5" /></svg>;
+function dl(name: string, text: string, mime = 'text/plain') {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: mime }));
+  a.download = name;
+  a.click();
+  setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+}
+
+function toCSV(rows: Record<string, any>[]): string {
+  if (!rows.length) return '';
+  const keys = Object.keys(rows[0]).filter(k => !Array.isArray(rows[0][k]));
+  const esc = (v: any) => {
+    const s = v === null || v === undefined ? '' : String(v);
+    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  };
+  return keys.join(',') + '\n' + rows.map(r => keys.map(k => esc(r[k])).join(',')).join('\n');
+}
+
+function buildReport(res: any): string {
+  const L: string[] = [];
+  L.push('# OPTION DISCOVERY — run report (RESEARCH_PRICE_MODEL)');
+  L.push(`run: ${res.engineVersion} · wallMs=${res.wallMs}`);
+  L.push(`settings: ${JSON.stringify(res.settings)}`);
+  L.push('');
+  L.push('## STATUS BAR');
+  for (const [k, v] of Object.entries(res.statusBar || {})) L.push(`- ${k} = ${v}`);
+  L.push('');
+  L.push('## DATA HEALTH / CHAIN');
+  L.push(JSON.stringify({ health: res.dataHealth, chain: res.chainMetadata }, null, 1));
+  L.push('');
+  L.push('## FILTER PIPELINE');
+  for (const f of res.filterLog || []) L.push(`- ${f.filter}: in=${f.input_count} passed=${f.passed_count} rejected=${f.rejected_count} (${f.rejection_reason})`);
+  L.push('');
+  L.push('## CANDIDATES');
+  for (const c of res.candidates || []) {
+    L.push(`- ${c.candidate} [${c.discovery_family}] events=${c.events} clusters=${c.clusters} ` +
+      `FWDexp=${fmt(c.FWD_expectancy)} OOSexp=${fmt(c.FWD_OOS_expectancy)} BHp=${fmt(c.perm_p_adj)} status=${c.final_status} :: ${c.formula}`);
+  }
+  L.push('');
+  L.push('## PAPER ELIGIBILITY: FALSE (research-only until explicitly promoted)');
+  return L.join('\n');
 }
 
 export default function Discovery() {
-  const [bundle, setBundle] = useState<Bundle | null>(null);
+  const [cfg, setCfg] = useState<Cfg>(DEFAULT_CFG);
+  const [fileName, setFileName] = useState<string | null>(null);
+  const [csvText, setCsvText] = useState<string | null>(null);
+  const [running, setRunning] = useState(false);
+  const [prog, setProg] = useState(0);
+  const [stage, setStage] = useState('');
+  const [log, setLog] = useState<string[]>([]);
+  const [res, setRes] = useState<any | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [fam, setFam] = useState('ALL');
   const [status, setStatus] = useState('ALL');
@@ -61,176 +104,269 @@ export default function Discovery() {
   const [sortK, setSortK] = useState('rank_composite');
   const [sortD, setSortD] = useState<1 | -1>(-1);
   const [sel, setSel] = useState<Record<string, any> | null>(null);
+  const workerRef = useRef<Worker | null>(null);
+  const logRef = useRef<HTMLDivElement>(null);
 
+  useEffect(() => () => { workerRef.current?.terminate(); }, []);
   useEffect(() => {
-    fetch('./discovery-bundle.json').then(r => {
-      if (!r.ok) throw new Error('no shipped bundle');
-      return r.json();
-    }).then(setBundle).catch(() => setErr('No discovery bundle shipped — upload a tab_bundle.json exported by the research engine.'));
-  }, []);
+    logRef.current?.scrollTo({ top: logRef.current.scrollHeight });
+  }, [log]);
 
-  const onFile = async (files: FileList | null) => {
+  const pushLog = (line: string) => setLog(prev => [...prev.slice(-2000), line]);
+
+  const onUpload = async (files: FileList | null) => {
     if (!files || !files.length) return;
-    try { setBundle(JSON.parse(await files[0].text())); setErr(null); }
-    catch (e: any) { setErr(`Could not parse bundle: ${e?.message || e}`); }
+    const f = files[0];
+    setFileName(f.name);
+    setCsvText(await f.text());
+    setRes(null);
+    pushLog(`source: uploaded ${f.name}`);
   };
 
-  const fams = useMemo(() => ['ALL', ...Array.from(new Set((bundle?.candidates || []).map(c => String(c.discovery_family))))], [bundle]);
-  const statuses = useMemo(() => ['ALL', ...Array.from(new Set((bundle?.candidates || []).map(c => String(c.final_status))))], [bundle]);
+  const loadSample = async () => {
+    pushLog('source: fetching shipped sample-banknifty-options.csv (2 sessions, reference sample)…');
+    try {
+      const r = await fetch('./sample-banknifty-options.csv');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const t = await r.text();
+      setFileName('sample-banknifty-options.csv');
+      setCsvText(t);
+      setRes(null);
+      pushLog(`source: sample loaded (${(t.length / 1024).toFixed(0)} KB)`);
+    } catch (e: any) {
+      setErr(`Sample fetch failed: ${e?.message || e}. Upload a CSV instead.`);
+    }
+  };
 
-  const rows = useMemo(() => {
-    let r = (bundle?.candidates || []).slice();
+  const loadShippedBundle = async () => {
+    pushLog('loading shipped discovery-bundle.json (precomputed reference run)…');
+    try {
+      const r = await fetch('./discovery-bundle.json');
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      const b = await r.json();
+      setRes(bundleToResult(b));
+      setFileName('discovery-bundle.json (precomputed)');
+      pushLog(`bundle loaded: run ${b.run_id}, ${b.candidates?.length || 0} candidates`);
+    } catch (e: any) {
+      setErr(`Bundle fetch failed: ${e?.message || e}`);
+    }
+  };
+
+  const run = () => {
+    if (!csvText) { setErr('Upload an option CSV or load the sample first.'); return; }
+    setErr(null); setRes(null); setLog([]); setRunning(true); setProg(0);
+    workerRef.current?.terminate();
+    let w: Worker;
+    try { w = new Worker('./discovery-worker.js'); }
+    catch (e: any) { setErr(`Worker failed to start: ${e?.message || e}`); setRunning(false); return; }
+    workerRef.current = w;
+    w.onmessage = (e: MessageEvent) => {
+      const m = e.data;
+      if (m.type === 'log') pushLog(m.line);
+      else if (m.type === 'progress') { setProg(m.p); setStage(m.stage || ''); }
+      else if (m.type === 'done') {
+        setRes(m.result); setRunning(false); setProg(1);
+        pushLog(`DONE wallMs=${m.result.wallMs} candidates=${m.result.candidates.length}`);
+        w.terminate(); workerRef.current = null;
+      } else if (m.type === 'error') {
+        setErr(m.message); setRunning(false);
+        pushLog(`ERROR: ${m.message}`);
+        w.terminate(); workerRef.current = null;
+      }
+    };
+    w.onerror = (ev) => {
+      setErr(`Worker error: ${(ev as ErrorEvent).message || 'unknown'}`);
+      setRunning(false);
+    };
+    w.postMessage({
+      type: 'run', text: csvText,
+      cfg: {
+        focusStrikes: cfg.focusStrikes, minEvents: cfg.minEvents,
+        trainFrac: cfg.trainFrac, valFrac: 1 - cfg.trainFrac - 0.3,
+        seed: cfg.seed, nPerms: cfg.nPerms, sl: cfg.sl, tp: cfg.tp, hold: cfg.hold,
+        rankingObjective: cfg.rankingObjective,
+      },
+    });
+    pushLog(`run started: focusStrikes=${cfg.focusStrikes} minEvents=${cfg.minEvents} ` +
+      `train=${cfg.trainFrac} sl=${cfg.sl} tp=${cfg.tp} hold=${cfg.hold} seed=${cfg.seed} perms=${cfg.nPerms}`);
+  };
+
+  const stop = () => {
+    workerRef.current?.terminate(); workerRef.current = null;
+    setRunning(false);
+    pushLog('STOPPED by user');
+  };
+
+  const rows = (() => {
+    let r = ((res?.candidates || []) as Record<string, any>[]).slice();
     if (fam !== 'ALL') r = r.filter(c => String(c.discovery_family) === fam);
     if (status !== 'ALL') r = r.filter(c => String(c.final_status) === status);
     if (minEv > 0) r = r.filter(c => Number(c.events) >= minEv);
     if (q) r = r.filter(c => JSON.stringify(c).toLowerCase().includes(q.toLowerCase()));
     const k = obj === 'composite' ? 'rank_composite' : `rank_${obj}`;
-    const key = TABLE_COLS.some(c => c.key === sortK) ? sortK : k;
+    const key = (TABLE_COLS.some(c => c.key === sortK) || k.startsWith('rank_')) ? (TABLE_COLS.some(c => c.key === sortK) ? sortK : k) : k;
     r.sort((x, y) => {
       const a = x[key], b = y[key];
-      const an = typeof a === 'number' ? a : NaN, bn = typeof b === 'number' ? b : NaN;
-      if (!isNaN(an) && !isNaN(bn)) return (an - bn) * sortD;
+      if (typeof a === 'number' && typeof b === 'number' && !isNaN(a) && !isNaN(b)) return (a - b) * sortD;
       return String(a ?? '').localeCompare(String(b ?? '')) * sortD;
     });
     return r;
-  }, [bundle, fam, status, minEv, q, obj, sortK, sortD]);
+  })();
 
-  if (!bundle) {
-    return (
-      <div className="min-h-screen bg-[#0d0d12] text-zinc-300 p-8 max-w-3xl mx-auto">
-        <h1 className="font-display text-xl text-white">OPTION DISCOVERY</h1>
-        <p className="text-sm text-zinc-500 mt-2">Independent option-native research console. No futures signals are used anywhere in this tab.</p>
-        <label className="block mt-6 cursor-pointer rounded-lg border border-dashed border-zinc-700 px-4 py-6 text-center">
-          <input type="file" accept=".json" className="hidden" onChange={e => onFile(e.target.files)} />
-          <div className="text-sm">📂 Upload <span className="num">tab_bundle.json</span> (exported by xbost_option_discovery)</div>
-        </label>
-        {err && <div className="text-[12px] text-amber-300 mt-3">{err}</div>}
-        <a href="#/" className="text-[12px] text-emerald-400 mt-4 inline-block">← Back</a>
-      </div>
-    );
-  }
-
-  const sb = bundle.status_bar || {};
-  const mods = bundle.modules || {};
+  const fams = ['ALL', ...Array.from(new Set(((res?.candidates || []) as any[]).map(c => String(c.discovery_family))))];
+  const statuses = ['ALL', ...Array.from(new Set(((res?.candidates || []) as any[]).map(c => String(c.final_status))))];
+  const sb = res?.statusBar || {};
   const pill = (v: string) => v === 'PASS' || v === 'AVAILABLE' || v === 'TRUE'
     ? 'text-emerald-300 border-emerald-800 bg-emerald-950/40'
-    : v === 'FALSE' || v === 'FAIL'
-      ? 'text-red-300 border-red-900 bg-red-950/30'
+    : v === 'FALSE' || v === 'FAIL' ? 'text-red-300 border-red-900 bg-red-950/30'
       : 'text-zinc-400 border-zinc-700 bg-zinc-900/60';
+
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-');
+  const downloadAll = () => {
+    if (!res) return;
+    dl(`discovery-log-${stamp}.txt`, log.join('\n'));
+    dl(`discovery-candidates-${stamp}.csv`, toCSV(res.candidates || []), 'text/csv');
+    dl(`discovery-bundle-${stamp}.json`, JSON.stringify(res, null, 1), 'application/json');
+    dl(`discovery-report-${stamp}.md`, buildReport(res));
+    dl(`discovery-config-${stamp}.json`, JSON.stringify(res.settings || cfg, null, 1), 'application/json');
+  };
+
+  const num = (v: string, dflt: number) => {
+    const n = Number(v);
+    return isNaN(n) ? dflt : n;
+  };
 
   return (
     <div className="min-h-screen bg-[#0d0d12] text-zinc-300">
       <header className="border-b border-[#232329] px-4 py-3 flex items-center gap-3">
         <a href="#/" className="text-emerald-400 text-sm">←</a>
         <h1 className="font-display font-bold text-white tracking-tight">OPTION DISCOVERY</h1>
-        <span className="text-[10px] text-zinc-500 num">run {bundle.run_id} · data {bundle.dataset_hash} · cfg {bundle.configuration_hash}</span>
+        <span className="text-[10px] text-zinc-500">independent research · no futures signals</span>
       </header>
 
-      {/* status bar */}
-      <section className="px-4 pt-3 flex flex-wrap gap-1.5">
-        {Object.entries(sb).map(([k, v]) => (
-          <span key={k} title={k} className={`text-[10px] num px-2 py-0.5 rounded-full border ${pill(String(v))}`}>{k} · {String(v)}</span>
-        ))}
-      </section>
-
       <main className="max-w-7xl mx-auto px-4 py-4 flex flex-col gap-4">
-        {/* chain + health */}
+        {/* 1. data */}
         <section className="card p-4">
-          <div className="lbl mb-2">DATA HEALTH · CHAIN STRUCTURE (dynamic)</div>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[12px] num">
-            <div>contracts <b className="text-white">{bundle.chain_metadata?.n_contracts}</b></div>
-            <div>strikes <b className="text-white">{bundle.chain_metadata?.n_strikes}</b></div>
-            <div>types <b className="text-white">{JSON.stringify(bundle.chain_metadata?.option_types)}</b></div>
-            <div>expiries <b className="text-white">{JSON.stringify(bundle.chain_metadata?.expiries)}</b></div>
-            <div>snapshots <b className="text-white">{bundle.chain_metadata?.synchronized_snapshots}</b></div>
-            <div>completeness <b className="text-white">{bundle.chain_metadata?.completeness}</b></div>
-            <div>bid/ask <b className="text-white">{bundle.chain_metadata?.has_bidask ? 'yes' : 'no (RESEARCH_PRICE_MODEL)'}</b></div>
-            <div>health <b className="text-white">{bundle.data_health?.status}</b></div>
+          <div className="lbl mb-2">1 · DATA SOURCE (option CSV: long or wide format)</div>
+          <div className="flex flex-wrap gap-2">
+            <label className="btn-ghost btn-xs cursor-pointer">📂 Upload CSV
+              <input type="file" accept=".csv,.txt" className="hidden" onChange={e => onUpload(e.target.files)} />
+            </label>
+            <button className="btn-ghost btn-xs" onClick={loadSample}>Load 2-day reference sample</button>
+            <button className="btn-ghost btn-xs" onClick={loadShippedBundle}>Load precomputed bundle</button>
+            {fileName && <span className="text-[11px] text-zinc-400 num self-center">source: {fileName}</span>}
           </div>
-          <div className="mt-2 flex flex-wrap gap-1.5">
-            {Object.entries(mods).map(([k, v]) => (
-              <span key={k} className={`text-[10px] num px-2 py-0.5 rounded-full border ${pill(String(v))}`}>{k} · {String(v)}</span>
-            ))}
-          </div>
-          {Object.keys(bundle.modules_unavailable || {}).length > 0 && (
-            <div className="text-[11px] text-zinc-500 mt-2">NOT_APPLICABLE: {Object.entries(bundle.modules_unavailable).map(([k, v]) => `${k} (${v})`).join(' · ')}</div>
-          )}
         </section>
 
-        {/* settings */}
-        <details className="card p-4">
-          <summary className="lbl cursor-pointer">RESEARCH SETTINGS (configuration-driven)</summary>
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-1.5 mt-2 text-[11px] num">
-            {Object.entries(bundle.settings || {}).map(([k, v]) => (
-              <div key={k} className="bg-[#111] border border-zinc-800 rounded px-2 py-1"><span className="text-zinc-500">{k}</span> <span className="text-zinc-200">{fmt(v)}</span></div>
-            ))}
-          </div>
-        </details>
-
-        {/* filters */}
+        {/* 2. config */}
         <section className="card p-4">
-          <div className="lbl mb-2">FILTERABLE DISCOVERY BOARD</div>
-          <div className="flex flex-wrap gap-2 text-[12px]">
-            <select value={fam} onChange={e => setFam(e.target.value)} className="bg-[#111] border border-zinc-700 rounded px-2 py-1">
-              {fams.map(f => <option key={f} value={f}>{f}</option>)}
-            </select>
-            <select value={status} onChange={e => setStatus(e.target.value)} className="bg-[#111] border border-zinc-700 rounded px-2 py-1">
-              {statuses.map(f => <option key={f} value={f}>{f}</option>)}
-            </select>
-            <select value={obj} onChange={e => setObj(e.target.value)} className="bg-[#111] border border-zinc-700 rounded px-2 py-1" title="Ranking objective">
-              {['composite', 'sharpe', 'expectancy', 'pf', 'oos', 'robustness'].map(o => <option key={o} value={o}>rank: {o}</option>)}
-            </select>
-            <input type="number" value={minEv} onChange={e => setMinEv(Number(e.target.value))} placeholder="min events" className="bg-[#111] border border-zinc-700 rounded px-2 py-1 w-28 num" />
-            <input value={q} onChange={e => setQ(e.target.value)} placeholder="search…" className="bg-[#111] border border-zinc-700 rounded px-2 py-1 flex-1 min-w-[140px]" />
-            <span className="text-zinc-500 num self-center">{rows.length} rows</span>
+          <div className="lbl mb-2">2 · RESEARCH SETTINGS</div>
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-2 text-[11px]">
+            {([
+              ['focusStrikes', 'Focus strikes', 'int'], ['minEvents', 'Min events', 'int'],
+              ['trainFrac', 'Train frac', 'float'], ['nPerms', 'Permutations', 'int'],
+              ['seed', 'Seed', 'int'], ['sl', 'Exit SL %', 'float'], ['tp', 'Exit TP %', 'float'],
+              ['hold', 'Max hold (bars)', 'int'],
+            ] as const).map(([k, label]) => (
+              <label key={k} className="bg-[#111] border border-zinc-800 rounded px-2 py-1.5 flex flex-col gap-1">
+                <span className="text-zinc-500">{label}</span>
+                <input type="number" step="any" value={(cfg as any)[k]}
+                  onChange={e => setCfg({ ...cfg, [k]: num(e.target.value, (DEFAULT_CFG as any)[k]) })}
+                  className="bg-transparent num text-zinc-100 outline-none" />
+              </label>
+            ))}
+            <label className="bg-[#111] border border-zinc-800 rounded px-2 py-1.5 flex flex-col gap-1">
+              <span className="text-zinc-500">Ranking objective</span>
+              <select value={cfg.rankingObjective} onChange={e => setCfg({ ...cfg, rankingObjective: e.target.value })}
+                className="bg-transparent text-zinc-100 outline-none">
+                {['composite', 'sharpe', 'expectancy', 'oos'].map(o => <option key={o} value={o}>{o}</option>)}
+              </select>
+            </label>
           </div>
-          <div className="overflow-x-auto mt-2">
-            <table className="w-full text-[11px] num">
-              <thead><tr className="text-zinc-500 text-left border-b border-zinc-800">
-                {TABLE_COLS.map(c => (
-                  <th key={c.key} className="px-2 py-1 cursor-pointer hover:text-emerald-300 whitespace-nowrap"
-                    onClick={() => { if (sortK === c.key) setSortD(d => d === 1 ? -1 : 1); else { setSortK(c.key); setSortD(-1); } }}>
-                    {c.label}{sortK === c.key ? (sortD === -1 ? ' ▼' : ' ▲') : ''}</th>
+          <div className="flex gap-2 mt-3">
+            {!running
+              ? <button className="btn-ghost btn-xs !text-emerald-300 !border-emerald-800" onClick={run} disabled={!csvText}>▶ Run discovery</button>
+              : <button className="btn-ghost btn-xs !text-red-300 !border-red-900" onClick={stop}>■ Stop</button>}
+            {running && (
+              <div className="flex-1 self-center">
+                <div className="prog"><div style={{ width: `${Math.round(prog * 100)}%` }} /></div>
+                <div className="text-[10px] text-zinc-500 num mt-0.5">{Math.round(prog * 100)}% · {stage}</div>
+              </div>
+            )}
+            {res && !running && (
+              <button className="btn-ghost btn-xs" onClick={downloadAll}>⬇ Download all (log · candidates · bundle · report · config)</button>
+            )}
+          </div>
+          {err && <div className="alert-err mt-2" role="alert"><span>⚠</span><span>{err}</span></div>}
+        </section>
+
+        {/* 3. live log */}
+        {(log.length > 0 || running) && (
+          <section className="card p-4">
+            <div className="lbl mb-2">3 · RUN LOG (in-depth, downloadable)</div>
+            <div ref={logRef} className="bg-black/60 border border-zinc-800 rounded p-2 h-56 overflow-y-auto font-mono text-[11px] leading-relaxed num">
+              {log.map((l, i) => <div key={i} className="text-zinc-300 whitespace-pre-wrap">{l}</div>)}
+              {running && <div className="text-emerald-400 animate-pulse">▊ running…</div>}
+            </div>
+          </section>
+        )}
+
+        {/* 4. results */}
+        {res && (
+          <>
+            <section className="px-1 flex flex-wrap gap-1.5">
+              {Object.entries(sb).map(([k, v]) => (
+                <span key={k} className={`text-[10px] num px-2 py-0.5 rounded-full border ${pill(String(v))}`}>{k} · {String(v)}</span>
+              ))}
+            </section>
+
+            <section className="card p-4">
+              <div className="lbl mb-2">4 · DISCOVERY BOARD ({rows.length} rows)</div>
+              <div className="flex flex-wrap gap-2 text-[12px] mb-2">
+                <select value={fam} onChange={e => setFam(e.target.value)} className="bg-[#111] border border-zinc-700 rounded px-2 py-1">
+                  {fams.map(f => <option key={f} value={f}>{f}</option>)}
+                </select>
+                <select value={status} onChange={e => setStatus(e.target.value)} className="bg-[#111] border border-zinc-700 rounded px-2 py-1">
+                  {statuses.map(f => <option key={f} value={f}>{f}</option>)}
+                </select>
+                <select value={obj} onChange={e => setObj(e.target.value)} className="bg-[#111] border border-zinc-700 rounded px-2 py-1">
+                  {['composite', 'sharpe', 'expectancy', 'oos'].map(o => <option key={o} value={o}>rank: {o}</option>)}
+                </select>
+                <input type="number" value={minEv} onChange={e => setMinEv(num(e.target.value, 0))} placeholder="min events" className="bg-[#111] border border-zinc-700 rounded px-2 py-1 w-24 num" />
+                <input value={q} onChange={e => setQ(e.target.value)} placeholder="search…" className="bg-[#111] border border-zinc-700 rounded px-2 py-1 flex-1 min-w-[120px]" />
+              </div>
+              <div className="overflow-x-auto">
+                <table className="w-full text-[11px] num">
+                  <thead><tr className="text-zinc-500 text-left border-b border-zinc-800">
+                    {TABLE_COLS.map(c => (
+                      <th key={c.key} className="px-2 py-1 cursor-pointer hover:text-emerald-300 whitespace-nowrap"
+                        onClick={() => { if (sortK === c.key) setSortD(d => d === 1 ? -1 : 1); else { setSortK(c.key); setSortD(-1); } }}>
+                        {c.label}{sortK === c.key ? (sortD === -1 ? ' ▼' : ' ▲') : ''}</th>
+                    ))}
+                  </tr></thead>
+                  <tbody>
+                    {rows.slice(0, 200).map((c, i) => (
+                      <tr key={i} className="border-b border-zinc-900 hover:bg-zinc-900/50 cursor-pointer" onClick={() => setSel(c)}>
+                        {TABLE_COLS.map(col => <td key={col.key} className={`px-2 py-1 whitespace-nowrap ${col.num ? 'text-right' : ''}`}>{fmt((c as any)[col.key])}</td>)}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+
+            <section className="card p-4">
+              <div className="lbl mb-2">FILTER PIPELINE</div>
+              <div className="text-[11px] num flex flex-col gap-0.5">
+                {(res.filterLog || []).map((f: any, i: number) => (
+                  <div key={i} className="flex gap-2 flex-wrap"><span className="text-zinc-500 w-44">{f.filter}</span><span>in={f.input_count}</span><span className="text-emerald-300">passed={f.passed_count}</span><span className="text-red-300">rejected={f.rejected_count}</span><span className="text-zinc-500">{f.rejection_reason}</span></div>
                 ))}
-              </tr></thead>
-              <tbody>
-                {rows.slice(0, 200).map((c, i) => (
-                  <tr key={i} className="border-b border-zinc-900 hover:bg-zinc-900/50 cursor-pointer" onClick={() => setSel(c)}>
-                    {TABLE_COLS.map(col => <td key={col.key} className={`px-2 py-1 whitespace-nowrap ${col.num ? 'text-right' : ''}`}>{fmt(c[col.key])}</td>)}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        </section>
-
-        {/* lead/lag */}
-        <section className="card p-4">
-          <div className="lbl mb-2">LEAD/LAG ({bundle.leadlag?.length || 0} pairs)</div>
-          <div className="overflow-x-auto max-h-56 overflow-y-auto">
-            <table className="w-full text-[11px] num">
-              <thead><tr className="text-zinc-500 text-left border-b border-zinc-800">
-                {['source', 'target', 'lag', 'event_count', 'mean_forward_return', 'WR'].map(k => <th key={k} className="px-2 py-1">{k}</th>)}
-              </tr></thead>
-              <tbody>{(bundle.leadlag || []).slice(0, 50).map((r, i) => (
-                <tr key={i} className="border-b border-zinc-900"><td className="px-2 py-1">{fmt(r.source)}</td><td className="px-2 py-1">{fmt(r.target)}</td><td className="px-2 py-1 text-right">{fmt(r.lag)}</td><td className="px-2 py-1 text-right">{fmt(r.event_count)}</td><td className="px-2 py-1 text-right">{fmt(r.mean_forward_return)}</td><td className="px-2 py-1 text-right">{fmt(r.WR)}</td></tr>
-              ))}</tbody>
-            </table>
-          </div>
-        </section>
-
-        {/* filter pipeline + paper */}
-        <section className="card p-4">
-          <div className="lbl mb-2">FILTER PIPELINE · PAPER ELIGIBILITY</div>
-          <div className="text-[11px] num flex flex-col gap-0.5">
-            {(bundle.filter_log || []).map((f, i) => (
-              <div key={i} className="flex gap-2"><span className="text-zinc-500 w-40">{f.filter}</span><span>in={f.input_count}</span><span className="text-emerald-300">passed={f.passed_count}</span><span className="text-red-300">rejected={f.rejected_count}</span><span className="text-zinc-500">{f.rejection_reason}</span></div>
-            ))}
-          </div>
-        </section>
+              </div>
+            </section>
+          </>
+        )}
       </main>
 
-      {/* candidate detail */}
       {sel && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center p-4 z-50" onClick={() => setSel(null)}>
           <div className="bg-[#14141a] border border-zinc-700 rounded-lg max-w-3xl w-full max-h-[90vh] overflow-y-auto p-5" onClick={e => e.stopPropagation()}>
@@ -239,13 +375,11 @@ export default function Discovery() {
               <button className="ml-auto text-zinc-500 hover:text-white" onClick={() => setSel(null)}>✕</button></div>
             <div className="lbl mt-3 mb-1">EXACT FORMULA</div>
             <pre className="text-[11px] num bg-[#0d0d12] border border-zinc-800 rounded p-2 whitespace-pre-wrap">{String(sel.formula || sel.feature_definition)}</pre>
-            <div className="grid grid-cols-2 gap-3 mt-3 text-[11px] num">
-              <div><div className="lbl mb-1">EQUITY (net pnl)</div><Spark data={sel.equity_curve} stroke="#34d399" /></div>
-              <div><div className="lbl mb-1">DRAWDOWN</div><Spark data={sel.drawdown_curve} stroke="#f87171" /></div>
-            </div>
+            <div className="lbl mt-3 mb-1">EQUITY (net pnl per trade, capped at 100 pts)</div>
+            <Sparkline data={sel.equity_curve} />
             <div className="lbl mt-3 mb-1">ALL METRICS</div>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-1 text-[11px] num">
-              {Object.entries(sel).filter(([k]) => !['equity_curve', 'drawdown_curve', 'formula'].includes(k)).map(([k, v]) => (
+              {Object.entries(sel).filter(([k]) => k !== 'equity_curve').map(([k, v]) => (
                 <div key={k} className="bg-[#0d0d12] border border-zinc-800 rounded px-2 py-1"><span className="text-zinc-500">{k}</span> <span className="text-zinc-200">{fmt(v)}</span></div>
               ))}
             </div>
@@ -254,4 +388,33 @@ export default function Discovery() {
       )}
     </div>
   );
+}
+
+function bundleToResult(b: any): any {
+  // shipped tab_bundle.json (Python engine) → same shape the worker returns
+  return {
+    engineVersion: b.engine_version || 'python',
+    wallMs: 0,
+    settings: b.settings || {},
+    statusBar: {
+      DATA_READY: 'PASS', CHAIN_READY: 'PASS', FEATURES_READY: 'PASS', DISCOVERY_READY: 'PASS',
+      VALIDATION_READY: 'PASS', OOS_READY: 'PASS', ROBUSTNESS_READY: 'PASS',
+      EXECUTION_MODEL: 'RESEARCH_PRICE_MODEL', PAPER_ELIGIBLE: 'FALSE',
+    },
+    dataHealth: {},
+    chainMetadata: b.chain_metadata || {},
+    modules: b.modules || {},
+    filterLog: [],
+    candidates: b.candidates || [],
+    leadlag: b.leadlag || [],
+    counts: b.counts || {},
+  };
+}
+
+function Sparkline({ data }: { data: any }) {
+  const arr = Array.isArray(data) ? data.filter((x: any) => typeof x === 'number') : [];
+  if (arr.length < 2) return <span className="text-zinc-600 text-[11px]">NA</span>;
+  const mn = Math.min(...arr), mx = Math.max(...arr), rg = mx - mn || 1;
+  const pts = arr.map((v: number, i: number) => `${(i / (arr.length - 1)) * 300},${60 - ((v - mn) / rg) * 56}`).join(' ');
+  return <svg width="300" height="64" className="block bg-[#0d0d12] border border-zinc-800 rounded"><polyline points={pts} fill="none" stroke="#34d399" strokeWidth="1.5" /></svg>;
 }
