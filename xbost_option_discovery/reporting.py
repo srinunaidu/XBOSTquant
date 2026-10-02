@@ -2,32 +2,42 @@
 import os, json
 import pandas as pd
 
-STATUS_ORDER = ["DISCOVERY", "RANKABLE", "ROBUST", "OOS_SURVIVED",
-                "PAPER_CANDIDATE", "PAPER_ELIGIBLE", "REJECTED", "THIN_SAMPLE", "DATA_INVALID"]
+STATUS_ORDER = ["DISCOVERY", "ROBUST", "OOS_SURVIVED", "PAPER_CANDIDATE", "PAPER_ELIGIBLE",
+                "OOS_REJECTED", "SURROGATE_REJECTED", "CAP_DOMINATED", "CONCENTRATED",
+                "REJECTED", "THIN_SAMPLE", "DATA_INVALID"]
 
-def assign_status(n, n_clu, days, oos_n, oos_mean, train_mean, padj, conc, thin_oos):
+def assign_status(n, n_clu, days, oos_n, oos_mean, train_mean, padj, conc, thin_oos,
+                  cap_dominated=None):
+    """§35 weakest-critical-dimension wins. OOS rejection / surrogate failure /
+    exit-cap domination can never be labelled ROBUST or above."""
     if n < 50 or days < 3:
         return "THIN_SAMPLE"
     if thin_oos == "THIN_OOS":
         return "THIN_SAMPLE"
-    agree = (train_mean > 0 and oos_mean > 0) or (train_mean < 0 and oos_mean < 0)
-    if padj < 0.05 and agree and days >= 5 and conc < 0.5:
-        return "PAPER_CANDIDATE"
-    if oos_mean != oos_mean:
+    if oos_mean != oos_mean:  # NaN -> not calculable
         return "REJECTED"
-    if agree and padj < 0.10 and conc < 0.7 and days >= 5:
+    if oos_mean <= 0:
+        return "OOS_REJECTED"
+    agree = (train_mean > 0 and oos_mean > 0) or (train_mean < 0 and oos_mean < 0)
+    if not agree:
+        return "REJECTED"
+    if padj != padj or padj >= 0.10:
+        return "SURROGATE_REJECTED"
+    if cap_dominated:
+        return "CAP_DOMINATED"
+    if conc >= 0.5:
+        return "CONCENTRATED"
+    if days < 5:
+        return "THIN_SAMPLE"
+    if padj < 0.05:
         return "OOS_SURVIVED"
-    if agree and days >= 3:
-        return "ROBUST"
-    if n >= 50:
-        return "RANKABLE"
-    return "REJECTED"
+    return "ROBUST"
 
 def paper_gate(df):
-    # §32: one-month data -> PAPER_ELIGIBLE=NO unless all pass
+    # §32: one-month data -> PAPER_ELIGIBLE=NO unless every gate passes
     if len(df) == 0:
         return "PAPER_ELIGIBLE = NO (no candidates)"
-    ok = df[df["final_status"] == "PAPER_CANDIDATE"]
+    ok = df[df["final_status"].isin(["OOS_SURVIVED", "ROBUST"])]
     if len(ok) == 0:
         return "PAPER_ELIGIBLE = NO"
     return "PAPER_ELIGIBLE = NO (one-month data: discovery valid, generalization not proven)"

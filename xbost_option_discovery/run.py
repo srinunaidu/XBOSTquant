@@ -10,7 +10,8 @@ from .sequences import add_atomic_events, add_combo_events, add_sequences, add_s
 from .labels import add_labels, FW
 from .validation import splits_50_20_30, walk_forward, cluster, oos_gate
 from .metrics import (calculate_trade_metrics, metric_recalculation_test,
-                      daily_sharpe, bootstrap_sharpe, surrogate_stats, SHARPE_DEFS)
+                      daily_sharpe, bootstrap_sharpe, surrogate_stats, SHARPE_DEFS,
+                      label_metrics, cap_dominance)
 from .robustness import concentration, best_removal, time_split, entry_perturbation
 from .multiple_testing import bh
 from .backtest import backtest, propagation_gate
@@ -116,15 +117,27 @@ def main():
     else:
         inj_changed = False
     print(f"NO_LOOKAHEAD_TEST={'PASS' if leak['PASS'] else 'FAIL'} (injection-changes-signal={inj_changed})")
+    # lead/lag pairs computed BEFORE candidate push so they become real candidates (§12)
+    import itertools
+    ll_rows = []
+    ser = {}; fwdd = {}
+    for c in chain:
+        s_ = c[:-2]; o_ = c[-2:]
+        sub = feat[(feat["strike"].astype(str) == str(s_)) & (feat["option_type"] == o_)].set_index("timestamp").sort_index()
+        ser[c] = sub["return_5"]; fwdd[c] = sub["fwd_ret_5m"]
+    for A_, B_ in itertools.permutations(chain, 2):
+        for k in (1, 2, 3, 5, 10):
+            common = ser[A_].index.intersection(fwdd[B_].index)
+            s = ser[A_].reindex(common); t = fwdd[B_].reindex(common).shift(-k)
+            vals = t[(s.abs() > 1.0)].dropna()
+            if len(vals) >= 50:
+                ll_rows.append({"source": f"{A_}_return_5m", "target": f"{B_}_forward_return_5m",
+                                "source_contract": A_, "target_contract": B_, "lag": k,
+                                "event_count": len(vals), "mean_forward_return": float(vals.mean()),
+                                "median_forward_return": float(vals.median()),
+                                "WR": float((vals > 0).mean())})
+    ll = pd.DataFrame(ll_rows)
     # candidates per family with family/feature/label
-    FAMS = {
-        "RAW_OPTION_PRICE": ["e_large_ret", "e_expansion"],
-        "OPTION_VOLUME": ["e_vol_shock", "ev_largeRet_volShock"],
-        "CE_PE_RELATIONSHIP": ["ev_ce_leads_pe", "ev_pe_leads_ce", "ev_compress_expand"],
-        "CROSS_STRIKE_RELATIONSHIP": ["e_atm_move"],
-        "EVENT": ["ev_ret_vol_expand"],
-        "LEAD_LAG": [], "SEQUENCE": [], "CHAIN_STATE": [],
-    }
     cands = []
     def push(cid, fam, feature, label, rel, direction, tf, mask):
         mask = mask.fillna(False)
@@ -148,6 +161,11 @@ def main():
              "TRADE_SHARPE": m_all["TRADE_SHARPE"], "P&L": m_all["P&L"]}, led_all)
         m_oos = calculate_trade_metrics(led_oos)
         m_is = calculate_trade_metrics(led_is)
+        cap = cap_dominance(led_all)
+        # PRIMARY research quantity: forward labels, not the exit grid
+        fwd_tr = label_metrics(feat.loc[mask & feat["day"].isin(tr), "fwd_ret_5m"])
+        fwd_oos = label_metrics(feat.loc[mask & feat["day"].isin(splits["pseudo_oos"]), "fwd_ret_5m"])
+        fwd_all = label_metrics(feat.loc[mask, "fwd_ret_5m"])
         cl = cluster(feat.loc[mask, ["timestamp", "strike", "option_type"]])
         n_clu = int(cl["cluster_id"].nunique())
         ds = daily_sharpe(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
@@ -155,20 +173,23 @@ def main():
         conc = concentration(led_all["ret"]); br = best_removal(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
         tstab = time_split(feat, mask); pert = entry_perturbation(feat, mask)
         og = oos_gate(len(led_oos))
-        padj = float(sg["p_value"]) if pd.notna(sg["p_value"]) else 1.0
+        # multiple-testing uses the label-side surrogate p (the discovery question)
+        padj = float(fwd_all["surrogate_p"]) if pd.notna(fwd_all["surrogate_p"]) else 1.0
         status = assign_status(len(led_all), n_clu, int(feat.loc[mask, "day"].nunique()),
                                len(led_oos),
-                               float(m_oos["expectancy"]) if pd.notna(m_oos["expectancy"]) else float("nan"),
-                               float(m_is["expectancy"]) if pd.notna(m_is["expectancy"]) else float("nan"),
-                               padj, conc["top5"], og)
+                               float(fwd_oos["expectancy"]) if pd.notna(fwd_oos["expectancy"]) else float("nan"),
+                               float(fwd_tr["expectancy"]) if pd.notna(fwd_tr["expectancy"]) else float("nan"),
+                               padj, conc["top5"], og,
+                               cap_dominated=cap["cap_dominated"])
         if integ["METRIC_INTEGRITY"] == "FAIL":
             status = "REJECTED"
-        oos_res = "OOS_REJECTED" if (pd.isna(m_oos["expectancy"]) or m_oos["expectancy"] <= 0) else "OOS_SURVIVED_MARK"
+        oos_res = "OOS_SURVIVED_MARK" if (pd.notna(fwd_oos["expectancy"]) and fwd_oos["expectancy"] > 0) else "OOS_REJECTED"
         fail = []
         if og == "THIN_OOS": fail.append("THIN_OOS")
         if conc["top5"] > 0.5: fail.append("concentration")
         if padj >= 0.1: fail.append("surrogate-fail")
         if integ["METRIC_INTEGRITY"] == "FAIL": fail.append("metric-fail")
+        if cap["cap_dominated"]: fail.append("exit-cap-dominated")
         if oos_res == "OOS_REJECTED": fail.append("OOS_REJECTED")
         cands.append({"candidate": cid, "discovery_family": fam, "feature_definition": feature,
                       "timestamp_definition": "signal bar close t (past-only)",
@@ -177,13 +198,22 @@ def main():
                       "events": m_all["trade_count"], "clusters": n_clu,
                       "wins": m_all["wins"], "losses": m_all["losses"],
                       "avg_winner": m_all["avg_winner"], "avg_loser": m_all["avg_loser"],
+                      # PRIMARY (forward label, no exit grid)
+                      "FWD_events": fwd_all["n"], "FWD_WR": fwd_all["WR"],
+                      "FWD_expectancy": fwd_all["expectancy"], "FWD_median": fwd_all["median"],
+                      "FWD_TRADE_SHARPE": fwd_all["TRADE_SHARPE"], "FWD_PF": fwd_all["PF"],
+                      "FWD_IS_expectancy": fwd_tr["expectancy"],
+                      "FWD_OOS_events": fwd_oos["n"], "FWD_OOS_expectancy": fwd_oos["expectancy"],
+                      "FWD_OOS_WR": fwd_oos["WR"],
+                      # SECONDARY (path-exit trade construction)
                       "IS_expectancy": m_all["expectancy"], "IS_PF": m_all["PF"],
                       "IS_TRADE_SHARPE": m_all["TRADE_SHARPE"], "IS_Sortino": m_all["Sortino"],
                       "IS_MAE": m_all["MAE"], "IS_MFE": m_all["MFE"],
                       "IS_DAILY_SHARPE": ds["DAILY_SHARPE"],
                       "IS_BOOTSTRAP_SHARPE": bs["BOOTSTRAP_SHARPE"],
                       "IS_SURROGATE_SHARPE": sg["SURROGATE_SHARPE"],
-                      "surrogate_p": padj, "surrogate_note": sg.get("note", ""),
+                      "exit_cap_dominated": cap["cap_dominated"],
+                      "exit_reason_mix": str(cap["exit_reason_mix"]),
                       "OOS_events": len(led_oos), "OOS_expectancy": m_oos["expectancy"],
                       "OOS_WR": float((led_oos["ret"] > 0).mean()) if len(led_oos) else 0.0,
                       "OOS_result": oos_res, "METRIC_INTEGRITY": integ["METRIC_INTEGRITY"],
@@ -205,27 +235,49 @@ def main():
     if "state_id" in feat.columns:
         for sid, n in feat["state_id"].value_counts()[feat["state_id"].value_counts() >= 50].head(6).items():
             push(f"STATE:{sid}", "CHAIN_STATE", sid, "fwd_ret_5m", "chain", "long", "5m", feat["state_id"] == sid)
+    # CHAIN_BREADTH family (§11): breadth predicts forward movement
+    if "breadth_diff" in feat.columns:
+        push("BREADTH:ce_dominant", "CHAIN_BREADTH", "ce_breadth>pe_breadth", "fwd_ret_5m",
+             "chain", "long", "5m", (feat["breadth_diff"] > 0).fillna(False))
+        push("BREADTH:pe_dominant", "CHAIN_BREADTH", "pe_breadth>ce_breadth", "fwd_ret_5m",
+             "chain", "long", "5m", (feat["breadth_diff"] < 0).fillna(False))
+        push("BREADTH:ce_all_up", "CHAIN_BREADTH", "ce_breadth==ce_n", "fwd_ret_5m",
+             "chain", "long", "5m", (feat["ce_breadth"] >= 3).fillna(False))
+        push("BREADTH:pe_all_up", "CHAIN_BREADTH", "pe_breadth==pe_n", "fwd_ret_5m",
+             "chain", "long", "5m", (feat["pe_breadth"] >= 3).fillna(False))
+    # CROSS_STRIKE named relationships (§10)
+    for xs in [c for c in feat.columns if c.startswith("x_CE_") and c.endswith("_retdiff")]:
+        ot, sa, sb = xs.split("_")[1], xs.split("_")[2], xs.split("_")[3]
+        push(f"XS:{ot}:{sa}_leads_{sb}", "CROSS_STRIKE_RELATIONSHIP", f"{sa}_retdiff>{sb}", "fwd_ret_5m",
+             f"{ot} {sa}/{sb}", "long", "5m", (feat[xs] > 0).fillna(False))
+    for xs in [c for c in feat.columns if c.startswith("x_PE_") and c.endswith("_retdiff")]:
+        ot, sa, sb = xs.split("_")[1], xs.split("_")[2], xs.split("_")[3]
+        push(f"XS:{ot}:{sa}_leads_{sb}", "CROSS_STRIKE_RELATIONSHIP", f"{sa}_retdiff>{sb}", "fwd_ret_5m",
+             f"{ot} {sa}/{sb}", "long", "5m", (feat[xs] > 0).fillna(False))
     cands_df = pd.DataFrame(cands)
     if len(cands_df):
         cands_df["perm_p_adj"] = bh(cands_df["perm_p"].fillna(1).values)
-    # lead/lag
-    import itertools
-    ll_rows = []
-    ser = {}; fwdd = {}
-    for c in chain:
-        s_ = c[:-2]; o_ = c[-2:]
-        sub = feat[(feat["strike"].astype(str) == str(s_)) & (feat["option_type"] == o_)].set_index("timestamp").sort_index()
-        ser[c] = sub["return_5"]; fwdd[c] = sub["fwd_ret_5m"]
-    for A_, B_ in itertools.permutations(chain, 2):
-        for k in (1, 2, 3, 5, 10):
-            common = ser[A_].index.intersection(fwdd[B_].index)
-            s = ser[A_].reindex(common); t = fwdd[B_].reindex(common).shift(-k)
-            vals = t[(s.abs() > 1.0)].dropna()
-            if len(vals) >= 50:
-                ll_rows.append({"source": f"{A_}_return_5m", "target": f"{B_}_forward_return_5m",
-                                "lag": k, "event_count": len(vals), "mean_forward_return": float(vals.mean()),
-                                "median_forward_return": float(vals.median()), "WR": float((vals > 0).mean())})
-    ll = pd.DataFrame(ll_rows)
+    # LEAD_LAG candidates become first-class discovery candidates (were previously report-only)
+    if len(ll):
+        _best = ll.reindex(ll["mean_forward_return"].abs().sort_values(ascending=False).index).head(6)
+        for _, r in _best.iterrows():
+            A_, B_ = r["source_contract"], r["target_contract"]
+            k = int(r["lag"])
+            smask = pd.Series(False, index=feat.index)
+            for st in strikes:
+                sub = feat[(feat["strike"].astype(str) == str(st)) & (feat["option_type"] == A_[-2:])]
+                if len(sub) == 0:
+                    continue
+                idx_by_ts = sub.set_index("timestamp")["return_5"]
+                hit = pd.DatetimeIndex(idx_by_ts[(idx_by_ts.abs() > 1.0)].index) + pd.Timedelta(minutes=k)
+                tgt_rows = feat[feat["timestamp"].isin(hit) & (feat["strike"].astype(str) == str(B_[:-2]))
+                                & (feat["option_type"] == B_[-2:])]
+                smask.loc[tgt_rows.index] = True
+            push(f"LL:{A_}->{B_}@{k}", "LEAD_LAG", f"{A_}_return_5m(>1%)@{k}bar", "fwd_ret_5m",
+                 f"{A_}->{B_}", "long", "5m", smask)
+        cands_df = pd.DataFrame(cands)
+        if len(cands_df):
+            cands_df["perm_p_adj"] = bh(cands_df["perm_p"].fillna(1).values)
     # 7 exit propagation gate TEST_A/B/C on shared entries
     _m = pd.Series(False, index=feat.index)
     _m.loc[feat[feat["e_expansion"] == 1].head(200).index] = True
@@ -239,10 +291,14 @@ def main():
     for k, v in SHARPE_DEFS.items():
         print(f"  {k}: formula={v['formula']} unit={v['sample_unit']} ann={v['annualization']}")
     # OOS reporting §27
-    tested = len(cands_df); surv_n = int((cands_df["OOS_result"] == "OOS_SURVIVED_MARK").sum()) if len(cands_df) else 0
-    champ_oos = float(cands_df["OOS_expectancy"].max()) if len(cands_df) else 0.0
+    tested = len(cands_df)
+    surv_n = int(cands_df["final_status"].isin(["OOS_SURVIVED", "ROBUST"]).sum()) if len(cands_df) else 0
+    champ_oos = float(cands_df["FWD_OOS_expectancy"].max()) if len(cands_df) else 0.0
+    n_cap = int(cands_df["exit_cap_dominated"].sum()) if len(cands_df) else 0
     print(f"OOS_CANDIDATES_TESTED={tested}\nOOS_CANDIDATES_SURVIVED={surv_n}\n"
           f"CHAMPION_OOS_RESULT={champ_oos}\nCHAMPION_OOS_STATUS={'OOS_REJECTED' if surv_n == 0 else 'MIXED'}")
+    print(f"EXIT_CAP_DOMINATED_CANDIDATES={n_cap}/{tested} "
+          f"(fixed SL/TP grid pins trade outcomes; forward-label metrics are therefore primary)")
     counts = {"total_features_tested": FEATURE_COUNT["n"], "total_relationships_tested": REL_COUNT["n"],
               "total_sequences_tested": SEQ_COUNT["n"], "total_states_tested": STATE_COUNT["n"],
               "total_candidate_events": len(cands_df)}
@@ -258,7 +314,7 @@ def main():
           f"PE_contracts={sum(c.endswith('PE') for c in chain)}\nstrikes={strikes}\n"
           f"expiries={sorted(norm['expiry'].astype(str).unique().tolist())}\ncomplete_chain_snapshots={complete}")
     for fam in ["RAW_OPTION_PRICE", "OPTION_VOLUME", "CE_PE_RELATIONSHIP", "CROSS_STRIKE_RELATIONSHIP",
-                "LEAD_LAG", "SEQUENCE", "EVENT", "CHAIN_STATE"]:
+                "CHAIN_BREADTH", "LEAD_LAG", "SEQUENCE", "EVENT", "CHAIN_STATE"]:
         sub = cands_df[cands_df["discovery_family"] == fam] if len(cands_df) else pd.DataFrame()
         print(f"{fam}: candidates_tested={len(sub)} OOS_survivors={int((sub['OOS_result'] == 'OOS_SURVIVED_MARK').sum()) if len(sub) else 0}")
     print(f"LEAD_LAG_DISCOVERY={'ACTIVE' if len(ll) else 'EMPTY'} "
@@ -270,7 +326,7 @@ def main():
              "OOS_PIPELINE": "PASS"}
     for k, v in gates.items():
         print(f"{k} = {v}")
-    paper = "NO" if ("FAIL" in gates.values() or surv_n == 0) else "NO"
+    paper = "NO"
     print("DATA_PIPELINE_STATUS = PASS\nDISCOVERY_PIPELINE_STATUS = PASS\n"
           "METRIC_PIPELINE_STATUS = PASS\n"
           f"EXIT_PIPELINE_STATUS = {'PASS' if exit_ok else 'FAIL'}\n"

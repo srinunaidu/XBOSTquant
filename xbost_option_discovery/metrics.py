@@ -75,6 +75,37 @@ def metric_recalculation_test(reported: dict, trades: pd.DataFrame, tol=1e-6) ->
     return {"METRIC_INTEGRITY": "PASS" if ok else "FAIL", "differences": diffs,
             "recalculated": {k: _fmt(v) for k, v in re.items()}}
 
+def label_metrics(vals) -> dict:
+    """Discovery-question metrics on FORWARD LABELS (no exit grid).
+    This is the primary research quantity: does the observable state at t predict
+    forward option-premium behaviour? Path-exit P&L is secondary trade construction."""
+    r = pd.Series(list(vals), dtype="float64").dropna()
+    n = int(len(r))
+    if n == 0:
+        return {"n": 0, "WR": NA, "expectancy": NA, "median": NA,
+                "TRADE_SHARPE": NA, "PF": NA, "surrogate_p": NA}
+    pos = r[r > 0]; neg = r[r < 0]
+    pf = float(pos.sum() / -neg.sum()) if len(neg) and neg.sum() != 0 else NA
+    ts = float(r.mean() / r.std() * np.sqrt(n)) if n >= 2 and r.std() not in (0, None) and not np.isnan(r.std()) else NA
+    sg = surrogate_stats(r)
+    return {"n": n, "WR": float((r > 0).mean()), "expectancy": float(r.mean()),
+            "median": float(r.median()), "TRADE_SHARPE": ts, "PF": pf,
+            "surrogate_p": float(sg["p_value"]) if pd.notna(sg["p_value"]) else NA}
+
+def cap_dominance(ledger) -> dict:
+    """Detect knife-edge exit-grid dominance (§25). If winners/losers are pinned to the
+    configured TP/SL, the ledger measures the grid, NOT the discovered structure."""
+    if ledger is None or len(ledger) == 0:
+        return {"cap_dominated": None, "exit_reason_mix": {}}
+    mix = ledger["exit_reason"].value_counts().to_dict()
+    aw = float(pd.to_numeric(ledger.loc[ledger["ret"] > 0, "ret"]).mean()) if (ledger["ret"] > 0).any() else NA
+    al = float(pd.to_numeric(ledger.loc[ledger["ret"] < 0, "ret"]).mean()) if (ledger["ret"] < 0).any() else NA
+    tp = float(ledger["tp_config"].iloc[0]); sl = float(ledger["sl_config"].iloc[0])
+    pinned = (pd.notna(aw) and abs(aw - tp) < 0.05 * tp) or (pd.notna(al) and abs(abs(al) - sl) < 0.05 * sl)
+    tp_share = float((ledger["exit_reason"] == "TP").mean())
+    return {"cap_dominated": bool(pinned), "tp_exit_share": tp_share,
+            "avg_winner": aw, "avg_loser": al, "exit_reason_mix": mix}
+
 # ---- legacy split-metric helpers (kept separate, never overwritten) ----
 def daily_sharpe(rets, days):
     s = pd.Series(list(rets)); d = pd.Series(list(days), index=s.index)
