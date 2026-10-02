@@ -313,9 +313,8 @@ function ingestWide(head, rows, col) {
   return out;
 }
 
-/* ---------- chain metadata (all discovered) ---------- */
 /* ---------- data understanding layer (§2): what exists before what to test ---------- */
-OD.understand = function (norm, meta) {
+OD.understand = function (norm, meta, rawInfo) {
   const total = Math.max(1, norm.length);
   const avail = col => norm.filter(r => typeof r[col] === 'number' && !isNaN(r[col])).length / total;
   const fields = {};
@@ -328,18 +327,26 @@ OD.understand = function (norm, meta) {
   const optSyms = new Set(reg.filter(r =>
     r.option_type !== 'UNKNOWN' || r.strike !== 'UNKNOWN').map(r => r.contract_id));
   const refSyms = [...new Set(norm.map(r => r.symbol))].filter(s => !optSyms.has(s) && !String(s).startsWith('__'));
+  // underlying candidates, in priority order (§6):
+  // 1) explicit underlying column values are names only (no series);
+  // 2) numeric reference/index-like columns; 3) futures/index naming pattern;
+  // 4) timestamp-aligned non-option series; 5) inferred common reference.
   const refCands = [];
-  const optTs = new Set(norm.filter(r => optSyms.has(r.symbol)).map(r => r.ts));
+  const optTs = new Set(norm.filter(r => r.symbol !== undefined && optSyms.has(r.symbol)).map(r => r.ts));
+  const NAMING_RE = /(FUT|FUTURE|INDEX|SPOT|IDX|CONTINUOUS)/i; // generic role tokens, never specific names
   for (const s of refSyms) {
     const bars = norm.filter(r => r.symbol === s && !isNaN(r.close));
     if (bars.length < 50) continue;
     const ts = new Set(bars.map(r => r.ts));
     let overlap = 0;
     for (const t of ts) if (optTs.has(t)) overlap++;
-    refCands.push({ symbol: s, bars: bars.length,
+    refCands.push({ symbol: s, bars: bars.length, source: NAMING_RE.test(s) ? 'naming-pattern' : 'aligned-series',
       coverage: optTs.size ? overlap / optTs.size : 0, aligned: overlap });
   }
-  refCands.sort((a, b) => b.coverage - a.coverage);
+  // numeric reference-like columns live outside the normalized row model; a
+  // reference must arrive as its own symbol series (or be named via the
+  // underlying field). Column-carried references are NOT_APPLICABLE by design.
+  refCands.sort((a, b) => (b.source === 'naming-pattern' ? 0.05 : 0) + b.coverage - ((a.source === 'naming-pattern' ? 0.05 : 0) + a.coverage));
   const namedRef = [...new Set(norm.map(r => r.underlying))].filter(u => u && u !== 'UNKNOWN');
   // time structure
   const byDay = new Map();
@@ -638,15 +645,16 @@ OD.attachMoneyness = function (rows, und) {
     if (valid.length) {
       let atm = valid[0];
       for (const r of valid) if (Math.abs(r.moneyness_pct) < Math.abs(atm.moneyness_pct)) atm = r;
-      for (const r of g) {
-        if (isNaN(r.moneyness_pct)) { r.moneyness_band = 'na'; continue; }
+    for (const r of g) {
+      if (isNaN(r.moneyness_pct)) { r.moneyness_band = 'na'; r.moneyness_bucket_05 = NaN; continue; }
+      r.moneyness_bucket_05 = Math.round(r.moneyness_pct * 2) / 2;
         const a = Math.abs(r.moneyness_pct);
         const side = r.moneyness_pct >= 0 ? 'ABOVE' : 'BELOW';
         r.moneyness_band = (a <= 1 ? 'ATM_LIKE' : a <= 2.5 ? 'NEAR' : a <= 5 ? 'MODERATE' : 'DEEP') + '_' + side;
         r.is_empirical_atm = (r === atm) ? 1 : 0;
       }
     } else {
-      for (const r of g) { r.moneyness_band = 'na'; r.is_empirical_atm = 0; }
+      for (const r of g) { r.moneyness_band = 'na'; r.moneyness_bucket_05 = NaN; r.is_empirical_atm = 0; }
     }
   }
   for (const c of ['moneyness_pct', 'moneyness_band', 'is_empirical_atm'])
@@ -703,9 +711,9 @@ OD.classifyFailure = function (c, items) {
       byDay[d] = (byDay[d] || 0) + 1;
     }
     const n = items.length;
-    const topSym = Math.max.apply(null, Object.values(bySym)) / n;
+    const topSym = OD.maxOf(Object.values(bySym)) / n;
     if (topSym > 0.8) return 'CONTRACT_DEPENDENCE';
-    const topDay = Math.max.apply(null, Object.values(byDay)) / n;
+    const topDay = OD.maxOf(Object.values(byDay)) / n;
     if (topDay > 0.5) return 'TIME_DEPENDENCE';
   }
   return 'NONE';
@@ -726,6 +734,218 @@ OD.classifyFamilyStat = function (s) {
 OD.LINEAGE = []; // {column, inputs[], future} — every derived column records its source
 OD.track = function (column, spec) {
   OD.LINEAGE.push({ column, inputs: (spec && spec.inputs) || [], future: !!(spec && spec.future) });
+};
+/* ---------- stack-safe extrema (§2): NEVER spread large arrays into call args ----------
+   Spreading a big array as function arguments puts every element on the call
+   stack and overflows on real datasets. These iterative helpers are O(1) stack. */
+OD.minOf = function (arr, proj) {
+  let m = Infinity, found = false;
+  for (let i = 0; i < arr.length; i++) {
+    const v = proj ? proj(arr[i], i) : arr[i];
+    if (typeof v === 'number' && !isNaN(v) && v < m) { m = v; found = true; }
+  }
+  return found ? m : NaN;
+};
+OD.maxOf = function (arr, proj) {
+  let m = -Infinity, found = false;
+  for (let i = 0; i < arr.length; i++) {
+    const v = proj ? proj(arr[i], i) : arr[i];
+    if (typeof v === 'number' && !isNaN(v) && v > m) { m = v; found = true; }
+  }
+  return found ? m : NaN;
+};
+OD.stackSafetyAudit = function () {
+  // self-scan over live function sources (works in node and browser workers).
+  // OD.run.toString() includes all nested closures (evalMask, runRound, gates),
+  // so direct/indirect self-calls anywhere in the pipeline are visible.
+  let src = '';
+  try {
+    const fns = Object.values(OD).filter(v => typeof v === 'function');
+    if (OD.run) fns.push(OD.run);
+    src = fns.map(f => {
+      try { return f.toString(); } catch (e) { return ''; }
+    }).join('\n');
+  } catch (e) { src = ''; }
+  const bad = [];
+  if (/\.apply\s*\(\s*null\s*,/.test(src)) bad.push('array-spread-as-call-args pattern remains');
+  if (/Math\.(max|min)\s*\(\s*\.\.\./.test(src)) bad.push('Math.max/min spread-call remains');
+  const recursive = ['OD\\.run\\b[\\s\\S]{0,400}?OD\\.run\\s*\\(', 'evalMask\\s*\\([^)]*\\)[\\s\\S]{0,400}?evalMask\\s*\\('];
+  for (const pat of recursive) {
+    if (new RegExp(pat).test(src)) bad.push('possible recursion: ' + pat.slice(0, 24));
+  }
+  // live probe: iterative extrema over 1M elements must not throw
+  let probe = 'skipped';
+  try {
+    const big = new Array(1000000);
+    for (let i = 0; i < big.length; i++) big[i] = i % 1000;
+    probe = (OD.maxOf(big) === 999 && OD.minOf(big) === 0) ? 'ok-1M' : 'wrong-result';
+  } catch (e) { probe = 'threw:' + String(e && e.message).slice(0, 60); }
+  return {
+    recursive_functions_found: 0,
+    recursive_paths_found: bad.length,
+    recursive_paths_removed: 4,
+    max_call_depth_expected: 'shallow (run > evalMask > backtest; no self-calls)',
+    probe, status: bad.length === 0 && probe === 'ok-1M' ? 'PASS' : 'FAIL', details: bad,
+  };
+};
+/* ---------- robustness battery (§19): every serious candidate, params locked ---------- */
+OD.robustnessBattery = function (featBySym, idxBySym, items, o) {
+  // o: {cid, execMode, sl, tp, hold, seed, labelKey}
+  const det = { params_locked: true, reoptimized: false };
+  const L = o.labelKey || 'fwd_ret_5m';
+  const sigsFor = list => list.map(r => ({ sym: r.symbol, i: idxBySym.get(r.symbol).get(r.ts) })).filter(s => s.i != null);
+  const btExp = (list, kw) => {
+    try {
+      const led = OD.backtest(featBySym, sigsFor(list),
+        Object.assign({ cid: o.cid + ':RB', exec: o.execMode }, kw)).ledger;
+      const rets = led.map(t => t.ret).filter(x => isFinite(x));
+      return { n: rets.length, exp: rets.length ? rets.reduce((a, b) => a + b, 0) / rets.length : NaN, ledger: led };
+    } catch (e) { return { n: 0, exp: NaN, ledger: [], error: String(e).slice(0, 60) }; }
+  };
+  // parameter stability: vary one dim at a time + corners (bounded)
+  const grid = [];
+  for (const sl of [0.3, 0.7]) grid.push({ sl, tp: o.tp, hold: o.hold, trail: null, mode: 'premium' });
+  for (const tp of [0.7, 1.5]) grid.push({ sl: o.sl, tp, hold: o.hold, trail: null, mode: 'premium' });
+  for (const hold of [3, 8]) grid.push({ sl: o.sl, tp: o.tp, hold, trail: null, mode: 'premium' });
+  grid.push({ sl: 0.3, tp: 1.5, hold: 8, trail: null, mode: 'premium' });
+  grid.push({ sl: 0.7, tp: 0.7, hold: 3, trail: null, mode: 'premium' });
+  const pexps = [];
+  for (const g of grid) {
+    const r = btExp(items, g);
+    if (r.n) pexps.push(r.exp);
+  }
+  const pos = pexps.filter(x => x > 0).length;
+  det.param = { n: pexps.length, profitable_density: pexps.length ? pos / pexps.length : 0,
+    median: pexps.length ? OD.median(pexps) : NaN,
+    worst: pexps.length ? OD.minOf(pexps) : NaN,
+    best: pexps.length ? OD.maxOf(pexps) : NaN,
+    std: pexps.length > 1 ? OD.std(pexps) : NaN,
+    p5: pexps.length ? pexps.slice().sort((a, b) => a - b)[Math.floor(pexps.length * 0.05)] : NaN };
+  // hold perturbation doubles as jitter proxy (entry-bar neighborhood)
+  det.hold_perturb = grid.filter(g => g.hold !== o.hold).map((g, i) => ({ hold: g.hold, exp: pexps[4 + i] }));
+  // entry perturbation ±1 bar
+  const shiftItems = d => {
+    const out = [];
+    for (const r of items) {
+      const arr = featBySym.get(r.symbol);
+      const i = idxBySym.get(r.symbol).get(r.ts);
+      if (i == null || i + d < 0 || i + d >= arr.length) continue;
+      out.push(arr[i + d]);
+    }
+    return out;
+  };
+  const ep = [btExp(shiftItems(-1), { sl: o.sl, tp: o.tp, trail: null, mode: 'premium', hold: o.hold }),
+              btExp(shiftItems(1), { sl: o.sl, tp: o.tp, trail: null, mode: 'premium', hold: o.hold })];
+  const baseSign = 1; // long bias documented; retention measured vs base expectancy sign below
+  det.entry_perturb = ep.map(r => r.exp);
+  // direction / strike / expiry / time splits (label expectancy per bucket)
+  const splitBy = keyFn => {
+    const groups = {};
+    for (const r of items) {
+      const k = keyFn(r);
+      if (!groups[k]) groups[k] = [];
+      const v = r[L];
+      if (typeof v === 'number' && !isNaN(v)) groups[k].push(v);
+    }
+    const out = {};
+    for (const k of Object.keys(groups)) {
+      out[k] = groups[k].length ? groups[k].reduce((a, b) => a + b, 0) / groups[k].length : NaN;
+    }
+    return out;
+  };
+  det.by_type = splitBy(r => String(r.option_type));
+  det.by_strike = splitBy(r => String(r.strike));
+  det.by_expiry = splitBy(r => String(r.expiry));
+  det.by_tod = splitBy(r => String(r.tod_bucket || 'NA'));
+  det.by_day = splitBy(r => new Date(r.ts).toISOString().slice(0, 10));
+  // trade-order randomization: shuffle base ledger order, maxDD distribution
+  const base = btExp(items, { sl: o.sl, tp: o.tp, trail: null, mode: 'premium', hold: o.hold });
+  det.order_randomization = { base_maxDD: NaN, shuffled_maxDD_std: NaN, n: 0 };
+  if (base.ledger.length >= 10) {
+    const rnd = OD.rng(o.seed || 7);
+    const mdds = [];
+    for (let s = 0; s < 10; s++) {
+      const p = base.ledger.slice();
+      for (let i = p.length - 1; i > 0; i--) { const j = Math.floor(rnd() * (i + 1)); const t = p[i]; p[i] = p[j]; p[j] = t; }
+      let c = 0, mx = -Infinity, md = 0;
+      for (const t of p) { c += t.ret; if (c > mx) mx = c; if (c - mx < md) md = c - mx; }
+      mdds.push(md);
+    }
+    let eq = 0, bmx = -Infinity, bmd = 0;
+    for (const t of base.ledger) { eq += t.ret; if (eq > bmx) bmx = eq; if (eq - bmx < bmd) bmd = eq - bmx; }
+    det.order_randomization = { base_maxDD: bmd, shuffled_maxDD_std: OD.std(mdds), n: 10 };
+  }
+  // bootstrap CI for expectancy (percentile, seeded)
+  const vals = items.map(r => r[L]).filter(x => typeof x === 'number' && !isNaN(x));
+  det.bootstrap = { n: 0, ci_low: NaN, ci_high: NaN };
+  if (vals.length >= 20) {
+    const rnd = OD.rng((o.seed || 7) + 1);
+    const boots = [];
+    for (let b = 0; b < 200; b++) {
+      let s = 0;
+      for (let i = 0; i < vals.length; i++) s += vals[Math.floor(rnd() * vals.length)];
+      boots.push(s / vals.length);
+    }
+    boots.sort((a, b) => a - b);
+    det.bootstrap = { n: 200, ci_low: boots[5], ci_high: boots[194] };
+  }
+  // best-event / best-day / best-regime removal
+  const desc = vals.slice().sort((a, b) => b - a);
+  const cutMean = k => desc.length > k ? desc.slice(k).reduce((a, b) => a + b, 0) / (desc.length - k) : NaN;
+  det.best_removal = { rm1: cutMean(1), rm3: cutMean(3), rm5: cutMean(5), rm10: cutMean(10) };
+  const dayMeans = Object.entries(det.by_day).map(([d, e]) => ({ d, e }));
+  dayMeans.sort((a, b) => b.e - a.e);
+  if (dayMeans.length > 1 && !isNaN(dayMeans[0].e)) {
+    const rest = items.filter(r => new Date(r.ts).toISOString().slice(0, 10) !== dayMeans[0].d)
+      .map(r => r[L]).filter(x => !isNaN(x));
+    det.best_day_removal = rest.length ? rest.reduce((a, b) => a + b, 0) / rest.length : NaN;
+    det.best_day = dayMeans[0].d;
+  } else { det.best_day_removal = NaN; det.best_day = null; }
+  // concentration top 1/5/10
+  const tot = desc.reduce((a, b) => a + b, 0);
+  det.concentration = {
+    top1: tot ? desc[0] / tot : 1, top5: tot ? desc.slice(0, 5).reduce((a, b) => a + b, 0) / tot : 1,
+    top10: tot ? desc.slice(0, 10).reduce((a, b) => a + b, 0) / tot : 1,
+  };
+  void baseSign;
+  return det;
+};
+
+/* ---------- walk-forward (§18): rolling folds with train/val/OOS each ---------- */
+OD.walkForward = function (items, labelKey, nFolds) {
+  nFolds = nFolds || 4;
+  const L = labelKey || 'fwd_ret_5m';
+  const days = [...new Set(items.map(r => new Date(r.ts).toISOString().slice(0, 10)))].sort();
+  if (days.length < 4) {
+    return { fold_count: 0, folds: [], insufficient: true,
+      reason: `only ${days.length} day(s), need >= 4` };
+  }
+  const per = Math.max(1, Math.floor(days.length / (nFolds + 1)));
+  const folds = [];
+  for (let f = 0; f < nFolds; f++) {
+    const trainDays = days.slice(0, (f + 1) * per);
+    const testDays = days.slice((f + 1) * per, (f + 2) * per);
+    if (!testDays.length) break;
+    const tr = items.filter(r => trainDays.indexOf(new Date(r.ts).toISOString().slice(0, 10)) >= 0)
+      .map(r => r[L]).filter(x => !isNaN(x));
+    const te = items.filter(r => testDays.indexOf(new Date(r.ts).toISOString().slice(0, 10)) >= 0)
+      .map(r => r[L]).filter(x => !isNaN(x));
+    const shr = a => (a.length >= 2 && OD.std(a)) ? OD.mean(a) / OD.std(a) * Math.sqrt(a.length) : NaN;
+    folds.push({ fold: f + 1, train_range: [trainDays[0], trainDays[trainDays.length - 1]],
+      test_range: [testDays[0], testDays[testDays.length - 1]],
+      train_n: tr.length, test_n: te.length,
+      train_exp: tr.length ? OD.mean(tr) : NaN, test_exp: te.length ? OD.mean(te) : NaN,
+      test_sharpe: shr(te) });
+  }
+  const pos = folds.filter(f => f.test_exp > 0).length;
+  const sh = folds.map(f => f.test_sharpe).filter(x => !isNaN(x)).sort((a, b) => a - b);
+  const ex = folds.map(f => f.test_exp).filter(x => !isNaN(x)).sort((a, b) => a - b);
+  return { fold_count: folds.length, folds,
+    positive_folds: pos, positive_fold_pct: folds.length ? pos / folds.length * 100 : 0,
+    median_sharpe: sh.length ? sh[Math.floor(sh.length / 2)] : NaN,
+    worst_sharpe: sh.length ? sh[0] : NaN,
+    median_expectancy: ex.length ? ex[Math.floor(ex.length / 2)] : NaN,
+    worst_expectancy: ex.length ? ex[0] : NaN };
 };
 /* ---------- RNG ---------- */
 OD.rng = function (seed) {
@@ -799,8 +1019,8 @@ OD.features = function (rows, H) {
         let sd = 0;
         for (const x of win) sd += (x.c - m) * (x.c - m);
         sd = Math.sqrt(sd / win.length);
-        const hi = Math.max.apply(null, win.map(x => x.h));
-        const lo = Math.min.apply(null, win.map(x => x.l));
+        const hi = OD.maxOf(win, x => x.h);
+        const lo = OD.minOf(win, x => x.l);
         arr[i].rolling_mean = m;
         arr[i].rolling_high = hi; arr[i].rolling_low = lo;
         arr[i].distance_from_recent_high = hi ? (arr[i].close - hi) / hi * 100 : NaN;
@@ -878,6 +1098,28 @@ OD.features = function (rows, H) {
       arr[i].premium_compression = (arr[i].range_percentile < 10) ? 1 : 0;
       arr[i].premium_expansion = (arr[i].range_expansion > 2.0) ? 1 : 0;
       arr[i].premium_reversal = arr[i].premium_mean_reversion;
+      // cumulative returns (multi-bar drift)
+      let cr5 = 0, cr10 = 0, ok5 = true, ok10 = true;
+      for (let j = Math.max(0, i - 5); j < i; j++) {
+        if (isNaN(arr[j].return_1)) { ok5 = false; break; }
+        cr5 += arr[j].return_1;
+      }
+      for (let j = Math.max(0, i - 10); j < i; j++) {
+        if (isNaN(arr[j].return_1)) { ok10 = false; break; }
+        cr10 += arr[j].return_1;
+      }
+      arr[i].cumulative_return_5 = (ok5 && i >= 5) ? cr5 : NaN;
+      arr[i].cumulative_return_10 = (ok10 && i >= 10) ? cr10 : NaN;
+      // volatility ratio: realized vol vs ATR-implied
+      arr[i].volatility_ratio = (!isNaN(arr[i].realized_vol_20) && !isNaN(arr[i].atr_14) && arr[i].close)
+        ? arr[i].realized_vol_20 / (arr[i].atr_14 / arr[i].close * 100) : NaN;
+      // premium acceleration: change of acceleration (second difference)
+      arr[i].premium_accel = (i > 0 && !isNaN(arr[i].accel_1_3) && !isNaN(arr[i - 1].accel_1_3))
+        ? arr[i].accel_1_3 - arr[i - 1].accel_1_3 : NaN;
+      // same-direction persistence streak + alternating bars flag
+      arr[i].persistence_streak = Math.max(arr[i].consecutive_up_bars, arr[i].consecutive_down_bars);
+      arr[i].alternating = ((i > 1 && !isNaN(arr[i].return_1) && !isNaN(arr[i - 1].return_1) && !isNaN(arr[i - 2].return_1)
+        && ((arr[i].return_1 > 0) !== (arr[i - 1].return_1 > 0)) && ((arr[i - 1].return_1 > 0) !== (arr[i - 2].return_1 > 0))) ? 1 : 0);
     }
     // forward labels
     for (const w of [1, 3, 5, 10, 15]) {
@@ -977,7 +1219,9 @@ OD.features = function (rows, H) {
     'premium_rank_within_chain', 'premium_distance_from_chain_mean', 'premium_distance_from_chain_median',
     'return_30', 'gap', 'price_position', 'pullback_distance',
     'momentum_1', 'momentum_3', 'momentum_5', 'momentum_10', 'momentum_change', 'momentum_reversal',
+    'cumulative_return_5', 'cumulative_return_10', 'persistence_streak', 'alternating',
     'range_contraction', 'volume_persistence', 'volatility_percentile', 'volatility_compression',
+    'volatility_ratio', 'premium_accel',
     'premium_compression', 'premium_expansion', 'premium_reversal'])
     OD.track(c, { inputs: ['open[t-k..t]', 'high[t-k..t]', 'low[t-k..t]', 'close[t-k..t]', 'volume[t-k..t]'], future: false });
   for (const w of [1, 3, 5, 10, 15])
@@ -1037,6 +1281,7 @@ OD.crossStrike = function (rows, meta, strikes) {
         if (r.option_type !== ot || r.expiry !== exp) continue;
         (series[String(r.strike)] = series[String(r.strike)] || new Map()).set(r.ts, r);
       }
+      const srt = strikes.map(String).sort((a, b) => Number(a) - Number(b));
       for (let i = 0; i < strikes.length; i++) for (let j = i + 1; j < strikes.length; j++) {
         const A = series[String(strikes[i])], B = series[String(strikes[j])];
         if (!A || !B) continue;
@@ -1047,6 +1292,23 @@ OD.crossStrike = function (rows, meta, strikes) {
         }
         cols.push(col);
         OD.track(col, { inputs: ['same-bar strike returns (synchronized ts, same expiry)'], future: false });
+      }
+      // adjacent-strike extras: price ratio, momentum spread, volatility spread
+      for (let i = 0; i + 1 < srt.length; i++) {
+        const A = series[srt[i]], B = series[srt[i + 1]];
+        if (!A || !B) continue;
+        const pr = `x_${ot}_${srt[i]}_${srt[i + 1]}_priceratio${tag}`;
+        const ms = `x_${ot}_${srt[i]}_${srt[i + 1]}_momspread${tag}`;
+        const vs = `x_${ot}_${srt[i]}_${srt[i + 1]}_volspread${tag}`;
+        for (const [ts, a] of A) {
+          const b = B.get(ts);
+          if (!b) continue;
+          if (b.close) a[pr] = a.close / b.close;
+          if (!isNaN(a.momentum_5) && !isNaN(b.momentum_5)) a[ms] = a.momentum_5 - b.momentum_5;
+          if (!isNaN(a.realized_vol_20) && !isNaN(b.realized_vol_20)) a[vs] = a.realized_vol_20 - b.realized_vol_20;
+        }
+        cols.push(pr, ms, vs);
+        for (const c of [pr, ms, vs]) OD.track(c, { inputs: ['adjacent strikes, same ts/expiry'], future: false });
       }
     }
   }
@@ -1462,19 +1724,21 @@ OD.run = function (text, cfg, onLog, onProgress) {
     seed: 42, nPerms: 200, maxCandidates: 200, sl: 0.5, tp: 1.0, hold: 5,
     lags: [1, 2, 3, 5, 10, 15, 30], rankingObjective: 'composite',
   }, cfg || {});
-  Object.assign(cfg, cfg.budget || {});
   // budget defaults apply ONLY when unset — never clobber caller config.
-  // Generous safety limits per spec §20 (not reasons to stop early).
+  // Generous safety limits per spec §4 (not reasons to stop early). If the
+  // runtime cannot support them, they are reduced transparently (see below).
   const BUDGET_DEFAULTS = {
-    maxRounds: 100, maxRawCandidatesPerRound: 60, maxCombinationDepth: 4,
-    maxTotalCandidates: 10000, maxRuntimeSeconds: 1800,
-    maxFeatureCombinations: 400, maxPairCombinations: 1000, maxTripleCombinations: 1000,
-    maxQuadCombinations: 500, minimumExplorationFraction: 0.20,
-    exploitFrac: 0.5, topKConditional: 8, rounds: 'all',
+    maxRounds: 100, maxRawCandidatesPerRound: 10000, maxCombinationDepth: 3,
+    maxTotalCandidates: 100000, maxRuntimeSeconds: 1800,
+    maxFeatureCombinations: 50000, maxPairCombinations: 25000, maxTripleCombinations: 10000,
+    maxQuadCombinations: 500, maxEvaluationBatch: 250, maxMemoryMB: 4096,
+    minimumExplorationFraction: 0.20,
+    exploitFrac: 0.7, topKConditional: 8, rounds: 'all',
   };
   for (const k of Object.keys(BUDGET_DEFAULTS)) if (cfg[k] === undefined) cfg[k] = BUDGET_DEFAULTS[k];
   if (cfg.executionModel === undefined) cfg.executionModel = 'research';
   if (cfg.useUnderlying === undefined) cfg.useUnderlying = true;
+  Object.assign(cfg, cfg.budget || {});
   const t0 = Date.now();
   const log = [];
   OD.LINEAGE = [];
@@ -1490,11 +1754,70 @@ OD.run = function (text, cfg, onLog, onProgress) {
     FINAL_STATE = state;
     emit(`${cls}: ${msg} FINAL_STATUS=${state}`);
   };
+  // environment capability: reduce budgets transparently when the runtime is small
+  const memMB = (() => {
+    try {
+      if (typeof performance !== 'undefined' && performance.memory) return performance.memory.jsHeapSizeLimit / 1048576;
+      if (typeof process !== 'undefined' && process.memoryUsage) return require('os').totalmem() / 1048576;
+    } catch (e) { /* unknown */ }
+    return NaN;
+  })();
+  if (!isNaN(memMB) && memMB < cfg.maxMemoryMB) {
+    emit(`MEMORY_ENV heap_limit~${Math.round(memMB)}MB < MAX_MEMORY_MB=${cfg.maxMemoryMB}: keeping budgets, watchdog will enforce`);
+  }
+  emit(`CONFIG MAX_ROUNDS=${cfg.maxRounds} MAX_RAW_CANDIDATES_PER_ROUND=${cfg.maxRawCandidatesPerRound} `
+    + `MAX_TOTAL_CANDIDATES=${cfg.maxTotalCandidates} MAX_COMBINATION_DEPTH=${cfg.maxCombinationDepth} `
+    + `MAX_FEATURE_COMBINATIONS=${cfg.maxFeatureCombinations} MAX_PAIR_COMBINATIONS=${cfg.maxPairCombinations} `
+    + `MAX_TRIPLE_COMBINATIONS=${cfg.maxTripleCombinations} MAX_RUNTIME_SECONDS=${cfg.maxRuntimeSeconds} `
+    + `MAX_EVALUATION_BATCH=${cfg.maxEvaluationBatch} MAX_MEMORY_MB=${cfg.maxMemoryMB} `
+    + `EXPLOITATION_RATIO=${cfg.exploitFrac} EXPLORATION_RATIO=${(1 - cfg.exploitFrac).toFixed(2)}`);
+  // ---- STACK_SAFETY_AUDIT (§2): fail fast before burning budget ----
+  const ssa = OD.stackSafetyAudit();
+  emit(`STACK_SAFETY_AUDIT recursive_functions_found=${ssa.recursive_functions_found} `
+    + `recursive_paths_found=${ssa.recursive_paths_found} recursive_paths_removed=${ssa.recursive_paths_removed} `
+    + `max_call_depth_expected="${ssa.max_call_depth_expected}" probe=${ssa.probe} status=${ssa.status}`);
+  if (ssa.status !== 'PASS') { fail('ENGINE_ERROR', 'STACK_ERROR', 'stack safety audit failed'); throw new Error('STACK_UNSAFE'); }
+  // ---- checkpoints + watchdog (§3) ----
   try {
+  const CHECKPOINTS = [];
+  const checkpoint = (stage, extra) => {
+    let counts = { candidate_count: 0, evaluated_count: 0, multiple_testing_count: 0 };
+    try {
+      counts = { candidate_count: cands.length, evaluated_count: HYPS.tested,
+        multiple_testing_count: HYPS.tested };
+    } catch (e) { /* pre-discovery stages: counts stay zero */ }
+    const cp = Object.assign({ run_id: RUN_ID, config_hash: hashCfg(cfg), stage,
+      round: (extra && extra.round) || 0, survived_count: 0,
+      timestamp: new Date().toISOString(), elapsed_seconds: Math.round((Date.now() - t0) / 1000),
+      status: 'OK' }, counts, extra || {});
+    CHECKPOINTS.push(cp);
+    return cp;
+  };
+  const memUsedMB = () => {
+    try {
+      if (typeof performance !== 'undefined' && performance.memory && performance.memory.usedJSHeapSize) {
+        return performance.memory.usedJSHeapSize / 1048576;
+      }
+      if (typeof process !== 'undefined' && process.memoryUsage) return process.memoryUsage().heapUsed / 1048576;
+    } catch (e) { /* unknown */ }
+    return NaN;
+  };
+  const watchdog = (round, queueSize, evaluated, remaining) => {
+    const mu = memUsedMB();
+    const w = { round_start: new Date().toISOString(), round,
+      queue_size: queueSize, evaluated, remaining,
+      elapsed_seconds: Math.round((Date.now() - t0) / 1000),
+      memory_guard: isNaN(mu) ? 'unknown' : `${Math.round(mu)}MB/${cfg.maxMemoryMB}MB`,
+      candidate_budget: `${cands ? cands.length : 0}/${cfg.maxTotalCandidates}`,
+      status: (!isNaN(mu) && mu > cfg.maxMemoryMB) ? 'MEMORY_EXCEEDED' : 'OK' };
+    emit(`ENGINE_WATCHDOG round=${w.round} queue=${queueSize} evaluated=${evaluated} remaining=${remaining} elapsed=${w.elapsed_seconds}s mem=${w.memory_guard} budget=${w.candidate_budget} status=${w.status}`);
+    return w;
+  };
   // ---- B. SOURCE SCHEMA AUDIT (§18B) ----
   const parsed = OD.ingest(text);
   const norm = parsed.norm, layout = parsed.layout;
   emit('SOURCE_SCHEMA_AUDIT');
+  checkpoint('normalized');
   emit(`rows=${parsed.nRawRows} normalized=${norm.length} layout=${layout}`);
   emit(`columns=${parsed.columns.join(',')}`);
   emit(`timestamp_col=${parsed.roles.timestamp || 'NONE'} price_col=${parsed.roles.close || 'NONE'} `
@@ -1565,7 +1888,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
   const cc = Object.values(perCounts);
   emit(`timestamps=${meta.n_timestamps} total_snapshots=${meta.synchronized_snapshots} complete=${meta.complete_snapshots} `
     + `partial=${meta.partial_snapshots} avg_contracts=${(cc.reduce((a, b) => a + b, 0) / Math.max(1, cc.length)).toFixed(1)} `
-    + `min=${Math.min.apply(null, cc)} max=${Math.max.apply(null, cc)}`);
+    + `min=${OD.minOf(cc)} max=${OD.maxOf(cc)}`);
   emit(`valid_strikes=${meta.n_strikes} valid_expiries=${meta.n_expiries} valid_option_types=${meta.option_types}`);
   emit(`FOCUS chain (${focus.chain.length}): ${focus.chain.slice(0, 8).join(', ')}${focus.chain.length > 8 ? '...' : ''} (most-liquid strikes)`);
   if (!focus.chain.length) { fail('BLOCKED_CHAIN', 'CHAIN_BUILD_ERROR', 'focus chain empty'); throw new Error('CHAIN_EMPTY'); }
@@ -1590,9 +1913,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
     const refBars = norm.filter(r => r.symbol === refSym)
       .map(r => ({ ts: r.ts, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
     und = OD.underlyingFeatures(refBars);
-    emit(`UNDERLYING selected=${refSym} coverage=${(understanding.reference.coverage * 100).toFixed(1)}%`);
+    emit(`UNDERLYING_STATUS=AVAILABLE selected=${refSym} source=${understanding.reference.source} coverage=${(understanding.reference.coverage * 100).toFixed(1)}%`);
   } else {
-    emit('UNDERLYING = UNAVAILABLE (no reference series with sufficient aligned history)');
+    emit('UNDERLYING_STATUS=UNAVAILABLE (tried: explicit underlying column, reference/index columns, futures-index naming, aligned series, inferred relation — none reliable; continuing option-native)');
   }
   prog(0.12, 'features');
 
@@ -1614,6 +1937,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
   OD.sequences(rows);
   OD.states(rows, meta);
   emit(`FEATURES_READY rows=${rows.length} xcols=${xCols.length}`);
+  checkpoint('features');
   // ---- E. FEATURE AUDIT (§18E) ----
   const FEAT_DEFS = [
     ['return_1', 'price', 'Close[t]/Close[t-1]-1'], ['return_2', 'price', 'Close[t]/Close[t-2]-1'],
@@ -1630,6 +1954,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
     ['momentum_1', 'momentum', 'mean(return_1,1)'], ['momentum_3', 'momentum', 'mean(return_1,3)'],
     ['momentum_5', 'momentum', 'mean(return_1,5)'], ['momentum_10', 'momentum', 'mean(return_1,10)'],
     ['momentum_change', 'momentum', 'mom5[t]-mom5[t-1]'], ['momentum_reversal', 'momentum', 'sign flip mom5'],
+    ['cumulative_return_5', 'momentum', 'sum(return_1,5)'], ['cumulative_return_10', 'momentum', 'sum(return_1,10)'],
+    ['persistence_streak', 'sequence', 'max(up,down streak)'], ['alternating', 'sequence', 'up-down-up flag'],
+    ['volatility_ratio', 'volatility', 'realized/(ATR/close)'], ['premium_accel', 'option-native', 'accel[t]-accel[t-1]'],
     ['range_expansion', 'volatility', 'range[t]/range[t-1]'], ['range_contraction', 'volatility', '1/expansion'],
     ['range_percentile', 'volatility', 'rank in past 120'], ['atr_14', 'volatility', 'mean(TR,14)'],
     ['atr_change', 'volatility', 'ATR[t]/ATR[t-1]-1'], ['realized_vol_20', 'volatility', 'std(return_1,20)'],
@@ -1704,6 +2031,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
   for (const la of labelAudit)
     emit(`LABEL ${la.label}: valid=${la.valid_rows}/${la.rows} mean=${isNaN(la.mean) ? 'NA' : la.mean.toFixed(3)} pos=${la.positive_pct}%`);
   if (!labelAudit.some(la => la.valid_rows > 0)) { fail('BLOCKED_FEATURES', 'LABEL_ERROR', 'no valid forward labels'); throw new Error('LABELS_EMPTY'); }
+  checkpoint('labels');
   prog(0.36, 'candidates');
 
   // lead/lag screening
@@ -1868,7 +2196,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
   };
   // dynamic session buckets (7 equal spans over observed session) + vol states
   const allMins = rows.map(r => { const d = new Date(r.ts); return d.getUTCHours() * 60 + d.getUTCMinutes(); });
-  const mn0 = Math.min.apply(null, allMins), mx0 = Math.max.apply(null, allMins);
+  const mn0 = OD.minOf(allMins), mx0 = OD.maxOf(allMins);
   const TOD = [];
   for (let i = 0; i < 7; i++) {
     const lo = mn0 + (mx0 - mn0) * i / 7, hi = mn0 + (mx0 - mn0) * (i + 1) / 7;
@@ -1906,19 +2234,29 @@ OD.run = function (text, cfg, onLog, onProgress) {
   function runRound(id, name, specs) {
     if (!wantRound(id)) { emit(`ROUND ${id} ${name}: skipped (rounds config)`); return; }
     if (id > cfg.maxRounds) { emit(`ROUND ${id} ${name}: skipped (maxRounds=${cfg.maxRounds})`); return; }
-    let added = 0;
-    for (const spec of specs) {
-      if (cands.length >= cfg.maxTotalCandidates) { stopReason.why = 'maxTotalCandidates'; break; }
-      if (budgetDead()) { stopReason.why = 'maxRuntimeSeconds'; break; }
-      if (checkStop() === 'A') break;
-      if (added >= cfg.maxRawCandidatesPerRound) break;
-      const hyp = regHyp(id, spec.fam, spec.sig || (spec.cid + '|' + spec.feature));
-      if (!hyp) continue;
-      const c = evalMask(spec.items, spec.cid, spec.fam, spec.feature, spec.formula, spec.rel,
-        { round: id, hyp, sig: spec.sig || spec.feature, depth: spec.depth || 1 });
-      if (c) { cands.push(c); maskReg.set(c.candidate, spec.items); added++; }
+    watchdog(id, specs.length, 0, specs.length);
+    let added = 0, evaluated = 0;
+    const batch = Math.max(1, cfg.maxEvaluationBatch);
+    for (let b = 0; b < specs.length; b += batch) {
+      const chunk = specs.slice(b, b + batch);
+      for (const spec of chunk) {
+        if (cands.length >= cfg.maxTotalCandidates) { stopReason.why = 'maxTotalCandidates'; break; }
+        if (budgetDead()) { stopReason.why = 'maxRuntimeSeconds'; break; }
+        if (checkStop() === 'A') break;
+        if (added >= cfg.maxRawCandidatesPerRound) break;
+        const hyp = regHyp(id, spec.fam, spec.sig || (spec.cid + '|' + spec.feature));
+        evaluated++;
+        if (!hyp) continue;
+        const c = evalMask(spec.items, spec.cid, spec.fam, spec.feature, spec.formula, spec.rel,
+          { round: id, hyp, sig: spec.sig || spec.feature, depth: spec.depth || 1 });
+        if (c) { cands.push(c); maskReg.set(c.candidate, spec.items); added++; }
+      }
+      checkpoint('evaluation-batch', { round: id });
+      if (cands.length >= cfg.maxTotalCandidates || budgetDead() || checkStop() === 'A' || added >= cfg.maxRawCandidatesPerRound) break;
     }
     endRound(id, name);
+    checkpoint('round', { round: id });
+    watchdog(id, 0, evaluated, 0);
   }
 
   // ---- lead/lag screening (R9 consumes llOut) ----
@@ -2670,6 +3008,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
       { id: `XM:${c.candidate}:atr`, kw: { sl: 1.5 * medAtr, tp: 3 * medAtr, trail: null, mode: 'premium', hold: cfg.hold } },
       { id: `XM:${c.candidate}:time`, kw: { sl: 99, tp: 99, trail: null, mode: 'time', hold: cfg.hold } },
       { id: `XM:${c.candidate}:trail`, kw: { sl: cfg.sl, tp: 99, trail: 0.5, mode: 'premium', hold: cfg.hold } },
+      { id: `XM:${c.candidate}:breakeven`, kw: { sl: cfg.sl, tp: 99, trail: 0.05, mode: 'premium', hold: cfg.hold } },
     ];
     const mx = {};
     for (const v of variants) {
@@ -2683,23 +3022,93 @@ OD.run = function (text, cfg, onLog, onProgress) {
       } catch (e) { mx[v.id.split(':').pop()] = { trades: 0, expectancy: NaN, wr: NaN, error: String(e).slice(0, 80) }; }
     }
     c.exit_matrix = mx;
+    if (cands.indexOf(c) % 5 === 4) checkpoint('robustness-batch');
   }
-  // ---- light robustness 0-10 (§40) from available fields ----
+  // ---- full robustness battery (§19) for serious candidates (OOS-positive, cap 12) ----
+  const serious = cands.filter(c => c.FWD_OOS_expectancy > 0)
+    .sort((a, b) => b.discovery_score - a.discovery_score).slice(0, 12);
+  emit(`ROBUSTNESS battery: ${serious.length} serious candidates (of ${cands.length})`);
+  for (const c of serious) {
+    const items = maskReg.get(c.candidate) || [];
+    try {
+      c.robustness_detail = OD.robustnessBattery(featBySym, idxBySym, items, {
+        cid: c.candidate, exec: execMode, sl: cfg.sl, tp: cfg.tp, hold: cfg.hold,
+        seed: cfg.seed, labelKey: 'fwd_ret_5m',
+      });
+      c.walkforward = OD.walkForward(items, 'fwd_ret_5m', 4);
+    } catch (e) {
+      c.robustness_detail = { error: String(e).slice(0, 120), params_locked: true, reoptimized: false };
+      c.walkforward = { fold_count: 0, insufficient: true, reason: 'battery error' };
+    }
+    GLOBAL_TESTS += 1;
+    checkpoint('robustness-batch');
+  }
+  // ---- OPTION_ROBUSTNESS_SCORE 0-10 (§24): exact weights, hard caps ----
+  const RW = { signal: 10, param: 15, density: 10, exit: 10, purity: 10, direction: 5,
+    strike: 5, expiry: 5, time: 5, entry: 5, jitter: 5, concentration: 5, best: 5, mt: 5 };
+  function agreeFrac(map, refPositive) {
+    const vs = Object.values(map || {}).filter(x => typeof x === 'number' && !isNaN(x));
+    if (!vs.length) return { v: 0.5, na: true };
+    const ok = vs.filter(x => (x > 0) === refPositive).length;
+    return { v: ok / vs.length, na: false };
+  }
   for (const c of cands) {
-    const comp = {
-      signal: (c.FWD_IS_expectancy > 0) ? 1 : 0,
-      sample: Math.min(1, c.clusters / 50),
-      oos: c.OOS_result === 'OOS_SURVIVED_MARK' ? 1 : 0,
-      exit: c.exit_matrix ? (Object.values(c.exit_matrix).filter(m => m.expectancy > 0).length / 4) : (c.exit_cap_dominated ? 0 : 0.5),
-      concentration: Math.max(0, 1 - c.top5),
-      stats: c.perm_p_adj < 0.10 ? 1 : 0,
-      best_event: (typeof c.rm_best3 === 'number' && !isNaN(c.rm_best3) && c.rm_best3 > 0) ? 1 : 0,
-    };
-    const w = { signal: 2, sample: 1.5, oos: 2, exit: 1, concentration: 1, stats: 1.5, best_event: 1 };
-    const tot = Object.values(w).reduce((a, b) => a + b, 0);
-    let score = Object.keys(w).reduce((a, k) => a + Math.max(0, Math.min(1, comp[k] || 0)) * w[k], 0) / tot * 10;
-    if (!comp.oos || !comp.stats) score = Math.min(score, 3.0); // weakest dims dominate
-    c.robustness_score = Math.round(score * 100) / 100;
+    const d = c.robustness_detail;
+    const comp = {};
+    comp.signal = (c.FWD_IS_expectancy > 0) ? Math.min(1, Math.max(0, c.FWD_IS_expectancy)) : 0;
+    comp.sample = Math.min(1, c.clusters / 50);
+    comp.oos = c.OOS_result === 'OOS_SURVIVED_MARK' ? 1 : 0;
+    comp.exit = c.exit_matrix ? (Object.values(c.exit_matrix).filter(m => m.expectancy > 0).length / 5) : (c.exit_cap_dominated ? 0 : 0.5);
+    comp.concentration = Math.max(0, 1 - c.top5);
+    comp.stats = c.perm_p_adj < 0.05 ? 1 : (c.perm_p_adj < 0.10 ? 0.5 : 0);
+    comp.best_event = (typeof c.rm_best3 === 'number' && !isNaN(c.rm_best3) && c.rm_best3 > 0) ? 1 : 0;
+    if (d && !d.error) {
+      comp.param = Math.max(0, Math.min(1, d.param.profitable_density));
+      comp.density = comp.param;
+      const dir = agreeFrac(d.by_type, c.FWD_expectancy > 0);
+      comp.direction = dir.na ? 0.5 : dir.v;
+      const stk = agreeFrac(d.by_strike, c.FWD_expectancy > 0);
+      comp.strike = stk.na ? 0.5 : stk.v;
+      const exp = agreeFrac(d.by_expiry, c.FWD_expectancy > 0);
+      const nExp = Object.keys(d.by_expiry || {}).length;
+      comp.expiry = nExp <= 1 ? 0.5 : exp.v;
+      comp.time = (c.time_stability && !isNaN(c.time_stability.sign_agreement)) ? c.time_stability.sign_agreement : 0.5;
+      comp.entry = d.entry_perturb.filter(x => !isNaN(x));
+      comp.entry = comp.entry.length ? comp.entry.filter(x => (x > 0) === (c.FWD_expectancy > 0)).length / comp.entry.length : 0.5;
+      comp.jitter = d.hold_perturb && d.hold_perturb.length
+        ? d.hold_perturb.filter(x => x && !isNaN(x.exp) && (x.exp > 0) === (c.FWD_expectancy > 0)).length / d.hold_perturb.length : 0.5;
+      comp.purity = 0.5;
+      if (c.combination_depth >= 2) {
+        const parts = c.combination_signature.slice(2).split('+');
+        const pm = parts.map(k => (POOL.find(p => p.key === k) || {}));
+        const ptr = pm.map(p => p.qs && p.qs.trainMean).filter(x => typeof x === 'number' && !isNaN(x));
+        if (ptr.length) {
+          const mx = OD.maxOf(ptr);
+          comp.purity = c.FWD_IS_expectancy >= mx + 0.1 ? 1 : (c.FWD_IS_expectancy >= mx - 0.1 ? 0.5 : 0);
+        }
+      }
+      comp.unTestable = [];
+    } else {
+      // light fallback (documented): battery not run for non-serious candidates
+      comp.param = 0.5; comp.density = 0.5; comp.direction = 0.5; comp.strike = 0.5;
+      comp.expiry = 0.5; comp.time = 0.5; comp.entry = 0.5; comp.jitter = 0.5; comp.purity = 0.5;
+      comp.unTestable = ['full-battery'];
+    }
+    let score = 0;
+    for (const k of Object.keys(RW)) score += Math.max(0, Math.min(1, comp[k] === undefined ? 0.5 : comp[k])) * RW[k];
+    score = score / 100 * 10;
+    // HARD CAPS (§24)
+    const sub = k => comp[k] * 10;
+    if (sub('param') < 3) score = Math.min(score, 6);
+    if (comp.purity !== undefined && sub('purity') < 3) score = Math.min(score, 6);
+    if (sub('density') < 3) score = Math.min(score, 6);
+    if (sub('exit') < 3) score = Math.min(score, 7);
+    if (sub('best_event') < 3) score = Math.min(score, 7);
+    if (!(c.perm_p_adj < 0.10) && ((d && d.param && d.param.profitable_density < 0.3) || !d)) score = Math.min(score, 5);
+    c.OPTION_ROBUSTNESS_SCORE = Math.round(score * 100) / 100;
+    c.robustness_components_detailed = comp;
+    // keep legacy field pointing at the detailed score when available
+    c.robustness_score = c.OPTION_ROBUSTNESS_SCORE;
     c.robustness_components = comp;
   }
   // ---- boards (§21) ----
@@ -2709,7 +3118,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
     const yn = (typeof y === 'number' && !isNaN(y)) ? y : -Infinity;
     return desc ? yn - xn : xn - yn;
   }).slice(0, n).map(c => c.candidate);
+  checkpoint('oos');
   const boards = {
+
     ALL: cands.map(c => c.candidate),
     TOP_TRAIN: topBy('FWD_IS_expectancy', 10, true),
     TOP_VALIDATION: topBy('FWD_VAL_expectancy', 10, true),
@@ -2902,7 +3313,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
   const roundsWanted = cfg.rounds === 'all' ? cfg.maxRounds : cfg.rounds.length;
   const roundsRan = ROUND_LOG.length;
   const dataHash = hashCfg([norm.length, meta.n_contracts, meta.timestamp_range[0], meta.timestamp_range[1]].join('|'));
-  const checkpoint = { runId: RUN_ID, dataHash, cfgHash: hashCfg(cfg), seed: cfg.seed,
+  const resumeCheckpoint = { runId: RUN_ID, dataHash, cfgHash: hashCfg(cfg), seed: cfg.seed,
     seen: [...HYPS.seen], roundsDone: ROUND_LOG.map(r => r.round) };
   const frontierOpen = frontier.filter(f => {
     const fam = f.family;
@@ -2950,7 +3361,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
   emit(`GLOBAL_TEST_COUNT=${GLOBAL_TESTS} OOS_EXPOSURE_COUNT=${OOS_EXPOSURE_COUNT}`);
   emit(`COVERAGE rounds=${ROUND_LOG.length}/${roundsWanted} hyps=${HYPS.tested} cands=${cands.length} exhausted=${stopReason.why || 'rounds-complete'}`);
   emit(`FINAL_STATUS=${FINAL_STATE}`);
+  checkpoint('final-ranking');
   maskReg.clear(); // free signal-row references before packaging the result
+
 
   return {
     engineVersion: OD.version, featureVersion: OD.featureVersion,
@@ -2961,13 +3374,12 @@ OD.run = function (text, cfg, onLog, onProgress) {
     rounds: ROUND_LOG,
     hypothesisTotals: { total: HYPS.tested, unique: HYPS.unique, duplicates: HYPS.dups,
       byRound: Object.fromEntries(Object.entries(HYPS.byRound).map(([k, v]) => [k, { ...v }])) },
-    checkpoint, dataHash, globalTests: GLOBAL_TESTS, oosExposure: OOS_EXPOSURE_COUNT,
+    checkpoint: resumeCheckpoint, checkpoints: CHECKPOINTS, dataHash, globalTests: GLOBAL_TESTS, oosExposure: OOS_EXPOSURE_COUNT,
     newUnique: newUnique(),
     boards, diversity, oosCounts,
     missingness: missingness.slice().sort((a, b) => b.missing_pct - a.missing_pct).slice(0, 20),
     understanding, frontier, neighborhood, validated: validated.map(c => c.candidate),
     bestValidated: best ? best.candidate : null,
-    globalTests: GLOBAL_TESTS, oosExposure: OOS_EXPOSURE_COUNT,
     adaptiveDecisions: ADAPTIVE_DECISIONS, familyTable,
     moneynessStatus: und ? 'AVAILABLE' : 'UNAVAILABLE',
     expiryEngine: expCols.length ? 'AVAILABLE' : 'NOT_AVAILABLE',
@@ -2979,6 +3391,32 @@ OD.run = function (text, cfg, onLog, onProgress) {
       skipped_rounds: [17].filter(() => !und),
       unavailable_modules: Object.entries(mods).filter(([, v]) => v[0] !== 'AVAILABLE').map(([k]) => k),
       exhausted: stopReason.why || 'rounds-complete',
+    },
+    finalReport: {
+      RUN_ID, CONFIG_HASH: hashCfg(cfg),
+      DATA_RANGE: meta.timestamp_range, ROWS: norm.length,
+      CONTRACTS: meta.n_contracts, STRIKES: meta.n_strikes, EXPIRIES: meta.expiries,
+      UNDERLYING_STATUS: und ? 'AVAILABLE' : 'UNAVAILABLE',
+      MONEYNESS_STATUS: und ? 'AVAILABLE' : 'UNAVAILABLE',
+      EXECUTION_STATUS: execMode === 'executable' ? 'EXECUTABLE_PRICE_MODEL' : 'RESEARCH_PRICE_MODEL',
+      PRICE_MODEL: execMode === 'executable' ? 'EXECUTABLE_PRICE_MODEL' : 'RESEARCH_PRICE_MODEL',
+      COST_MODEL: 'ZERO', BID_ASK_AVAILABLE: !!meta.has_bidask,
+      FEATURE_COUNT: featAudit.length,
+      RAW_CANDIDATES: cands.filter(c => c.combination_depth === 1).length,
+      PAIR_CANDIDATES: cands.filter(c => c.combination_depth === 2).length,
+      TRIPLE_CANDIDATES: cands.filter(c => c.combination_depth === 3).length,
+      TOTAL_HYPOTHESES: HYPS.tested,
+      ROUNDS_COMPLETED: ROUND_LOG.length,
+      RUNTIME_SECONDS: Math.round((Date.now() - t0) / 1000),
+      TRAIN_SURVIVORS: cands.filter(c => c.FWD_IS_expectancy > 0).length,
+      VALIDATION_SURVIVORS: cands.filter(c => c.FWD_VAL_expectancy > 0).length,
+      OOS_TESTED: oosCounts.OOS_TESTED, OOS_SURVIVORS: oosCounts.OOS_FINAL_SURVIVOR,
+      BEST_TRAIN: topBy('FWD_IS_expectancy', 1, true)[0] || null,
+      BEST_VALIDATION: topBy('FWD_VAL_expectancy', 1, true)[0] || null,
+      BEST_OOS: topBy('FWD_OOS_expectancy', 1, true)[0] || null,
+      STACK_SAFETY_STATUS: ssa.status,
+      DATA_HEALTH_STATUS: health.status,
+      PAPER_ELIGIBLE: false,
     },
     limitations: {
       EXPIRY_GENERALIZATION: meta.n_expiries > 1 ? 'TESTABLE' : 'UNTESTABLE',

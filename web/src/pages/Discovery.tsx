@@ -468,6 +468,26 @@ export default function Discovery() {
                   EXPIRY_GENERALIZATION={res.limitations.EXPIRY_GENERALIZATION} · EXECUTION_GENERALIZATION={res.limitations.EXECUTION_GENERALIZATION} · UNDERLYING_METADATA={res.limitations.UNDERLYING_METADATA}
                 </div>
               )}
+              {res.finalReport && (
+                <div className="mt-2">
+                  <div className="lbl mb-1">FINAL REPORT (§27)</div>
+                  <div className="grid grid-cols-2 md:grid-cols-4 gap-1 text-[11px] num">
+                    {Object.entries(res.finalReport).filter(([k]) => !['BEST_TRAIN', 'BEST_VALIDATION', 'BEST_OOS'].includes(k)).map(([k, v]) => (
+                      <div key={k} className="bg-[#111] border border-zinc-800 rounded px-2 py-1"><span className="text-zinc-500">{k}</span> <span className="text-zinc-200">{fmt(v)}</span></div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {res.checkpoints && res.checkpoints.length > 0 && (
+                <div className="mt-2">
+                  <div className="lbl mb-1">CHECKPOINTS ({res.checkpoints.length})</div>
+                  <div className="text-[11px] num text-zinc-400 flex flex-wrap gap-x-3 gap-y-0.5">
+                    {res.checkpoints.filter((c: any, i: number) => i === 0 || c.stage !== res.checkpoints[i - 1].stage || c.stage === 'round').slice(0, 40).map((c: any, i: number) => (
+                      <span key={i}>{c.stage}{c.round ? `#${c.round}` : ''}@{c.elapsed_seconds}s</span>
+                    ))}
+                  </div>
+                </div>
+              )}
             </section>
           </>
         )}

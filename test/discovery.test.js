@@ -455,3 +455,79 @@ test('ADAPT missingness classes valid; ESS consistent', () => {
     assert.ok(m.effective_sample_size >= 0);
   }
 });
+
+/* 9/10 HARDENING (§29): stack, checkpoints, watchdog, execution, statuses. */
+test('NINE stack safety audit passes; run completes on a small stack', () => {
+  const a = OD.stackSafetyAudit();
+  assert.equal(a.status, 'PASS');
+  assert.equal(a.recursive_paths_found, 0);
+});
+
+test('NINE checkpoints cover all stages with required fields', () => {
+  const cps = ADAPT_RUN.checkpoints;
+  const stages = new Set(cps.map(c => c.stage));
+  for (const s of ['normalized', 'features', 'labels', 'round', 'final-ranking']) {
+    assert.ok(stages.has(s), 'missing stage ' + s);
+  }
+  for (const c of cps) {
+    for (const k of ['run_id', 'config_hash', 'stage', 'candidate_count', 'evaluated_count',
+      'multiple_testing_count', 'timestamp', 'status']) {
+      assert.ok(c[k] !== undefined, 'checkpoint missing ' + k);
+    }
+  }
+});
+
+test('NINE watchdog emits per-round with budget and memory fields', () => {
+  assert.ok(ADAPT_RUN.log.some(l => l.indexOf('ENGINE_WATCHDOG round=') >= 0));
+  assert.ok(ADAPT_RUN.log.some(l => l.indexOf('MAX_MEMORY_MB=') >= 0));
+  assert.ok(ADAPT_RUN.log.some(l => l.indexOf('MAX_EVALUATION_BATCH=') >= 0));
+});
+
+test('NINE execution model separates research and executable prices', () => {
+  const { norm } = OD.ingest(ADAPT_CSV);
+  const rows = OD.features(norm.filter(r => r.symbol !== 'NIFTYSPOT').slice(0, 2000));
+  const bySym = new Map();
+  for (const r of rows) {
+    if (!bySym.has(r.symbol)) bySym.set(r.symbol, []);
+    bySym.get(r.symbol).push(r);
+  }
+  const sig = [];
+  for (const [s, arr] of bySym) for (let i = 0; i < Math.min(15, arr.length); i++) sig.push({ sym: s, i });
+  const ex = OD.backtest(bySym, sig, { cid: 'E', sl: 5, tp: 5, trail: null, mode: 'premium', hold: 5, exec: 'executable' });
+  assert.ok(ex.ledger.length > 0);
+  // LONG executable entry must equal the bar's ask (not the close)
+  const t0 = ex.ledger[0];
+  const bar = bySym.get(t0.contract).find(r => r.ts === t0.entry_time);
+  assert.equal(t0.entry_price, bar.ask);
+  assert.equal(t0.model, 'EXECUTABLE_PRICE_MODEL');
+});
+
+test('NINE underlying ordered attempts; moneyness bands only with reference', () => {
+  assert.ok(ADAPT_RUN.log.some(l => l.indexOf('UNDERLYING_STATUS=AVAILABLE') >= 0));
+  assert.ok(ADAPT_RUN.moneynessStatus === 'AVAILABLE');
+  // without reference: UNAVAILABLE, never fabricated
+  const { norm } = OD.ingest(ADAPT_CSV);
+  const noRef = norm.filter(r => r.symbol !== 'NIFTYSPOT');
+  const meta = OD.detectChain(noRef);
+  const u = OD.understand(noRef, meta);
+  assert.equal(u.reference, null);
+});
+
+test('NINE final status is always a valid state; paper never auto-assigned', () => {
+  const valid = ['VALIDATED_EDGE_FOUND', 'NO_EDGE_FOUND_WITHIN_SEARCH_BUDGET',
+    'SEARCH_BUDGET_EXHAUSTED', 'INSUFFICIENT_DATA', 'ENGINE_ERROR', 'BLOCKED_DATA',
+    'BLOCKED_PARSER', 'BLOCKED_CHAIN', 'BLOCKED_FEATURES', 'BLOCKED_TRUE_LOOKAHEAD',
+    'BLOCKED_AUDIT_MISMATCH', 'BLOCKED_PNL_NAN', 'DISCOVERY_EDGE_OOS_FAILED', 'DISCOVERY_COMPLETED_NO_EDGE'];
+  assert.ok(valid.indexOf(ADAPT_RUN.finalStatus) >= 0);
+  for (const c of ADAPT_RUN.candidates) assert.equal(c.paper_eligible, false);
+  assert.ok(ADAPT_RUN.finalReport && ADAPT_RUN.finalReport.PAPER_ELIGIBLE === false);
+  assert.ok(ADAPT_RUN.finalReport.ROUNDS_COMPLETED > 0);
+});
+
+test('NINE report answers the 14 output questions', () => {
+  const fr = ADAPT_RUN.finalReport;
+  assert.ok(fr.TOTAL_HYPOTHESES > 0 && fr.RAW_CANDIDATES >= 0);
+  assert.ok(fr.TRAIN_SURVIVORS >= 0 && fr.OOS_TESTED >= 0);
+  assert.ok(['EXECUTABLE_PRICE_MODEL', 'RESEARCH_PRICE_MODEL'].indexOf(fr.EXECUTION_STATUS) >= 0);
+  assert.ok(ADAPT_RUN.oosCounts && ADAPT_RUN.oosCounts.OOS_TESTED === ADAPT_RUN.candidates.length);
+});
