@@ -7,7 +7,7 @@ STATE_COUNT = {"n": 0}
 
 def add_atomic_events(df, H=120, type_acc_col="cepe_acc_diff"):
     df = df.copy()
-    g = df.groupby(["strike", "option_type"], group_keys=False)
+    g = df.groupby("symbol", group_keys=False)
     def z(s):
         mu = s.shift(1).rolling(H, min_periods=20).mean()
         sd = s.shift(1).rolling(H, min_periods=20).std()
@@ -48,8 +48,8 @@ def bar_state(r):
     return "flat"
 
 def add_sequences(df, max_len=3):
-    df = df.sort_values(["strike", "option_type", "timestamp"]).copy()
-    g = df.groupby(["strike", "option_type"], group_keys=False)
+    df = df.sort_values(["symbol", "timestamp"]).copy()
+    g = df.groupby("symbol", group_keys=False)
     for k in (1, 2, 3):
         df[f"st_m{k}"] = g["return_1"].transform(lambda s, k=k: s.shift(k).map(bar_state))
     for L in (2, 3):
@@ -79,9 +79,9 @@ def add_states(df, meta=None, type_diff_col="type_ret_diff", buckets=None):
             return pd.qcut(s, 5, labels=["vlow", "low", "mid", "high", "vhigh"], duplicates="drop")
         except Exception:
             return pd.cut(s, 5)
-    df["b_vol_regime"] = df.groupby(["strike", "option_type"])["range_expansion"].transform(
+    df["b_vol_regime"] = df.groupby("symbol")["range_expansion"].transform(
         lambda s: qbin(s.fillna(1)))
-    df["b_vol"] = df.groupby(["strike", "option_type"])["volume_percentile"].transform(
+    df["b_vol"] = df.groupby("symbol")["volume_percentile"].transform(
         lambda s: pd.cut(s.fillna(50), bins=[-1, 25, 50, 75, 95, 101],
                          labels=["low_vol", "midlow", "midhigh", "high_vol", "shock"]))
     df["state_id"] = (df["b_vol_regime"].astype(str) + "/" + df["b_type_dom"].astype(str)

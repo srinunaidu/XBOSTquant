@@ -8,8 +8,8 @@ def _bump(n=1):
     FEATURE_COUNT["n"] += n
 
 def add_raw(df, H=120):
-    df = df.sort_values(["strike", "option_type", "timestamp"]).copy()
-    g = df.groupby(["strike", "option_type"], group_keys=False)
+    df = df.sort_values(["symbol", "timestamp"]).copy()
+    g = df.groupby("symbol", group_keys=False)
     for w in (1, 2, 3, 5, 10, 15):
         df[f"return_{w}"] = g["close"].transform(lambda s, w=w: s.pct_change(w) * 100)
         _bump()
@@ -19,7 +19,7 @@ def add_raw(df, H=120):
     # streaks
     df["consecutive_up_bars"] = 0.0; df["consecutive_down_bars"] = 0.0
     df["same_direction_streak"] = 0.0
-    for _, idx in df.groupby(["strike", "option_type"]).groups.items():
+    for _, idx in df.groupby("symbol").groups.items():
         s = df.loc[idx].sort_values("timestamp")
         r1 = s["return_1"].values
         cu = np.zeros(len(s)); cd = np.zeros(len(s)); cs = np.zeros(len(s))
@@ -42,7 +42,7 @@ def add_raw(df, H=120):
     df["close_location"] = (df["close"] - df["low"]) / rng
     df["body_to_range"] = body.abs() / rng
     _bump(7)
-    g2 = df.groupby(["strike", "option_type"], group_keys=False)
+    g2 = df.groupby("symbol", group_keys=False)
     df["rolling_mean"] = g2["close"].transform(lambda s: s.shift(1).rolling(H, min_periods=20).mean())
     df["rolling_high"] = g2["high"].transform(lambda s: s.shift(1).rolling(H, min_periods=20).max())
     df["rolling_low"] = g2["low"].transform(lambda s: s.shift(1).rolling(H, min_periods=20).min())
@@ -64,7 +64,7 @@ def add_raw(df, H=120):
 
 def add_volume(df, H=120):
     df = df.copy()
-    g = df.groupby(["strike", "option_type"], group_keys=False)
+    g = df.groupby("symbol", group_keys=False)
     df["volume_change"] = g["volume"].transform(lambda s: s.pct_change() * 100)
     mu = g["volume"].transform(lambda s: s.shift(1).rolling(H, min_periods=20).mean())
     sd = g["volume"].transform(lambda s: s.shift(1).rolling(H, min_periods=20).std())
@@ -84,10 +84,10 @@ def add_volume(df, H=120):
 def add_baselines(df):
     """BASELINE ONLY (§5): RSI, BB, VWAP-ref, momentum/ROC, MACD, ATR, MA. Never primary."""
     df = df.copy()
-    g = df.groupby(["strike", "option_type"], group_keys=False)
+    g = df.groupby("symbol", group_keys=False)
     delta = g["close"].transform(lambda s: s.diff())
     gain = delta.clip(lower=0); loss = -delta.clip(upper=0)
-    ag = gain.groupby(df.groupby(["strike", "option_type"]).ngroup()).transform(lambda s: s.rolling(14, min_periods=5).mean())
+    ag = gain.groupby(df.groupby("symbol").ngroup()).transform(lambda s: s.rolling(14, min_periods=5).mean())
     # simpler per-group RSI
     def rsi(s):
         d = s.diff(); u = d.clip(lower=0).rolling(14, min_periods=5).mean()
@@ -101,6 +101,6 @@ def add_baselines(df):
     df["BASELINE_BB_pos"] = (df["close"] - mm) / ss.replace(0, np.nan)
     df["BASELINE_ATR"] = df["atr"] if "atr" in df.columns else np.nan
     cumv = g["volume"].transform(lambda s: s.cumsum())
-    cump = (df["close"] * df["volume"]).groupby(df.groupby(["strike", "option_type"]).ngroup()).cumsum()
+    cump = (df["close"] * df["volume"]).groupby(df.groupby("symbol").ngroup()).cumsum()
     df["BASELINE_VWAP_dev"] = (df["close"] - cump / cumv.replace(0, np.nan)) / df["close"] * 100
     return df

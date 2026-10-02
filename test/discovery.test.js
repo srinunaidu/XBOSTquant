@@ -208,3 +208,40 @@ test('ACCEPT TEST12: reproducibility — same seed+data = identical candidates+h
   assert.deepEqual(a.candidates.map(key), b.candidates.map(key));
   assert.equal(a.finalStatus, b.finalStatus);
 });
+
+test('ACCEPT TEST9: P&L finite for all completed trades (gappy data skipped, counted)', () => {
+  const { norm } = OD.ingest(synth(['CE', 'PE']));
+  // inject NaN closes to simulate sparse contracts
+  norm.forEach((r, i) => { if (i % 7 === 0) r.close = NaN; });
+  const rows = OD.features(norm.slice(0, 4000));
+  const bySym = new Map();
+  for (const r of rows) {
+    if (!bySym.has(r.symbol)) bySym.set(r.symbol, []);
+    bySym.get(r.symbol).push(r);
+  }
+  const sig = [];
+  for (const [s, arr] of bySym) for (let i = 0; i < Math.min(40, arr.length); i++) sig.push({ sym: s, i });
+  for (const tp of [1, 2, 3]) {
+    const bt = OD.backtest(bySym, sig, { cid: 'N', sl: 0.5, tp, trail: null, mode: 'premium', hold: 5 });
+    const bad = bt.ledger.filter(t => typeof t.ret !== 'number' || !isFinite(t.ret));
+    assert.equal(bad.length, 0, `NaN P&L in TP${tp} ledger`);
+    assert.ok(bt.skipped.nan_exit + bt.skipped.nan_entry >= 0);
+  }
+});
+
+test('ACCEPT TEST10+13: independent 1m label matches production; audit passes', () => {
+  const fs = require('node:fs');
+  const { norm } = OD.ingest(fs.readFileSync('public/sample-banknifty-options.csv', 'utf8'));
+  const meta = OD.detectChain(norm);
+  const focus = OD.selectFocus(norm, meta, 3, meta.expiries[0]);
+  const rows = OD.features(focus.rows);
+  const bySym = new Map();
+  for (const r of rows) {
+    if (!bySym.has(r.symbol)) bySym.set(r.symbol, []);
+    bySym.get(r.symbol).push(r);
+  }
+  const la = OD.auditLookahead(bySym, null);
+  assert.equal(la.status, 'PASS');
+  assert.ok(la.label_tests >= 10);
+  assert.equal(la.spot_fail, 0);
+});

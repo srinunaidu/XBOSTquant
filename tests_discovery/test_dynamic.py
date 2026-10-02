@@ -185,3 +185,64 @@ def test_reported_wide_shape_parses_contracts(tmp_path):
     meta = ingestion.detect_chain(norm)
     sub, strikes, chain = ingestion.select_focus(norm, meta, 3)
     assert len(chain) > 0  # FOCUS chain (0) regression
+
+
+def test_symbol_grouping_no_cross_expiry_contamination(tmp_path):
+    """Same strike+otype in two expiries must never share a shift chain."""
+    import pandas as pd
+    from xbost_option_discovery.features import add_raw
+    from xbost_option_discovery.labels import add_labels
+    rows = []
+    base = pd.Timestamp("2026-03-02 09:15")
+    for b in range(100):
+        ts = (base + pd.Timedelta(minutes=b)).strftime("%Y-%m-%d %H:%M:%S")
+        # SEP contract drifts up, OCT contract drifts down — contamination would flip signs
+        rows.append([ts, "E1", 100, "CE", "S1", 100 + b, 101 + b, 99 + b, 100 + b, 50])
+        rows.append([ts, "E2", 100, "CE", "S2", 200 - b, 201 - b, 199 - b, 200 - b, 50])
+    df = pd.DataFrame(rows, columns=["timestamp", "expiry", "strike", "option_type",
+                                     "symbol", "open", "high", "low", "close", "volume"])
+    p = str(tmp_path / "twoexp.csv")
+    df.to_csv(p, index=False)
+    from xbost_option_discovery import ingestion
+    norm, _ = ingestion.load_dataset(p)
+    feat = add_labels(add_raw(norm))
+    s1 = feat[feat["symbol"] == "S1"].sort_values("timestamp").reset_index(drop=True)
+    s2 = feat[feat["symbol"] == "S2"].sort_values("timestamp").reset_index(drop=True)
+    assert (s1["return_1"].dropna() > 0).all()  # pure up drift, no OCT contamination
+    assert (s2["return_1"].dropna() < 0).all()  # pure down drift, no SEP contamination
+    assert (s1["fwd_ret_1m"].dropna() > 0).all()
+    assert (s2["fwd_ret_1m"].dropna() < 0).all()
+
+
+def test_backtest_skips_nan_without_nan_pnl(tmp_path):
+    import pandas as pd
+    import numpy as np
+    from xbost_option_discovery import ingestion
+    from xbost_option_discovery.features import add_raw, add_volume
+    from xbost_option_discovery.labels import add_labels
+    from xbost_option_discovery.backtest import backtest
+    norm, _ = ingestion.load_dataset("Data test/banknifty_options.csv")
+    meta = ingestion.detect_chain(norm)
+    sub, _, _ = ingestion.select_focus(norm.head(6000), meta, 2)
+    feat = add_labels(add_volume(add_raw(sub)))
+    feat.loc[feat.index[::7], "close"] = np.nan  # sparse-contract gaps
+    m = pd.Series(False, index=feat.index)
+    m.iloc[:200] = True
+    led = backtest(feat, m, cid="GAP")
+    rets = pd.to_numeric(led["ret"], errors="coerce")
+    assert rets.notna().all() and np.isfinite(rets).all()
+    assert (led.attrs.get("SKIPPED", {}).get("nan_exit", 0) or 0) > 0 or len(led) > 0
+
+
+def test_lookahead_audit_passes_on_real_sample():
+    from xbost_option_discovery import ingestion, leakage
+    from xbost_option_discovery.chain_normalizer import normalize
+    from xbost_option_discovery.features import add_raw, add_volume
+    from xbost_option_discovery.labels import add_labels
+    norm, _ = ingestion.load_dataset("Data test/banknifty_options.csv")
+    meta = ingestion.detect_chain(norm)
+    sub, _, _ = ingestion.select_focus(norm.head(20000), meta, 3)
+    feat = add_labels(add_volume(add_raw(sub)))
+    r = leakage.audit_lookahead(feat)
+    assert r["status"] == "PASS", r["first_mismatch"]
+    assert r["label_tests"] >= 10

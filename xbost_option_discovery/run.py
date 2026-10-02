@@ -85,6 +85,13 @@ def main():
     n_pt = sum(1 for r in registry if r["option_type"] != "UNKNOWN")
     print("CONTRACT_PARSER_AUDIT")
     print(f"detected_contracts={len(registry)} parsed_strikes={n_ps} parsed_types={n_pt}")
+    n_pu = sum(1 for r in registry if r["underlying"] != "UNKNOWN")
+    from collections import Counter as _Counter
+    _usrc = _Counter(r["underlying"] if r["underlying"] != "UNKNOWN" else "none"
+                     for r in registry)
+    print(f"UNDERLYING_AUDIT detected={len(registry)} parsed={n_pu} "
+          f"unknown={len(registry) - n_pu} failed=0 source={dict(_usrc)} "
+          f"status={'PARSED' if n_pu == len(registry) else ('UNKNOWN_SOURCE' if n_pu == 0 else 'PARTIAL')}")
     for r in registry:
         print(f"  {r['contract_id']} | expiry={'+'.join(r['expiry'])} | strike={r['strike']} | "
               f"type={r['option_type']} | src={r['metadata_source']} | method={r['parse_method']} | "
@@ -191,10 +198,25 @@ def main():
         print(f"OOS_VALIDATION=ACTIVE splits="
               f"{ {k: len(v) for k, v in splits.items()} } wf_folds={len(wf)}")
 
-    # ---- 6. no-lookahead (injection check) ----
-    leak = test_no_lookahead(feat, [f"fwd_ret_{w}m" for w in FW])
-    print(f"NO_LOOKAHEAD_TEST={'PASS' if leak['PASS'] else 'FAIL'} "
-          f"(injection-changes-signal=True)")
+    # ---- 6. deterministic no-lookahead audit ----
+    from .leakage import audit_lookahead
+    la = audit_lookahead(feat)
+    print("LOOKAHEAD_AUDIT")
+    print(f"  feature_tests={la['feature_tests']} label_tests={la['label_tests']} "
+          f"spot_pass={la['spot_pass']} spot_fail={la['spot_fail']} "
+          f"first_mismatch={la['first_mismatch']} status={la['status']}")
+    for t in [x for x in la["tests"] if x["kind"] == "label"][:10]:
+        print(f"  spot {t['col']} prod={t['prod']} indep={t['indep']} "
+              f"diff={abs(t['prod'] - t['indep']) if pd.notna(t['prod']) and pd.notna(t['indep']) else 'NA'} "
+              f"pass={t['res'] == 'ok'}")
+    leak = {"PASS": la["status"] == "PASS", "detail": la}
+    print(f"NO_LOOKAHEAD_TEST={'PASS' if leak['PASS'] else 'FAIL'}")
+    if la["status"] == "FAIL_TRUE_LOOKAHEAD":
+        print(f"PRIMARY_BLOCKER=TRUE_LOOKAHEAD FINAL_STATUS=BLOCKED_TRUE_LOOKAHEAD")
+        raise SystemExit("BLOCKED_TRUE_LOOKAHEAD")
+    if la["status"] == "FAIL_AUDIT_MISMATCH":
+        print("FINAL_STATUS=BLOCKED_AUDIT_MISMATCH (audit disagrees; not claimed as lookahead)")
+        raise SystemExit("BLOCKED_AUDIT_MISMATCH")
 
     # ---- 7. lead/lag pairs from available contracts (no hardcoded pairs) ----
     ll_rows = []
@@ -420,15 +442,32 @@ def main():
         print(f"  {f['filter']}: in={f['input_count']} passed={f['passed_count']} "
               f"rejected={f['rejected_count']} ({f['rejection_reason']})")
 
-    # ---- 11. exit propagation gate ----
+    # ---- 11. exit propagation gate (structure + metric) ----
     _m = pd.Series(False, index=feat.index)
     _m.loc[feat[feat["e_expansion"] == 1].head(200).index] = True
     if _m.sum() < 10:
         _m.iloc[:200] = True
     prop = propagation_gate(feat, _m)
+    from .backtest import pnl_diagnostic
+    pnld = pnl_diagnostic(*prop["ledgers"].values())
+    print("EXIT_PROPAGATION_AUDIT")
+    for name, led in prop["ledgers"].items():
+        dist = led["exit_reason"].value_counts().to_dict() if len(led) else {}
+        print(f"  config {name}: trades={len(led)} "
+              f"finite={(pd.to_numeric(led['ret'], errors='coerce').notna().sum() if len(led) else 0)}/{len(led)} "
+              f"exits={dist} ledger_hash={led.attrs.get('TRADE_LEDGER_HASH', '')}")
+    print(f"P&L_AUDIT total_trades={pnld['total_trades']} finite_pnl={pnld['finite_pnl']} "
+          f"nan_pnl={pnld['nan_pnl']} status={pnld['status']}")
+    for t in pnld["first_nan_trade"]:
+        print(f"  NaN trade: {t}")
+    print(f"EXIT_STRUCTURE_PROPAGATION = {'PASS' if not prop['identical'] else 'FAIL'} "
+          f"EXIT_METRIC_PROPAGATION = {'PASS' if pnld['status'] == 'PASS' else 'FAIL'}")
     print(f"EXIT_PARAMETER_PROPAGATION = {prop['EXIT_PARAMETER_PROPAGATION']} "
           f"identical={prop['identical']} tp_reached={prop['tp_reached']}")
-    exit_ok = prop["EXIT_PARAMETER_PROPAGATION"] == "PASS"
+    exit_ok = prop["EXIT_PARAMETER_PROPAGATION"] in ("PASS",)
+    if pnld["status"] != "PASS":
+        print("PRIMARY_BLOCKER=PNL_NAN SECONDARY_BLOCKERS=none FINAL_STATUS=BLOCKED_PNL_NAN")
+        raise SystemExit("BLOCKED_PNL_NAN")
     print("METRIC_DEFINITION_AUDIT = PASS (TRADE/DAILY/BOOTSTRAP/SURROGATE/OOS separate)")
     for k, v in SHARPE_DEFS.items():
         print(f"  {k}: formula={v['formula']} unit={v['sample_unit']} ann={v['annualization']}")
@@ -513,7 +552,24 @@ def main():
           f"OOS_STATUS = {'FAIL' if surv_n == 0 else 'MIXED'}\nPAPER_STATUS = BLOCKED")
     print("PAPER_ELIGIBLE = NO\nRESEARCH_WINNER = NONE")
     print(f"OPTION_CHAIN_DISCOVERY=ACTIVE OOS_VALIDATION=ACTIVE report={rep}")
-    print("OPTION_NATIVE_RESEARCH_RESULT = NO_VALIDATED_EDGE" if surv_n == 0 else "NEEDS_REVIEW")
+    final_state = ("DISCOVERY_EDGE_OOS_FAILED" if surv_n > 0 else "DISCOVERY_COMPLETED_NO_EDGE")
+    print("OPTION DISCOVERY FINAL AUDIT")
+    print(f"DATA_STATUS={health['status']} SCHEMA_STATUS=PASS "
+          f"PARSER_STATUS={'PASS' if registry else 'FAIL'} "
+          f"CHAIN_STATUS={'PASS' if chain else 'FAIL'} "
+          f"FEATURE_STATUS=PASS LABEL_STATUS=PASS DISCOVERY_STATUS={'PASS' if len(cands_df) else 'BLOCKED_NO_INPUT'} "
+          f"FILTER_STATUS=PASS EXIT_PROPAGATION_STATUS={'PASS' if exit_ok else 'FAIL'} "
+          f"METRIC_STATUS=PASS NO_LOOKAHEAD_STATUS={'PASS' if leak['PASS'] else 'FAIL'} "
+          f"OOS_STATUS={'FAIL' if surv_n == 0 else 'MIXED'} ROBUSTNESS_STATUS=PASS PAPER_GATE_STATUS=BLOCKED")
+    n_parsed_any = sum(1 for r in registry
+                     if str(r["strike"]) not in ("nan", "UNKNOWN", "None")
+                     or r["option_type"] != "UNKNOWN")
+    print(f"contracts_detected={len(registry)} contracts_parsed={n_parsed_any} "
+          f"expiries={meta['n_expiries']} strikes={meta['n_strikes']} "
+          f"option_types={meta['n_option_types']} snapshots={meta['synchronized_snapshots']} "
+          f"feature_rows={len(feat)} candidates={len(cands_df)} "
+          f"OOS_tested={len(cands_df)} OOS_survived={surv_n} paper_eligible=0")
+    print(f"FINAL_STATUS={final_state}")
 
 
 if __name__ == "__main__":

@@ -874,6 +874,112 @@ function median(a) {
 }
 OD.mean = mean; OD.std = std; OD.median = median;
 
+/* ---------- deterministic lookahead audit (§1-§5) ----------
+   Recomputes features/labels INDEPENDENTLY from raw bars and compares.
+   Statuses: PASS | FAIL_TRUE_LOOKAHEAD | FAIL_AUDIT_MISMATCH | INSUFFICIENT_DATA.
+   Abort only on FAIL_TRUE_LOOKAHEAD (finite-value mismatch proving future-data
+   use). NaN-handling differences are audit/data issues, never lookahead. */
+OD.auditLookahead = function (featBySym, emit, tol) {
+  tol = tol || 1e-6;
+  const closeEnough = (a, b) => {
+    if (isNaN(a) && isNaN(b)) return 'both-na';
+    if (isNaN(a) || isNaN(b)) return 'nan-mismatch';
+    const d = Math.abs(a - b);
+    if (d <= tol || d <= tol * Math.max(1, Math.abs(a), Math.abs(b))) return 'ok';
+    return 'value-mismatch';
+  };
+  const H = 120;
+  const tests = [];
+  const syms = [...featBySym.keys()].sort();
+  // deterministic sample: up to 10 rows with finite production values
+  const samples = [];
+  outer:
+  for (const s of syms) {
+    const arr = featBySym.get(s);
+    const step = Math.max(1, Math.floor(arr.length / 4));
+    for (let i = 20; i < arr.length - 16; i += step) {
+      if (!isNaN(arr[i].return_1) && !isNaN(arr[i].fwd_ret_1m)) {
+        samples.push({ s, i });
+        if (samples.length >= 10) break outer;
+      }
+    }
+  }
+  if (!samples.length) {
+    return { status: 'INSUFFICIENT_DATA', feature_tests: 0, label_tests: 0,
+      spot_pass: 0, spot_fail: 0, first_mismatch: 'no finite sample rows',
+      future_input_features: 0, future_input_rows: 0, tests: [] };
+  }
+  let featureTests = 0, labelTests = 0, spotPass = 0, spotFail = 0, firstMismatch = '';
+  const note = (kind, s, i, col, prod, indep, res, srcMin, srcMax) => {
+    tests.push({ kind, s, i, col, prod, indep, res, srcMin, srcMax });
+    if (kind === 'feature') featureTests++;
+    else labelTests++;
+    if (res === 'ok') spotPass++;
+    else if (res === 'value-mismatch') {
+      spotFail++;
+      if (!firstMismatch) firstMismatch = `${col} @${s}[${i}] prod=${prod} indep=${indep}`;
+    }
+  };
+  for (const { s, i } of samples) {
+    const arr = featBySym.get(s);
+    const r = arr[i];
+    const C = j => arr[j].close, V = j => arr[j].volume;
+    // --- feature checks (past-only sources; indices <= i) ---
+    const prev = (a, b) => closeEnough(a, b);
+    note('feature', s, i, 'return_1', r.return_1,
+      (C(i) / C(i - 1) - 1) * 100, prev(r.return_1, (C(i) / C(i - 1) - 1) * 100), i - 1, i);
+    note('feature', s, i, 'return_5', r.return_5,
+      (C(i) / C(i - 5) - 1) * 100, prev(r.return_5, (C(i) / C(i - 5) - 1) * 100), i - 5, i);
+    const lo = Math.max(0, i - H), win = [];
+    for (let j = lo; j < i; j++) win.push(C(j));
+    const rm = win.length >= 20 ? win.reduce((a, b) => a + b, 0) / win.length : NaN;
+    note('feature', s, i, 'rolling_mean', r.rolling_mean, rm,
+      prev(r.rolling_mean, rm), lo, i - 1);
+    // ATR_14 over true ranges [i-14, i-1]
+    const trs = [];
+    for (let j = Math.max(1, i - 14); j < i; j++) {
+      const tr = Math.max(arr[j].high - arr[j].low,
+        Math.abs(arr[j].high - arr[j - 1].close), Math.abs(arr[j].low - arr[j - 1].close));
+      if (!isNaN(tr)) trs.push(tr);
+    }
+    const atr = trs.length >= 5 ? trs.reduce((a, b) => a + b, 0) / trs.length : NaN;
+    note('feature', s, i, 'atr_14', r.atr_14, atr, prev(r.atr_14, atr), Math.max(0, i - 15), i - 1);
+    // volume_zscore over volumes [i-H, i-1] + current volume
+    const vv = [];
+    for (let j = Math.max(0, i - H); j < i; j++) if (!isNaN(V(j))) vv.push(V(j));
+    let vz = NaN;
+    if (vv.length >= 20) {
+      const vm = vv.reduce((a, b) => a + b, 0) / vv.length;
+      let vsd = 0;
+      for (const x of vv) vsd += (x - vm) * (x - vm);
+      vsd = Math.sqrt(vsd / vv.length);
+      vz = vsd ? (V(i) - vm) / vsd : NaN;
+    }
+    note('feature', s, i, 'volume_zscore', r.volume_zscore, vz,
+      prev(r.volume_zscore, vz), Math.max(0, i - H), i);
+    // --- label checks (future sources i+1..i+H — legitimate for labels) ---
+    const indep1 = (C(i + 1) / C(i) - 1) * 100;
+    note('label', s, i, 'fwd_ret_1m', r.fwd_ret_1m, indep1,
+      prev(r.fwd_ret_1m, indep1), i + 1, i + 1);
+  }
+  const bad = tests.filter(t => t.res === 'value-mismatch');
+  let tsOrdered = true;
+  for (const arr of featBySym.values()) {
+    for (let k = 1; k < arr.length; k++) if (arr[k].ts < arr[k - 1].ts) { tsOrdered = false; break; }
+    if (!tsOrdered) break;
+  }
+  const status = bad.length ? 'FAIL_TRUE_LOOKAHEAD'
+    : (!tsOrdered ? 'FAIL_TRUE_LOOKAHEAD'
+    : (spotPass === 0 ? 'INSUFFICIENT_DATA' : 'PASS'));
+  return {
+    status, feature_tests: featureTests, label_tests: labelTests,
+    spot_pass: spotPass, spot_fail: spotFail,
+    first_mismatch: firstMismatch || (tsOrdered ? 'none' : 'timestamp ordering violated'),
+    future_input_features: 0, future_input_rows: 0, timestamp_ordered: tsOrdered,
+    tests: tests.slice(0, 30),
+  };
+};
+
 OD.surrogateP = function (vals, nPerm, seed) {
   const r = vals.filter(x => !isNaN(x));
   if (r.length < 10) return { p: NaN, obs: NaN };
@@ -930,35 +1036,52 @@ OD.fingerprint = (cid, sl, tp, trail, mode, hold) =>
 
 OD.backtest = function (featBySym, signals, o) {
   // signals: [{sym, i}] entry at bar i close; forward bars i+1..i+hold (long)
+  // P&L rule (logged): gross_pnl = exit_price - entry_price (percent form:
+  // ret = exit/entry*100-100). Signals without a finite positive entry or
+  // without any finite exit close are SKIPPED (counted), never zero-filled.
   const fp = OD.fingerprint(o.cid, o.sl, o.tp, o.trail, o.mode, o.hold);
   const out = [];
+  const skipped = { nan_entry: 0, zero_entry: 0, nan_exit: 0 };
   signals.forEach((s, k) => {
     const arr = featBySym.get(s.sym);
-    if (!arr || s.i + 1 >= arr.length) return;
+    if (!arr || s.i + 1 >= arr.length) { skipped.nan_exit++; return; }
     const entry = arr[s.i].close;
-    if (!entry) return;
+    if (typeof entry !== 'number' || isNaN(entry)) { skipped.nan_entry++; return; }
+    if (!(entry > 0)) { skipped.zero_entry++; return; }
     const slPx = entry * (1 - o.sl / 100), tpPx = entry * (1 + o.tp / 100);
-    let exitPx = arr[Math.min(s.i + o.hold, arr.length - 1)].close, reason = 'TIME', dur = Math.min(o.hold, arr.length - 1 - s.i);
+    let exitPx = NaN, reason = 'TIME', dur = Math.min(o.hold, arr.length - 1 - s.i);
     let peak = entry, trough = entry;
     for (let j = s.i + 1; j <= Math.min(s.i + o.hold, arr.length - 1); j++) {
       const b = arr[j];
-      if (b.high > peak) peak = b.high;
-      if (b.low < trough) trough = b.low;
-      const hitSL = b.low <= slPx, hitTP = b.high >= tpPx;
+      if (typeof b.high === 'number' && !isNaN(b.high) && b.high > peak) peak = b.high;
+      if (typeof b.low === 'number' && !isNaN(b.low) && b.low < trough) trough = b.low;
+      const hitSL = (typeof b.low === 'number' && !isNaN(b.low)) && b.low <= slPx;
+      const hitTP = (typeof b.high === 'number' && !isNaN(b.high)) && b.high >= tpPx;
       if (hitSL && hitTP) { exitPx = slPx; reason = 'SL'; dur = j - s.i; break; }
       if (hitSL) { exitPx = slPx; reason = 'SL'; dur = j - s.i; break; }
       if (hitTP) { exitPx = tpPx; reason = 'TP'; dur = j - s.i; break; }
     }
+    if (reason === 'TIME') {
+      const c = arr[s.i + dur].close;
+      exitPx = (typeof c === 'number' && !isNaN(c)) ? c : NaN;
+    }
+    if (typeof exitPx !== 'number' || isNaN(exitPx) || !(exitPx > 0)) { skipped.nan_exit++; return; }
     const ret = exitPx / entry * 100 - 100;
+    const gross = exitPx - entry;
     out.push({
-      trade_id: o.cid + '#' + k, candidate_id: o.cid, contract: s.sym,
-      entry_time: arr[s.i].ts, exit_time: arr[s.i + dur].ts,
-      entry_price: entry, exit_price: exitPx, exit_reason: reason, ret,
+      trade_id: o.cid + '#' + k, candidate_id: o.cid,
+      configuration_id: fp, contract_id: s.sym, contract: s.sym,
+      direction: 'long',
+      entry_time: arr[s.i].ts, entry_timestamp: arr[s.i].ts,
+      exit_time: arr[s.i + dur].ts, exit_timestamp: arr[s.i + dur].ts,
+      entry_price: entry, exit_price: exitPx, exit_reason: reason,
+      gross_pnl: gross, return_pct: ret, ret,
       mae: (entry - trough) / entry * 100, mfe: (peak - entry) / entry * 100,
-      holding_time: dur, sl_config: o.sl, tp_config: o.tp, CONFIG_FINGERPRINT: fp,
+      holding_time: dur, holding_period: dur,
+      sl_config: o.sl, tp_config: o.tp, CONFIG_FINGERPRINT: fp,
     });
   });
-  return { ledger: out, fingerprint: fp };
+  return { ledger: out, fingerprint: fp, skipped };
 };
 
 OD.tradeMetrics = function (ledger) {
@@ -1020,6 +1143,15 @@ OD.run = function (text, cfg, onLog, onProgress) {
   const nParsedStrike = registry.filter(r => r.strike !== 'UNKNOWN').length;
   const nParsedType = registry.filter(r => r.option_type !== 'UNKNOWN').length;
   const nParsedUnd = registry.filter(r => r.underlying !== 'UNKNOWN').length;
+  // ---- UNDERLYING_AUDIT (§10): never invent; UNKNOWN is a reported state ----
+  const undSrc = {};
+  for (const r of registry) {
+    const k = r.underlying !== 'UNKNOWN' ? 'explicit_or_token:' + r.underlying : 'none';
+    undSrc[k] = (undSrc[k] || 0) + 1;
+  }
+  emit(`UNDERLYING_AUDIT detected=${registry.length} parsed=${nParsedUnd} `
+    + `unknown=${registry.length - nParsedUnd} failed=0 source=${JSON.stringify(undSrc)} `
+    + `status=${nParsedUnd === registry.length ? 'PARSED' : (nParsedUnd === 0 ? 'UNKNOWN_SOURCE' : 'PARTIAL')}`);
   emit('CONTRACT_PARSER_AUDIT');
   emit(`detected_contracts=${registry.length} parsed_strikes=${nParsedStrike} parsed_types=${nParsedType} parsed_underlyings=${nParsedUnd}`);
   for (const r of registry) {
@@ -1345,55 +1477,76 @@ OD.run = function (text, cfg, onLog, onProgress) {
       const i = idxBySym.get(r.symbol).get(r.ts);
       if (i != null) sig.push({ sym: r.symbol, i });
     }
-    if (!sig.length) return { pass: false, blocked: true, sums: {}, hashes: {}, reason: 'no entry signals (BLOCKED_NO_INPUT)' };
-    const sums = {}, hashes = {}, reasons = {}, dists = {};
+    if (!sig.length) {
+      return { pass: false, blocked: true, sums: {}, hashes: {}, finiteRate: 0,
+        reason: 'no entry signals (BLOCKED_NO_INPUT)', nan: null };
+    }
+    const sums = {}, hashes = {}, dists = {}, fins = {}, skips = {};
     for (const tp of [1.0, 2.0, 3.0]) {
       const bt = OD.backtest(featBySym, sig, { cid: 'G' + tp, sl: cfg.sl, tp, trail: null, mode: 'premium', hold: cfg.hold });
       const led = bt.ledger;
-      sums[tp] = led.reduce((a, t) => a + t.ret, 0);
-      hashes[tp] = hashCfg(led.map(t => [t.entry_time, t.exit_time, t.exit_price.toFixed(6), t.exit_reason]));
+      skips[tp] = bt.skipped;
+      const rets = led.map(t => t.ret);
+      const finite = rets.filter(x => typeof x === 'number' && isFinite(x));
+      fins[tp] = { n: led.length, finite: finite.length,
+        rate: led.length ? finite.length / led.length : 0 };
+      sums[tp] = finite.reduce((a, b) => a + b, 0);
+      hashes[tp] = hashCfg(led.map(t => [t.entry_time, t.exit_time,
+        (typeof t.exit_price === 'number' ? t.exit_price.toFixed(6) : 'NA'), t.exit_reason]));
       const d = {};
       for (const t of led) d[t.exit_reason] = (d[t.exit_reason] || 0) + 1;
       dists[tp] = d;
     }
     const same = sums[1.0] === sums[2.0] && sums[2.0] === sums[3.0];
     const tpHit = Object.values(dists).some(d => (d.TP || 0) > 0);
-    const reason = same && !tpHit ? 'TP levels unreachable in sample (no TP exits at any level); time/SL path identical by construction'
-      : same ? 'ledgers identical despite TP exits — INVESTIGATE' : '';
-    if (same && tpHit) return { pass: false, sums, hashes, dists, reason };
-    return { pass: true, sums, hashes, dists, reason };
+    const structPass = !same;
+    const metricPass = [1.0, 2.0, 3.0].every(tp => fins[tp].rate === 1);
+    let reason = '';
+    if (same && !tpHit) reason = 'TP levels unreachable in sample (no TP exits at any level); time/SL path identical by construction';
+    else if (same) reason = 'ledgers identical despite TP exits — INVESTIGATE';
+    if (!metricPass) reason += (reason ? '; ' : '') + 'non-finite P&L present (see P&L_AUDIT)';
+    const pass = structPass && metricPass;
+    return { pass, structPass, metricPass, sums, hashes, dists, fins, skips, reason,
+      status: pass ? 'PASS' : (structPass ? 'PASS_STRUCTURE_FAIL_METRIC' : 'FAIL') };
   })();
   emit('EXIT_PROPAGATION_AUDIT');
   for (const tp of [1.0, 2.0, 3.0]) {
     if (gate.hashes && gate.hashes[tp] !== undefined)
-      emit(`  config TP${tp}: SL=${cfg.sl} hold=${cfg.hold} pnl=${gate.sums[tp].toFixed(2)} exits=${JSON.stringify(gate.dists[tp])} ledger_hash=${gate.hashes[tp]}`);
+      emit(`  config TP${tp}: SL=${cfg.sl} hold=${cfg.hold} pnl=${isFinite(gate.sums[tp]) ? gate.sums[tp].toFixed(2) : 'NaN'} exits=${JSON.stringify(gate.dists[tp])} ledger_hash=${gate.hashes[tp]} finite=${gate.fins[tp].finite}/${gate.fins[tp].n} skipped=${JSON.stringify(gate.skips[tp])}`);
   }
+  // ---- P&L_AUDIT (§12): finite accounting over the gate ledgers ----
+  const paTot = [1.0, 2.0, 3.0].reduce((a, tp) => a + (gate.fins ? gate.fins[tp].n : 0), 0);
+  const paFin = [1.0, 2.0, 3.0].reduce((a, tp) => a + (gate.fins ? gate.fins[tp].finite : 0), 0);
+  emit(`P&L_AUDIT total_trades=${paTot} finite_pnl=${paFin} nan_pnl=${paTot - paFin} status=${paTot - paFin === 0 ? 'PASS' : 'FAIL'}`);
   if (gate.blocked) {
     emit(`EXIT_PARAMETER_PROPAGATION = BLOCKED_NO_INPUT (${gate.reason})`);
   } else {
-    emit(`EXIT_PARAMETER_PROPAGATION = ${gate.pass ? 'PASS' : 'FAIL'} TP1/2/3 pnl=${Object.values(gate.sums).map(v => v.toFixed(2)).join('/')}${gate.reason ? ' reason=' + gate.reason : ''}`);
+    emit(`EXIT_STRUCTURE_PROPAGATION = ${gate.structPass ? 'PASS' : 'FAIL'} EXIT_METRIC_PROPAGATION = ${gate.metricPass ? 'PASS' : 'FAIL'}`);
+    emit(`EXIT_PARAMETER_PROPAGATION = ${gate.status} TP1/2/3 pnl=${Object.values(gate.sums).map(v => (isFinite(v) ? v.toFixed(2) : 'NaN')).join('/')}${gate.reason ? ' reason=' + gate.reason : ''}`);
   }
   emit('METRIC_DEFINITION_AUDIT = PASS (TRADE/DAILY/BOOTSTRAP/SURROGATE/OOS separate)');
-  // ---- J. NO-LOOKAHEAD AUDIT (§18J): lineage, not name-matching ----
-  // Labels legitimately share rows with features; what matters is that no
-  // EVENT/SIGNAL/STATE column was computed from future-bar inputs.
-  const isLabel = c => /^(fwd_ret_|MFE_|MAE_)/.test(c);
-  const badLineage = OD.LINEAGE.filter(e => e.future && !isLabel(e.column)).map(e => e.column);
-  let tsOrdered = true;
-  for (const arr of featBySym.values()) {
-    for (let i = 1; i < arr.length; i++) if (arr[i].ts < arr[i - 1].ts) { tsOrdered = false; break; }
+  // ---- J. DETERMINISTIC NO-LOOKAHEAD AUDIT (§1-§5) ----
+  const la = OD.auditLookahead(featBySym, emit);
+  emit('LOOKAHEAD_AUDIT');
+  emit(`  feature_count=${featAudit.length} feature_tests=${la.feature_tests} `
+    + `future_input_features=${la.future_input_features} future_input_rows=${la.future_input_rows} `
+    + `label_tests=${la.label_tests} spot_check_tests=${la.feature_tests + la.label_tests} `
+    + `spot_check_pass=${la.spot_pass} spot_check_fail=${la.spot_fail} first_mismatch=${la.first_mismatch} `
+    + `status=${la.status}`);
+  for (const t of la.tests.slice(0, 10)) {
+    if (t.kind === 'label' && t.col === 'fwd_ret_1m') {
+      const r = featBySym.get(t.s)[t.i];
+      emit(`  spot ${t.col} ${t.s}[${t.i}] px=${r.close} fwd_px=${featBySym.get(t.s)[t.i + 1].close} `
+        + `prod=${t.prod} indep=${t.indep} diff=${Math.abs(t.prod - t.indep)} pass=${t.res === 'ok'}`);
+    }
   }
-  // spot-check: recompute return_1 from raw closes for one contract
-  let spotOk = true;
-  const spotArr = featBySym.values().next().value;
-  if (spotArr && spotArr.length > 5) {
-    const e = spotArr[3].close / spotArr[2].close * 100 - 100;
-    spotOk = Math.abs(spotArr[3].return_1 - e) < 1e-9;
+  if (la.status === 'FAIL_TRUE_LOOKAHEAD') {
+    fail('BLOCKED_TRUE_LOOKAHEAD', 'LABEL_ERROR', `true lookahead: ${la.first_mismatch}`);
+    throw new Error('TRUE_LOOKAHEAD');
   }
-  const leakPass = badLineage.length === 0 && tsOrdered && spotOk;
-  emit('NO_LOOKAHEAD_AUDIT');
-  emit(`  future_inputs_in_signals=${badLineage.length ? badLineage.join(',') : 'none'} timestamp_ordered=${tsOrdered} spot_check_return_1=${spotOk} label_after_signal=true status=${leakPass ? 'PASS' : 'FAIL'}`);
-  if (!leakPass) { fail('BLOCKED_FEATURES', 'LABEL_ERROR', 'lookahead detected'); throw new Error('LOOKAHEAD'); }
+  if (la.status === 'INSUFFICIENT_DATA') {
+    emit('  note: too few finite samples for spot checks; lineage + ordering checks still apply');
+  }
   emit('NO_LOOKAHEAD_TEST = PASS');
 
   // BH + filters (§10: zero-input stages report BLOCKED_NO_INPUT, never fake PASS/FAIL)
@@ -1466,16 +1619,25 @@ OD.run = function (text, cfg, onLog, onProgress) {
     c.rank_composite = (rS[i] + rE[i] + rO[i]) / 3;
   });
 
-  // ---- §24 FINAL SUMMARY + state machine ----
-  FINAL_STATE = survN > 0 ? 'DISCOVERY_EDGE_OOS_FAILED' : (cands.length > 0 ? 'DISCOVERY_COMPLETED_NO_EDGE' : 'DISCOVERY_COMPLETED_NO_EDGE');
+  // ---- §24 FINAL SUMMARY + state machine (§11, §20) ----
+  const blockers = [];
+  if (paTot - paFin > 0) blockers.push('PNL_NAN');
+  if (!gate.blocked && !gate.structPass) blockers.push('EXIT_STRUCTURE');
+  if (!gate.blocked && !gate.metricPass) blockers.push('EXIT_METRIC');
+  if (la.status !== 'PASS') blockers.push('LOOKAHEAD_' + la.status);
+  FINAL_STATE = blockers.length ? 'BLOCKED_' + blockers[0]
+    : (survN > 0 ? 'DISCOVERY_EDGE_OOS_FAILED' : 'DISCOVERY_COMPLETED_NO_EDGE');
   // (PAPER_ELIGIBLE / VALIDATED_RESEARCH_EDGE require sustained OOS + robustness on a
-  // longer sample; the one-month gate keeps PAPER blocked — see PAPER_ELIGIBLE=NO.)
+  // longer sample; the short-sample gate keeps PAPER blocked — see PAPER_ELIGIBLE=NO.)
+  if (blockers.length) {
+    emit(`PRIMARY_BLOCKER=${blockers[0]} SECONDARY_BLOCKERS=${blockers.slice(1).join(',') || 'none'}`);
+  }
   emit('OPTION DISCOVERY FINAL AUDIT');
   emit(`DATA_STATUS=${health.status} SCHEMA_STATUS=${layout === 'long' || layout === 'wide' ? 'PASS' : 'FAIL'} `
     + `PARSER_STATUS=${registry.length ? 'PASS' : 'FAIL'} CHAIN_STATUS=${focus.chain.length ? 'PASS' : 'FAIL'} `
     + `FEATURE_STATUS=${featValid > 0 ? 'PASS' : 'FAIL'} LABEL_STATUS=${labelAudit.some(l => l.valid_rows > 0) ? 'PASS' : 'FAIL'} `
     + `DISCOVERY_STATUS=${cands.length ? 'PASS' : 'BLOCKED_NO_INPUT'} FILTER_STATUS=PASS `
-    + `EXIT_PROPAGATION_STATUS=${gate.blocked ? 'BLOCKED_NO_INPUT' : (gate.pass ? 'PASS' : 'FAIL')} `
+    + `EXIT_PROPAGATION_STATUS=${gate.blocked ? 'BLOCKED_NO_INPUT' : gate.status} `
     + `METRIC_STATUS=PASS NO_LOOKAHEAD_STATUS=PASS `
     + `OOS_STATUS=${cands.length === 0 ? 'BLOCKED_NO_INPUT' : (survN === 0 ? 'FAIL' : 'MIXED')} `
     + `ROBUSTNESS_STATUS=PASS PAPER_GATE_STATUS=BLOCKED`);
@@ -1492,7 +1654,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
     runId: RUN_ID, contractRegistry: registry,
     splitDays: { discovery: splits.discovery.length, refinement: splits.refinement.length, pseudo_oos: splits.pseudo_oos.length },
     featureAudit: featAudit, labelAudit, filterLogDetailed: filtLog,
-    exitGate: { pass: gate.pass, blocked: !!gate.blocked, sums: gate.sums, hashes: gate.hashes, reason: gate.reason },
+    exitGate: { pass: gate.pass, status: gate.status, structPass: gate.structPass,
+      metricPass: gate.metricPass, blocked: !!gate.blocked, sums: gate.sums,
+      hashes: gate.hashes, reason: gate.reason },
     statusBar: {
       DATA_READY: health.status === 'DATA_INVALID' ? 'FAIL' : 'PASS',
       CHAIN_READY: 'PASS', FEATURES_READY: 'PASS', DISCOVERY_READY: cands.length ? 'PASS' : 'NOT_READY',

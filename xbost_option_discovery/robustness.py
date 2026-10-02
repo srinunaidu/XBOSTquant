@@ -49,8 +49,8 @@ def time_split(feat, mask, col="timestamp", n_windows=4):
 
 def entry_perturbation(feat, mask, shift=1):
     # shift entry by +-1 bar within same contract; report stability
-    f2 = feat.sort_values(["strike", "option_type", "timestamp"]).copy()
-    f2["ret_shifted"] = f2.groupby(["strike", "option_type"])["fwd_ret_5m"].shift(shift)
+    f2 = feat.sort_values(["symbol", "timestamp"]).copy()
+    f2["ret_shifted"] = f2.groupby("symbol")["fwd_ret_5m"].shift(shift)
     v0 = feat.loc[mask, "fwd_ret_5m"].dropna()
     v1 = f2.loc[mask, "ret_shifted"].dropna()
     return {"base": float(v0.mean()) if len(v0) else 0.0,
