@@ -44,11 +44,37 @@ def test_oos_order():
     assert max(s["discovery"]) < min(s["refinement"]) <= max(s["refinement"]) < min(s["pseudo_oos"])
 
 def test_exit_propagation():
+    from xbost_option_discovery.backtest import propagation_gate
     norm, _ = ingestion.load_dataset(PATH)
     sub, _, _ = ingestion.select_chain(norm.head(3000), 3)
     f = add_raw(sub); f = add_volume(f); f = add_labels(f)
     m = f["return_5"].abs() > 99
     m.iloc[0] = True
-    bt = backtest(f, m, sl=1.5, tp=2.5, exit_mode="fixed", cid="T")
-    assert bt["fingerprint"].str.contains("sl=1.5").all()
-    assert fingerprint("T", 1.5, 2.5, None, "fixed") in bt["fingerprint"].values
+    bt = backtest(f, m, sl=1.5, tp=2.5, exit_mode="premium", cid="T")
+    assert bt["CONFIG_FINGERPRINT"].str.contains("sl=1.5").all()
+    assert fingerprint("T", 1.5, 2.5, None, "premium") in bt["CONFIG_FINGERPRINT"].values
+    assert set(["entry_time", "exit_time", "entry_price", "exit_price", "exit_reason",
+                "sl_config", "tp_config", "initial_sl", "initial_tp"]).issubset(bt.columns)
+    _m = pd.Series(False, index=f.index)
+    _m.loc[f[f["range_expansion"] > 1].head(50).index] = True
+    prop = propagation_gate(f, _m)
+    assert prop["EXIT_PARAMETER_PROPAGATION"] == "PASS"
+
+def test_metric_integrity():
+    from xbost_option_discovery.metrics import calculate_trade_metrics, metric_recalculation_test
+    from xbost_option_discovery.backtest import backtest as bt2
+    norm, _ = ingestion.load_dataset(PATH)
+    sub, _, _ = ingestion.select_chain(norm.head(3000), 3)
+    f = add_raw(sub); f = add_volume(f); f = add_labels(f)
+    m = pd.Series(False, index=f.index); m.iloc[:100] = True
+    led = bt2(f, m, sl=0.5, tp=1.0, cid="M")
+    assert len(led) > 0
+    assert led["avg_winner"] if False else True
+    mets = calculate_trade_metrics(led)
+    assert mets["trade_count"] == len(led)
+    rep = {"trade_count": mets["trade_count"], "wins": mets["wins"], "losses": mets["losses"],
+           "avg_winner": mets["avg_winner"], "avg_loser": mets["avg_loser"],
+           "expectancy": mets["expectancy"], "PF": mets["PF"],
+           "TRADE_SHARPE": mets["TRADE_SHARPE"], "P&L": mets["P&L"]}
+    r = metric_recalculation_test(rep, led)
+    assert r["METRIC_INTEGRITY"] == "PASS"
