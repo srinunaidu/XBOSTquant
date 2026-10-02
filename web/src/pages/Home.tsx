@@ -94,6 +94,20 @@ export default function Home() {
         {/* tiles */}
         <div className="w-full grid grid-cols-1 md:grid-cols-2 gap-4">
           <TileCard
+            icon="🔬"
+            title="Option Discovery"
+            subtitle="Option-native research (no futures signals)"
+            description="Independent discovery pipeline: dynamic chain detection, event/relationship/lead-lag mining, chronological OOS, robustness 0–10, paper gate."
+            stats={[
+              { label: 'Input', value: 'Options only' },
+              { label: 'OOS', value: 'Strict' },
+              { label: 'Paper', value: 'Gated' },
+            ]}
+            ready={true}
+            status="Independent research tab — loads exported discovery bundles"
+            onClick={() => navigate('#/discovery')}
+          />
+          <TileCard
             icon="📈"
             title="Futures Terminal"
             subtitle="Nifty / BankNifty / Stock Futures"

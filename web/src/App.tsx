@@ -9,6 +9,7 @@ import ErrorBoundary from './components/ErrorBoundary';
 import Login from './pages/Login';
 import Users from './pages/Users';
 import Home from './pages/Home';
+import Discovery from './pages/Discovery';
 
 function route() {
   return location.hash.replace(/^#\/?/, '');
@@ -52,6 +53,7 @@ export default function App() {
   };
 
   if (!isTerminal) {
+    if (r === 'discovery') return <Discovery />;
     return <Home />;
   }
 

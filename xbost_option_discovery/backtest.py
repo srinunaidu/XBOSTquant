@@ -71,17 +71,30 @@ def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="pre
         ret = (exit_px / entry * 100 - 100) if direction == "long" else (entry / exit_px * 100 - 100)
         mae = (entry - trough) / entry * 100 if direction == "long" else (peak - entry) / entry * 100
         mfe = (peak - entry) / entry * 100 if direction == "long" else (entry - trough) / entry * 100
-        rows.append({"candidate_id": cid, "entry_time": entry_t,
-                     "exit_time": window.index[dur - 1], "entry_price": entry,
-                     "exit_price": exit_px, "exit_reason": reason, "ret": ret,
+        rows.append({"trade_id": f"{cid}#{len(rows)}",
+                     "event_id": len(rows), "cluster_id": -1,
+                     "candidate_id": cid,
+                     "contract": f"{sig.get('strike')}_{sig.get('option_type')}",
+                     "expiry": sig.get("expiry", "UNKNOWN"),
+                     "strike": sig.get("strike"), "option_type": sig.get("option_type"),
+                     "direction": direction,
+                     "entry_time": entry_t, "entry_timestamp": entry_t,
+                     "exit_time": window.index[dur - 1], "exit_timestamp": window.index[dur - 1],
+                     "entry_price": entry, "exit_price": exit_px, "exit_reason": reason,
+                     "ret": ret, "gross_pnl": ret, "cost": 0.0, "net_pnl": ret,
                      "mae": mae, "mfe": mfe, "duration_bars": dur,
+                     "holding_time": dur,
                      "sl_config": sl, "tp_config": tp, "trail_config": trail,
                      "exit_model": exit_mode, "initial_sl": sl_px, "initial_tp": tp_px,
                      "CONFIG_FINGERPRINT": fp, "model": "RESEARCH_PRICE_MODEL"})
+    from .ledger import ledger_hash, exit_config_hash
     ledger = pd.DataFrame(rows)
     if verify and len(ledger):
         assert (ledger["CONFIG_FINGERPRINT"] == fp).all(), "fingerprint did not reach ledger"
         assert set(["sl_config", "tp_config", "exit_reason", "ret"]).issubset(ledger.columns)
+    if len(ledger):
+        ledger.attrs["TRADE_LEDGER_HASH"] = ledger_hash(ledger)
+        ledger.attrs["EXIT_CONFIG_HASH"] = exit_config_hash(sl, tp, trail, exit_mode, hold_bars)
     return ledger
 
 def propagation_gate(feat, mask, sl=0.5, hold_bars=5):

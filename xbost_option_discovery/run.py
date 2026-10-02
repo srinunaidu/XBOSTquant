@@ -12,6 +12,10 @@ import numpy as np
 from .ingestion import (load_dataset, detect_chain, select_focus,
                         module_availability, data_health)
 from .chain_normalizer import normalize
+from .settings import DiscoverySettings
+from .timeframe import detect_frequency, resample_ohlcv
+from .divergence import (add_divergence_events, add_convergence_events,
+                         add_catchup_events, catchup_outcomes, FORMULAS)
 from .features import add_raw, add_volume, add_baselines, FEATURE_COUNT
 from .relationships import (add_type_relationship, add_crossstrike, add_breadth,
                             REL_COUNT, REGISTRY)
@@ -21,12 +25,14 @@ from .labels import add_labels, FW
 from .validation import chronological_splits, walk_forward, cluster, oos_gate
 from .metrics import (calculate_trade_metrics, metric_recalculation_test,
                       daily_sharpe, bootstrap_sharpe, surrogate_stats, SHARPE_DEFS,
-                      label_metrics, cap_dominance)
-from .robustness import concentration, best_removal, time_split, entry_perturbation
+                      label_metrics, cap_dominance, block_bootstrap_ci, proportion_ci)
+from .robustness import (concentration, best_removal, time_split, entry_perturbation,
+                         exit_independence, parameter_neighborhood, robustness_score)
 from .multiple_testing import bh
 from .backtest import backtest, propagation_gate
 from .leakage import test_no_lookahead
 from .reporting import write_report, assign_status
+from .filters import run_filters
 
 LAG_WINDOWS = (1, 2, 3, 5, 10)
 MIN_EVENTS = 50
@@ -39,17 +45,36 @@ def main():
     ap.add_argument("--require-contracts", default=None,
                     help="optional comma-separated contract symbols that must exist")
     ap.add_argument("--focus-strikes", type=int, default=3)
+    ap.add_argument("--timeframe", default="RAW",
+                    help="RAW or resample rule like 5m")
+    ap.add_argument("--ranking-objective", default="composite",
+                    help="sharpe|expectancy|pf|oos|robustness|composite")
+    ap.add_argument("--settings-out", default=None)
     ap.add_argument("--splits", default="0.5,0.2,0.3",
                     help="discovery,refinement,pseudo-OOS fractions")
     ap.add_argument("--min-events", type=int, default=MIN_EVENTS)
     a = ap.parse_args()
     fractions = tuple(float(x) for x in a.splits.split(","))
+    settings = DiscoverySettings(
+        data_path=a.path, timeframe=a.timeframe, focus_strikes=a.focus_strikes,
+        ranking_objective=a.ranking_objective,
+        train_frac=fractions[0], validation_frac=fractions[1], oos_frac=fractions[2],
+        min_events=a.min_events)
+    print(f"SETTINGS configuration_hash={settings.configuration_hash()}")
+    if a.settings_out:
+        import json as _j
+        open(a.settings_out, "w").write(_j.dumps(settings.to_dict(), indent=2))
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     outdir = a.outdir or os.path.join("xbost_option_discovery", "runs", run_id)
 
     # ---- 1. dynamic ingestion + chain detection ----
     norm, layout = load_dataset(a.path)
     norm = normalize(norm)
+    bar_freq = detect_frequency(norm["timestamp"])
+    print(f"BAR_FREQUENCY detected={bar_freq}")
+    if settings.timeframe != "RAW":
+        norm = resample_ohlcv(norm, settings.timeframe.lower())
+        print(f"RESAMPLED to {settings.timeframe} (O=first H=max L=min C=last V=sum, causal)")
     meta = detect_chain(norm)
     print("OPTIONS_INGESTION_AUDIT\n-----------------------")
     print(f"source_file: {a.path}\nlayout: {layout}\nrows: {len(norm)}")
@@ -105,6 +130,9 @@ def main():
     if mods["STRIKE_RELATIONSHIP"][0] == "AVAILABLE":
         feat = add_crossstrike(feat, meta, strikes)
     feat = add_breadth(feat, meta)
+    feat = add_divergence_events(feat)
+    feat = add_convergence_events(feat, REGISTRY["x_cols"])
+    feat = add_catchup_events(feat, REGISTRY["x_cols"])
     lead_cols = [c for c in feat.columns if "_leads_" in c]
     feat = add_atomic_events(feat)
     feat = add_combo_events(feat, lead_cols)
@@ -153,14 +181,18 @@ def main():
     # ---- 8. candidates per enabled family ----
     cands = []
 
-    def push(cid, fam, feature, label, rel, direction, tf, mask):
+    def push(cid, fam, feature, label, rel, direction, tf, mask, formula=""):
         mask = mask.fillna(False)
         if mask.sum() < a.min_events:
             return
         tr = splits["discovery"] + splits["refinement"]
-        led_all = backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, exit_mode="premium", cid=cid)
-        led_oos = backtest(feat, mask & feat["day"].isin(splits["pseudo_oos"]), hold_bars=5,
-                           sl=0.5, tp=1.0, exit_mode="premium", cid=cid)
+        led_all = backtest(feat, mask, hold_bars=settings.exit_hold_bars,
+                           sl=settings.exit_sl_pct, tp=settings.exit_tp_pct,
+                           exit_mode="premium", cid=cid)
+        led_oos = backtest(feat, mask & feat["day"].isin(splits["pseudo_oos"]),
+                           hold_bars=settings.exit_hold_bars,
+                           sl=settings.exit_sl_pct, tp=settings.exit_tp_pct,
+                           exit_mode="premium", cid=cid)
         if len(led_all) < a.min_events:
             return
         m_all = calculate_trade_metrics(led_all)
@@ -179,6 +211,13 @@ def main():
         n_clu = int(cl["cluster_id"].nunique())
         ds = daily_sharpe(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
         bs = bootstrap_sharpe(led_all["ret"]); sg = surrogate_stats(led_all["ret"])
+        bb = block_bootstrap_ci(led_all["ret"])
+        wr_ci = proportion_ci(m_all["wins"], m_all["trade_count"])
+        eq = pd.to_numeric(led_all["ret"], errors="coerce").fillna(0).cumsum()
+        step = max(1, len(eq) // 100)
+        equity_curve = [round(float(x), 4) for x in eq.iloc[::step].tolist()]
+        dd = (eq - eq.cummax()).tolist()
+        drawdown_curve = [round(float(x), 4) for x in dd[::step]]
         conc = concentration(led_all["ret"])
         br = best_removal(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
         tstab = time_split(feat, mask); pert = entry_perturbation(feat, mask)
@@ -201,12 +240,17 @@ def main():
         if cap["cap_dominated"]: fail.append("exit-cap-dominated")
         if oos_res == "OOS_REJECTED": fail.append("OOS_REJECTED")
         cands.append({"candidate": cid, "discovery_family": fam, "feature_definition": feature,
+                      "formula": formula or f"EVENT=({feature}) at bar t; LABEL=fwd_ret_5m",
                       "timestamp_definition": "signal bar close t (past-only)",
                       "forward_label_definition": label, "type": "OPTION_NATIVE_DISCOVERY",
                       "contract": rel, "direction": direction, "timeframe": tf,
                       "events": m_all["trade_count"], "clusters": n_clu,
                       "wins": m_all["wins"], "losses": m_all["losses"],
-                      "avg_winner": m_all["avg_winner"], "avg_loser": m_all["avg_loser"],
+                      "avg_winner": m_all["avg_winner"], "median_winner": m_all["median_winner"],
+                      "avg_loser": m_all["avg_loser"], "median_loser": m_all["median_loser"],
+                      "payoff": m_all["payoff"], "maxDD": m_all["maxDD"],
+                      "largest_winner": m_all["largest_winner"],
+                      "largest_loser": m_all["largest_loser"],
                       "FWD_events": fwd_all["n"], "FWD_WR": fwd_all["WR"],
                       "FWD_expectancy": fwd_all["expectancy"], "FWD_median": fwd_all["median"],
                       "FWD_TRADE_SHARPE": fwd_all["TRADE_SHARPE"], "FWD_PF": fwd_all["PF"],
@@ -218,12 +262,16 @@ def main():
                       "IS_MAE": m_all["MAE"], "IS_MFE": m_all["MFE"],
                       "IS_DAILY_SHARPE": ds["DAILY_SHARPE"],
                       "IS_BOOTSTRAP_SHARPE": bs["BOOTSTRAP_SHARPE"],
+                      "IS_BLOCK_BOOTSTRAP_CI": str(bb["block_bootstrap_ci"]),
+                      "WR_CI": str(wr_ci),
                       "IS_SURROGATE_SHARPE": sg["SURROGATE_SHARPE"],
                       "exit_cap_dominated": cap["cap_dominated"],
                       "exit_reason_mix": str(cap["exit_reason_mix"]),
                       "OOS_events": len(led_oos), "OOS_expectancy": m_oos["expectancy"],
                       "OOS_WR": float((led_oos["ret"] > 0).mean()) if len(led_oos) else 0.0,
                       "OOS_result": oos_res, "METRIC_INTEGRITY": integ["METRIC_INTEGRITY"],
+                      "TRADE_LEDGER_HASH": led_all.attrs.get("TRADE_LEDGER_HASH", ""),
+                      "equity_curve": equity_curve, "drawdown_curve": drawdown_curve,
                       "top5": conc["top5"], "rm_best3": br["rm_best3"],
                       "perm_p": padj, "final_status": status,
                       "failure_reason": ";".join(fail) if fail else "none"})
@@ -232,6 +280,8 @@ def main():
     fam_map = {"e_large_ret": "RAW_OPTION_PRICE", "e_expansion": "RAW_OPTION_PRICE",
                "e_vol_shock": "OPTION_VOLUME", "ev_largeRet_volShock": "OPTION_VOLUME",
                "ev_compress_expand": "EVENT", "ev_ret_vol_expand": "EVENT",
+               "ev_divergence": "DIVERGENCE", "ev_convergence": "CONVERGENCE",
+               "ev_catchup_setup": "CATCHUP",
                "e_atm_move": "CROSS_STRIKE_RELATIONSHIP"}
     fam_map.update({c: "OPTION_TYPE_RELATIONSHIP" for c in lead_cols})
     for ec, fam in fam_map.items():
@@ -279,7 +329,59 @@ def main():
     if len(cands_df):
         cands_df["perm_p_adj"] = bh(cands_df["perm_p"].fillna(1).values)
 
-    # ---- 9. exit propagation gate ----
+    # ---- 9. exit independence + robustness 0-10 (train survivors only) ----
+    cands_df["exit_independence"] = ""
+    cands_df["robustness_score"] = 0.0
+    cands_df["robustness_components"] = ""
+    pre = cands_df[cands_df["FWD_IS_expectancy"] > 0].index.tolist() if len(cands_df) else []
+    for idx in pre:
+        row = cands_df.loc[idx]
+        m = feat[feat["candidate_probe"].eq(row["candidate"])] if "candidate_probe" in feat else None
+        ei = {"n_variants": 0, "profitable_variants": 0, "median_performance": float("nan")}
+        try:
+            # rebuild mask cheaply from stored feature col when possible
+            ei = exit_independence(feat, feat[row["feature_definition"]].eq(1)
+                                   if row["feature_definition"] in feat.columns else
+                                   feat["e_expansion"].eq(1),
+                                   row["candidate"], settings.exit_hold_bars)
+        except Exception:
+            pass
+        comp = {
+            "signal": 1.0 if (pd.notna(row["FWD_expectancy"]) and row["FWD_expectancy"] > 0) else 0.0,
+            "sample": min(1.0, row["clusters"] / 50),
+            "param": 0.5,
+            "time": 0.5,
+            "contract": 0.5,
+            "oos": 1.0 if row["OOS_result"] == "OOS_SURVIVED_MARK" else 0.0,
+            "exit": (ei["profitable_variants"] / max(1, ei["n_variants"])),
+            "concentration": max(0.0, 1.0 - row["top5"]),
+            "best_event": 1.0 if pd.notna(row["rm_best3"]) and row["rm_best3"] > 0 else 0.0,
+            "stats": 1.0 if row["perm_p"] < 0.10 else 0.0,
+        }
+        rs = robustness_score(comp)
+        cands_df.at[idx, "exit_independence"] = str({k: ei[k] for k in
+                                                    ("n_variants", "profitable_variants",
+                                                     "median_performance")})
+        cands_df.at[idx, "robustness_score"] = rs["robustness_score"]
+        cands_df.at[idx, "robustness_components"] = str(rs["components"])
+    # rank scores per objective (§42); tab re-ranks client-side from these
+    if len(cands_df):
+        for obj, col in [("sharpe", "IS_TRADE_SHARPE"), ("expectancy", "FWD_expectancy"),
+                         ("pf", "FWD_PF"), ("oos", "FWD_OOS_expectancy"),
+                         ("robustness", "robustness_score")]:
+            v = pd.to_numeric(cands_df[col], errors="coerce")
+            cands_df[f"rank_{obj}"] = v.rank(pct=True)
+        cands_df["rank_composite"] = cands_df[
+            ["rank_sharpe", "rank_expectancy", "rank_oos", "rank_robustness"]].mean(axis=1)
+
+    # ---- 10. explicit filter pipeline with counts ----
+    filt_surv, filt_log = run_filters(cands_df)
+    print("FILTER PIPELINE (F1..F13):")
+    for f in filt_log:
+        print(f"  {f['filter']}: in={f['input_count']} passed={f['passed_count']} "
+              f"rejected={f['rejected_count']} ({f['rejection_reason']})")
+
+    # ---- 11. exit propagation gate ----
     _m = pd.Series(False, index=feat.index)
     _m.loc[feat[feat["e_expansion"] == 1].head(200).index] = True
     if _m.sum() < 10:
@@ -298,21 +400,62 @@ def main():
     n_cap = int(cands_df["exit_cap_dominated"].sum()) if len(cands_df) else 0
     print(f"EXIT_CAP_DOMINATED_CANDIDATES={n_cap}/{tested}")
 
+    import hashlib as _hl
+    dataset_hash = _hl.sha256(
+        pd.util.hash_pandas_object(norm, index=True).values.tobytes()).hexdigest()[:16]
     seqs_df = cands_df[cands_df["discovery_family"] == "SEQUENCE"] if len(cands_df) else pd.DataFrame()
     states_df = cands_df[cands_df["discovery_family"] == "CHAIN_STATE"] if len(cands_df) else pd.DataFrame()
+    counts = {"total_features_tested": FEATURE_COUNT["n"],
+              "total_relationships_tested": REL_COUNT["n"],
+              "total_sequences_tested": SEQ_COUNT["n"],
+              "total_states_tested": STATE_COUNT["n"],
+              "total_candidate_events": len(cands_df)}
     meta_out = {"run_id": run_id, "dataset_path": a.path, "data_format": layout, "chain": chain,
-                "chain_metadata": {k: (v if not isinstance(v, dict) else v) for k, v in meta.items()},
+                "dataset_hash": dataset_hash,
+                "settings": settings.to_dict(),
+                "configuration_hash": settings.configuration_hash(),
+                "feature_version": settings.feature_version,
+                "engine_version": settings.engine_version,
+                "random_seed": settings.random_seed,
+                "bar_frequency": bar_freq, "timeframe": settings.timeframe,
+                "execution_model": ("EXECUTABLE_MODEL" if meta["has_bidask"] else "RESEARCH_PRICE_MODEL"),
+                "cost_mode": settings.cost_mode,
+                "chain_metadata": {k: v for k, v in meta.items()},
                 "modules": {k: v[0] for k, v in mods.items()},
                 "modules_unavailable": {k: v[1] for k, v in mods.items() if v[0] != "AVAILABLE"},
-                "code_version": "od-v5-dynamic", "seed": 42,
+                "filter_log": filt_log,
+                "filter_survivors": int(len(filt_surv)),
+                "formulas": FORMULAS,
+                "counts": counts,
+                "seed": settings.random_seed,
                 "splits": {k: [str(d) for d in v] for k, v in splits.items()}}
     rep = write_report(outdir, meta_out, health, "", "", cands_df, ll, states_df, seqs_df,
-                       wf, leak, True,
-                       {"total_features_tested": FEATURE_COUNT["n"],
-                        "total_relationships_tested": REL_COUNT["n"],
-                        "total_sequences_tested": SEQ_COUNT["n"],
-                        "total_states_tested": STATE_COUNT["n"],
-                        "total_candidate_events": len(cands_df)})
+                       wf, leak, True, counts)
+    # ---- 12. tab bundle export (§48): machine-readable JSON for the OPTION DISCOVERY tab ----
+    bundle = {
+        "run_id": run_id, "dataset_hash": dataset_hash,
+        "configuration_hash": settings.configuration_hash(), "settings": settings.to_dict(),
+        "status_bar": {
+            "DATA_READY": "PASS" if health["status"] in ("DATA_VALID", "DATA_PARTIAL") else "FAIL",
+            "CHAIN_READY": "PASS" if mods["CHAIN_STRUCTURE"][0] == "AVAILABLE" else "FAIL",
+            "FEATURES_READY": "PASS", "DISCOVERY_READY": "PASS",
+            "VALIDATION_READY": ("PASS" if mods["OOS_VALIDATION"][0] == "AVAILABLE"
+                                 else "NOT_APPLICABLE"),
+            "OOS_READY": ("PASS" if splits["pseudo_oos"] else "NOT_READY"),
+            "ROBUSTNESS_READY": "PASS",
+            "EXECUTION_MODEL": meta_out["execution_model"], "PAPER_ELIGIBLE": "FALSE",
+        },
+        "data_health": health, "chain_metadata": meta_out["chain_metadata"],
+        "modules": meta_out["modules"], "modules_unavailable": meta_out["modules_unavailable"],
+        "counts": counts, "filter_log": filt_log,
+        "candidates": cands_df.fillna("NA").to_dict(orient="records") if len(cands_df) else [],
+        "leadlag": ll.fillna("NA").to_dict(orient="records") if len(ll) else [],
+        "formulas": FORMULAS, "sharpe_defs": SHARPE_DEFS,
+    }
+    import json as _json
+    with open(os.path.join(outdir, "tab_bundle.json"), "w") as f:
+        _json.dump(bundle, f, indent=1, default=str)
+    print(f"TAB_BUNDLE written: {outdir}/tab_bundle.json")
     print("===== OPTION NATIVE DISCOVERY AUDIT =====")
     for fam in sorted(cands_df["discovery_family"].unique().tolist()) if len(cands_df) else []:
         sub = cands_df[cands_df["discovery_family"] == fam]

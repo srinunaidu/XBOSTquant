@@ -31,28 +31,40 @@ def calculate_trade_metrics(trades: pd.DataFrame) -> dict:
     """Single canonical path: trades ledger -> all metrics. trades needs ret, mae, mfe cols (pct)."""
     if trades is None or len(trades) == 0:
         return {"trade_count": 0, "wins": 0, "losses": 0, "avg_winner": NA, "avg_loser": NA,
-                "expectancy": NA, "PF": NA, "TRADE_SHARPE": NA, "Sortino": NA,
-                "MAE": NA, "MFE": NA, "P&L": 0.0}
+                "median_winner": NA, "median_loser": NA, "expectancy": NA, "PF": NA,
+                "payoff": NA, "TRADE_SHARPE": NA, "Sortino": NA, "maxDD": NA,
+                "MAE": NA, "MFE": NA, "MFE_MAE": NA, "P&L": 0.0,
+                "largest_winner": NA, "largest_loser": NA}
     r = pd.to_numeric(trades["ret"], errors="coerce").dropna()
     n = int(len(r))
     wins = int((r > 0).sum()); losses = int((r < 0).sum())
     pos = r[r > 0]; neg = r[r < 0]
     avg_w = float(pos.mean()) if len(pos) else NA
     avg_l = float(neg.mean()) if len(neg) else NA
+    med_w = float(pos.median()) if len(pos) else NA
+    med_l = float(neg.median()) if len(neg) else NA
     exp = float(r.mean()) if n else NA
     pf = float(pos.sum() / -neg.sum()) if len(neg) and neg.sum() != 0 else (float("inf") if len(pos) else NA)
+    payoff = float(avg_w / abs(avg_l)) if pd.notna(avg_w) and pd.notna(avg_l) and avg_l != 0 else NA
     ts = float(r.mean() / r.std() * np.sqrt(n)) if n >= 2 and r.std() not in (0, None) and not np.isnan(r.std()) else NA
     dn = r[r < 0].std()
     sort = float(r.mean() / dn * np.sqrt(n)) if n >= 2 and pd.notna(dn) and dn not in (0,) else NA
+    eq = r.cumsum()
+    mdd = float((eq - eq.cummax()).min()) if n else NA
     mae = float(pd.to_numeric(trades["mae"], errors="coerce").mean()) if "mae" in trades else NA
     mfe = float(pd.to_numeric(trades["mfe"], errors="coerce").mean()) if "mfe" in trades else NA
     if "mae" in trades and pd.to_numeric(trades["mae"], errors="coerce").isna().all():
         mae = NA
     if "mfe" in trades and pd.to_numeric(trades["mfe"], errors="coerce").isna().all():
         mfe = NA
+    mfe_mae = float(mfe / mae) if pd.notna(mfe) and pd.notna(mae) and mae != 0 else NA
     return {"trade_count": n, "wins": wins, "losses": losses, "avg_winner": avg_w,
-            "avg_loser": avg_l, "expectancy": exp, "PF": pf, "TRADE_SHARPE": ts,
-            "Sortino": sort, "MAE": mae, "MFE": mfe, "P&L": float(r.sum())}
+            "median_winner": med_w, "avg_loser": avg_l, "median_loser": med_l,
+            "expectancy": exp, "PF": pf, "payoff": payoff, "TRADE_SHARPE": ts,
+            "Sortino": sort, "maxDD": mdd, "MAE": mae, "MFE": mfe, "MFE_MAE": mfe_mae,
+            "P&L": float(r.sum()),
+            "largest_winner": float(r.max()) if n else NA,
+            "largest_loser": float(r.min()) if n else NA}
 
 def metric_recalculation_test(reported: dict, trades: pd.DataFrame, tol=1e-6) -> dict:
     """METRIC_RECALCULATION_TEST (§22): recompute from ledger, compare."""
@@ -127,6 +139,42 @@ def bootstrap_sharpe(rets, n_boot=500, seed=42):
     return {"BOOTSTRAP_SHARPE": float(np.mean(boots)),
             "bootstrap_ci": (float(np.quantile(boots, 0.025)), float(np.quantile(boots, 0.975))),
             "_def": SHARPE_DEFS["BOOTSTRAP_SHARPE"]}
+
+def block_bootstrap_ci(rets, stat_fn=None, n_boot=500, block=10, seed=42):
+    """Block bootstrap (§32): preserves local autocorrelation unlike iid resampling."""
+    rng = np.random.default_rng(seed)
+    r = pd.Series(list(rets)).dropna().values
+    stat_fn = stat_fn or (lambda x: float(np.mean(x)))
+    if len(r) < 2 * block:
+        return {"block_bootstrap_mean": NA, "block_bootstrap_ci": ("NA", "NA")}
+    n = len(r)
+    outs = []
+    for _ in range(n_boot):
+        idx = np.concatenate([np.arange(s, min(s + block, n))
+                              for s in rng.integers(0, n, size=int(np.ceil(n / block)))])[:n]
+        outs.append(stat_fn(r[idx]))
+    return {"block_bootstrap_mean": float(np.mean(outs)),
+            "block_bootstrap_ci": (float(np.quantile(outs, 0.025)),
+                                   float(np.quantile(outs, 0.975)))}
+
+
+def proportion_ci(k, n, z=1.96):
+    """Wilson 95% CI for win rate (§32)."""
+    if n == 0:
+        return ("NA", "NA")
+    p = k / n
+    d = 1 + z * z / n
+    c = p + z * z / (2 * n)
+    m = z * np.sqrt(p * (1 - p) / n + z * z / (4 * n * n))
+    return (max(0.0, (c - m) / d), min(1.0, (c + m) / d))
+
+
+def expectancy_ci(rets, n_boot=500, seed=42):
+    """Bootstrap CI for expectancy (§32)."""
+    r = block_bootstrap_ci(rets, stat_fn=lambda x: float(np.mean(x)),
+                           n_boot=n_boot, seed=seed)
+    return {"expectancy_ci": r["block_bootstrap_ci"]}
+
 
 def surrogate_stats(rets, n_perm=200, seed=42):
     rng = np.random.default_rng(seed)
