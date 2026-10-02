@@ -19,7 +19,7 @@ OD.SCHEMA = {
   expiry: ['expiry', 'exp', 'expiration', 'expiry_date', 'maturity'],
   strike: ['strike', 'strike_px', 'strike_price', 'k'],
   option_type: ['option_type', 'otype', 'cp', 'call_put', 'type', 'kind', 'side'],
-  symbol: ['symbol', 'contract', 'contract_symbol', 'instrument', 'ticker'],
+  symbol: ['symbol', 'sym', 'contract', 'contract_symbol', 'instrument', 'ticker'],
   open: ['open', 'o', 'open_price'],
   high: ['high', 'h', 'high_price'],
   low: ['low', 'l', 'low_price'],
@@ -314,6 +314,68 @@ function ingestWide(head, rows, col) {
 }
 
 /* ---------- chain metadata (all discovered) ---------- */
+/* ---------- data understanding layer (§2): what exists before what to test ---------- */
+OD.understand = function (norm, meta) {
+  const total = Math.max(1, norm.length);
+  const avail = col => norm.filter(r => typeof r[col] === 'number' && !isNaN(r[col])).length / total;
+  const fields = {};
+  for (const c of ['open', 'high', 'low', 'close', 'volume', 'oi', 'bid', 'ask']) fields[c] = avail(c);
+  const reg = (meta && meta.registry && meta.registry.length) ? meta.registry : OD.buildRegistry(norm, 'long');
+  // underlying candidates: series that are NOT parsed option contracts —
+  // UNKNOWN option type AND no valid strike anywhere on the symbol, with dense
+  // aligned history. Genuinely unparseable option tokens stay UNKNOWN (reported
+  // as parse gaps), they are not promoted to reference.
+  const optSyms = new Set(reg.filter(r =>
+    r.option_type !== 'UNKNOWN' || r.strike !== 'UNKNOWN').map(r => r.contract_id));
+  const refSyms = [...new Set(norm.map(r => r.symbol))].filter(s => !optSyms.has(s) && !String(s).startsWith('__'));
+  const refCands = [];
+  const optTs = new Set(norm.filter(r => optSyms.has(r.symbol)).map(r => r.ts));
+  for (const s of refSyms) {
+    const bars = norm.filter(r => r.symbol === s && !isNaN(r.close));
+    if (bars.length < 50) continue;
+    const ts = new Set(bars.map(r => r.ts));
+    let overlap = 0;
+    for (const t of ts) if (optTs.has(t)) overlap++;
+    refCands.push({ symbol: s, bars: bars.length,
+      coverage: optTs.size ? overlap / optTs.size : 0, aligned: overlap });
+  }
+  refCands.sort((a, b) => b.coverage - a.coverage);
+  const namedRef = [...new Set(norm.map(r => r.underlying))].filter(u => u && u !== 'UNKNOWN');
+  // time structure
+  const byDay = new Map();
+  for (const r of norm) {
+    const d = new Date(r.ts).toISOString().slice(0, 10);
+    if (!byDay.has(d)) byDay.set(d, []);
+    byDay.get(d).push(r.ts);
+  }
+  const sessions = [];
+  for (const [d, arr] of byDay) {
+    const a = arr.sort((x, y) => x - y);
+    const f = t => { const dd = new Date(t); return String(dd.getUTCHours()).padStart(2, '0') + ':' + String(dd.getUTCMinutes()).padStart(2, '0'); };
+    sessions.push({ day: d, open: f(a[0]), close: f(a[a.length - 1]), bars: a.length });
+  }
+  // chain structure per expiry
+  const perExp = {};
+  for (const e of meta.expiries) {
+    const ss = norm.filter(r => r.expiry === e);
+    const sts = [...new Set(ss.map(r => r.strike).filter(s => !isNaN(s)))].sort((a, b) => a - b);
+    const diffs = [];
+    for (let i = 1; i < sts.length; i++) diffs.push(sts[i] - sts[i - 1]);
+    diffs.sort((a, b) => a - b);
+    const vol = ss.filter(r => !isNaN(r.volume)).reduce((a, r) => a + r.volume, 0);
+    perExp[e] = { strikes: sts.length, spacing: diffs.length ? diffs[Math.floor(diffs.length / 2)] : NaN,
+      contracts: new Set(ss.map(r => r.symbol)).size, volume: vol };
+  }
+  return {
+    fields,
+    underlying_candidates: refCands,
+    reference: refCands.length ? refCands[0] : null,
+    named_reference: namedRef,
+    sessions: sessions.slice(0, 5), n_sessions: sessions.length,
+    timezone: 'UNKNOWN (assumed exchange-local)',
+    per_expiry: perExp,
+  };
+};
 OD.detectChain = function (norm) {
   const syms = [...new Set(norm.map(r => r.symbol))].sort();
   const otypes = [...new Set(norm.map(r => r.option_type))].sort();
@@ -463,11 +525,209 @@ OD.selectFocus = function (norm, meta, nStrikes, expiry) {
   return { rows: sub.filter(r => cset.has(r.symbol)), strikes: strikes.map(String), chain };
 };
 
-/* ---------- RNG ---------- */
+/* ---------- underlying + moneyness + multi-expiry (§4-§6) ---------- */
+OD.underlyingFeatures = function (refBars) {
+  // refBars: [{ts,open,high,low,close,volume}] sorted; past-only, option conventions
+  const arr = refBars.slice().sort((a, b) => a.ts - b.ts);
+  const n = arr.length, H = 120;
+  const cl = arr.map(r => r.close);
+  for (let i = 0; i < n; i++) {
+    const r = arr[i];
+    for (const w of [1, 5]) {
+      r['und_ret_' + w] = (i >= w && cl[i - w] !== 0 && !isNaN(cl[i]) && !isNaN(cl[i - w]))
+        ? (cl[i] / cl[i - w] - 1) * 100 : NaN;
+    }
+    let s = 0, c = 0;
+    for (let j = Math.max(0, i - 5); j < i; j++) if (!isNaN(arr[j].und_ret_1)) { s += arr[j].und_ret_1; c++; }
+    r.und_mom_5 = c >= 3 ? s / c : NaN;
+    r.und_acc = NaN; // filled in second pass below
+    let rs = [];
+    for (let j = Math.max(0, i - 20); j < i; j++) {
+      const v = (j > 0 && !isNaN(arr[j].close) && !isNaN(arr[j - 1].close) && arr[j - 1].close)
+        ? (arr[j].close / arr[j - 1].close - 1) * 100 : NaN;
+      if (!isNaN(v)) rs.push(v);
+    }
+    r.und_vol_20 = rs.length >= 10 ? std(rs) : NaN;
+    const rng = r.high - r.low;
+    r.und_expansion = (i > 0 && !isNaN(rng) && !isNaN(arr[i - 1].high) && arr[i - 1].high !== arr[i - 1].low)
+      ? rng / (arr[i - 1].high - arr[i - 1].low) : NaN;
+    r.und_breakout = ((!isNaN(r.und_expansion) && r.und_expansion > 2.0 && Math.abs(r.und_ret_5) > 1.0)) ? 1 : 0;
+    r.und_trend = (!isNaN(r.und_mom_5)) ? (r.und_mom_5 > 0.2 ? 'up' : (r.und_mom_5 < -0.2 ? 'down' : 'flat')) : 'na';
+    const win = [];
+    for (let j = Math.max(0, i - H); j < i; j++) if (!isNaN(arr[j].und_vol_20)) win.push(arr[j].und_vol_20);
+    const vw = win.filter(x => !isNaN(x));
+    if (vw.length >= 20 && !isNaN(r.und_vol_20)) {
+      let le = 0;
+      for (const x of vw) if (x <= r.und_vol_20) le++;
+      const p = le / vw.length * 100;
+      r.und_vol_regime = p < 33 ? 'low' : p < 66 ? 'mid' : 'high';
+    } else r.und_vol_regime = 'na';
+  }
+  // accel needs mom series: second pass
+  for (let i = 1; i < n; i++) {
+    arr[i].und_acc = (!isNaN(arr[i].und_mom_5) && !isNaN(arr[i - 1].und_mom_5)) ? arr[i].und_mom_5 - arr[i - 1].und_mom_5 : NaN;
+  }
+  const byTs = new Map(arr.map(r => [r.ts, r]));
+  return { bars: arr, byTs };
+};
+
+OD.attachUnderlying = function (rows, und, meta) {
+  // join reference features onto option rows by exact ts; beta_60 per option row
+  const bySym = new Map();
+  for (const r of rows) {
+    if (!bySym.has(r.symbol)) bySym.set(r.symbol, []);
+    bySym.get(r.symbol).push(r);
+  }
+  for (const arr of bySym.values()) arr.sort((a, b) => a.ts - b.ts);
+  const uret = new Map([...und.byTs.entries()].map(([t, r]) => [t, r.und_ret_1]));
+  for (const arr of bySym.values()) {
+    for (let i = 0; i < arr.length; i++) {
+      const r = arr[i];
+      const u = und.byTs.get(r.ts);
+      r.und_ret_1 = u ? u.und_ret_1 : NaN;
+      r.und_ret_5 = u ? u.und_ret_5 : NaN;
+      r.und_mom_5 = u ? u.und_mom_5 : NaN;
+      r.und_acc = u ? u.und_acc : NaN;
+      r.und_vol_20 = u ? u.und_vol_20 : NaN;
+      r.und_expansion = u ? u.und_expansion : NaN;
+      r.und_breakout = u ? u.und_breakout : 0;
+      r.und_trend = u ? u.und_trend : 'na';
+      r.und_vol_regime = u ? u.und_vol_regime : 'na';
+      // beta_60: cov(opt r1, und r1)/var(und r1) over trailing 60 bars
+      let sx = 0, sy = 0, sxx = 0, sxy = 0, cn = 0;
+      for (let j = Math.max(0, i - 60); j < i; j++) {
+        const a = arr[j].return_1, b = uret.get(arr[j].ts);
+        if (typeof a === 'number' && !isNaN(a) && typeof b === 'number' && !isNaN(b)) {
+          sx += b; sy += a; sxx += b * b; sxy += a * b; cn++;
+        }
+      }
+      if (cn >= 20 && (sxx - sx * sx / cn) > 1e-12) {
+        r.beta_60 = (sxy - sx * sy / cn) / (sxx - sx * sx / cn);
+      } else r.beta_60 = NaN;
+      r.resp_spread = (!isNaN(r.return_5) && !isNaN(r.und_ret_5) && !isNaN(r.beta_60))
+        ? r.return_5 - r.beta_60 * r.und_ret_5 : NaN;
+      r.und_lead_up = ((!isNaN(r.und_ret_5) && r.und_ret_5 > 1.0 && !isNaN(r.return_5) && Math.abs(r.return_5) < 0.5)) ? 1 : 0;
+      r.und_lead_dn = ((!isNaN(r.und_ret_5) && r.und_ret_5 < -1.0 && !isNaN(r.return_5) && Math.abs(r.return_5) < 0.5)) ? 1 : 0;
+      r.opt_lead_up = ((!isNaN(r.return_5) && r.return_5 > 1.0 && !isNaN(r.und_ret_5) && Math.abs(r.und_ret_5) < 0.5)) ? 1 : 0;
+      r.und_divergence = (!isNaN(r.resp_spread) && Math.abs(r.resp_spread) > 2.0) ? 1 : 0;
+      const over = (!isNaN(r.return_5) && !isNaN(r.und_ret_5) && Math.abs(r.und_ret_5) > 0.5)
+        ? Math.abs(r.return_5) / Math.abs(r.und_ret_5) : NaN;
+      r.overreaction = (!isNaN(over) && over > 2.0) ? 1 : 0;
+      r.underreaction = (!isNaN(over) && over < 0.5) ? 1 : 0;
+    }
+  }
+  for (const c of ['und_ret_1', 'und_ret_5', 'und_mom_5', 'und_acc', 'und_vol_20', 'und_expansion',
+    'beta_60', 'resp_spread']) OD.track(c, { inputs: ['reference series at same ts + trailing 60'], future: false });
+  return rows;
+};
+
+OD.attachMoneyness = function (rows, und) {
+  // strike distance vs reference close at same ts; ATM = min |distance| per ts
+  const byTs = new Map();
+  for (const r of rows) {
+    if (!byTs.has(r.ts)) byTs.set(r.ts, []);
+    byTs.get(r.ts).push(r);
+  }
+  for (const g of byTs.values()) {
+    const ref = und.byTs.get(g[0].ts);
+    const px = ref ? ref.close : NaN;
+    for (const r of g) {
+      r.moneyness_pct = (!isNaN(r.strike) && px) ? (r.strike - px) / px * 100 : NaN;
+    }
+    const valid = g.filter(r => !isNaN(r.moneyness_pct));
+    if (valid.length) {
+      let atm = valid[0];
+      for (const r of valid) if (Math.abs(r.moneyness_pct) < Math.abs(atm.moneyness_pct)) atm = r;
+      for (const r of g) {
+        if (isNaN(r.moneyness_pct)) { r.moneyness_band = 'na'; continue; }
+        const a = Math.abs(r.moneyness_pct);
+        const side = r.moneyness_pct >= 0 ? 'ABOVE' : 'BELOW';
+        r.moneyness_band = (a <= 1 ? 'ATM_LIKE' : a <= 2.5 ? 'NEAR' : a <= 5 ? 'MODERATE' : 'DEEP') + '_' + side;
+        r.is_empirical_atm = (r === atm) ? 1 : 0;
+      }
+    } else {
+      for (const r of g) { r.moneyness_band = 'na'; r.is_empirical_atm = 0; }
+    }
+  }
+  for (const c of ['moneyness_pct', 'moneyness_band', 'is_empirical_atm'])
+    OD.track(c, { inputs: ['strike + reference close at same ts'], future: false });
+  return rows;
+};
+
+OD.expirySpreads = function (rows, meta) {
+  // front-vs-next same (strike,type) spreads; only when ≥2 expiries present
+  const cols = [];
+  const exps = [...new Set(rows.map(r => r.expiry))].sort();
+  if (exps.length < 2) return cols;
+  for (let e = 0; e + 1 < exps.length; e++) {
+    const A = exps[e], B = exps[e + 1];
+    const key = r => r.strike + '|' + r.option_type;
+    const ma = new Map(), mb = new Map();
+    for (const r of rows) {
+      if (r.expiry === A) { if (!ma.has(key(r))) ma.set(key(r), new Map()); ma.get(key(r)).set(r.ts, r); }
+      else if (r.expiry === B) { if (!mb.has(key(r))) mb.set(key(r), new Map()); mb.get(key(r)).set(r.ts, r); }
+    }
+    for (const [k, am] of ma) {
+      const bm = mb.get(k);
+      if (!bm) continue;
+      for (const [ts, a] of am) {
+        const b = bm.get(ts);
+        if (!b) continue;
+        a.exp_spread_ret = a.return_5 - b.return_5;
+        a.exp_spread_vol = a.volume - b.volume;
+      }
+      cols.push('exp_spread_ret', 'exp_spread_vol');
+    }
+  }
+  const uniq = [...new Set(cols)];
+  for (const c of uniq) OD.track(c, { inputs: ['same strike/type across adjacent expiries, same ts'], future: false });
+  return uniq;
+};
+
+/* ---------- failure classification (§19): WHY did it fail ---------- */
+OD.classifyFailure = function (c, items) {
+  // order = first blocking gate in pipeline order (primary class)
+  if (!items || !items.length || c.events < 50) return 'THIN_SAMPLE';
+  if (c.clusters < 10 || (c.events / Math.max(1, c.clusters)) > 20) return 'EVENT_DEPENDENCE';
+  if (!(c.FWD_IS_expectancy > 0)) return 'TRAIN_FAIL';
+  if (!(c.FWD_VAL_expectancy > 0)) return 'VALIDATION_FAIL';
+  if (!(c.FWD_OOS_expectancy > 0)) return 'OOS_FAIL';
+  if (c.top5 >= 0.5) return 'CONCENTRATION';
+  if (!(c.perm_p_adj < 0.10)) return 'MULTIPLE_TESTING';
+  if (c.exit_cap_dominated) return 'EXIT_DEPENDENCE';
+  if (items) {
+    const bySym = {}, byDay = {};
+    for (const r of items) {
+      bySym[r.symbol] = (bySym[r.symbol] || 0) + 1;
+      const d = new Date(r.ts).toISOString().slice(0, 10);
+      byDay[d] = (byDay[d] || 0) + 1;
+    }
+    const n = items.length;
+    const topSym = Math.max.apply(null, Object.values(bySym)) / n;
+    if (topSym > 0.8) return 'CONTRACT_DEPENDENCE';
+    const topDay = Math.max.apply(null, Object.values(byDay)) / n;
+    if (topDay > 0.5) return 'TIME_DEPENDENCE';
+  }
+  return 'NONE';
+};
+
+/* ---------- family classification (§9): measured evidence, fixed thresholds ---------- */
+OD.classifyFamilyStat = function (s) {
+  const trainRate = s.tested ? s.train / s.tested : 0;
+  const valRate = s.tested ? s.val / s.tested : 0;
+  const oosRate = s.tested ? s.oos / s.tested : 0;
+  if (!s.tested) return 'UNTESTABLE';
+  if (s.train === 0) return 'FAILED';
+  if (oosRate >= 0.3 && valRate >= 0.4) return 'STRONG';
+  if (trainRate >= 0.4 && (valRate > 0 || oosRate > 0)) return 'PROMISING';
+  if (trainRate < 0.2) return 'WEAK';
+  return 'NEUTRAL';
+};
 OD.LINEAGE = []; // {column, inputs[], future} — every derived column records its source
 OD.track = function (column, spec) {
   OD.LINEAGE.push({ column, inputs: (spec && spec.inputs) || [], future: !!(spec && spec.future) });
 };
+/* ---------- RNG ---------- */
 OD.rng = function (seed) {
   let a = seed >>> 0;
   return function () {
@@ -728,7 +988,10 @@ OD.features = function (rows, H) {
 OD.relationships = function (rows, meta) {
   const REG = { type_pair: null, type_cols: [], x_cols: [], breadth_cols: [] };
   const byOT = {};
-  for (const o of meta.option_types) byOT[o] = (rows.filter(r => r.option_type === o).reduce((a, r) => a + (isNaN(r.volume) ? 0 : r.volume), 0));
+  for (const o of meta.option_types) {
+    if (o === 'UNKNOWN') continue; // data-quality marker, never a relationship leg
+    byOT[o] = rows.filter(r => r.option_type === o).reduce((a, r) => a + (isNaN(r.volume) ? 0 : r.volume), 0);
+  }
   const ranked = Object.keys(byOT).sort((a, b) => byOT[b] - byOT[a]);
   if (ranked.length >= 2) {
     const t0 = ranked[0], t1 = ranked[1];
@@ -1108,25 +1371,30 @@ OD.cluster = function (items, minutes) {
 };
 
 /* ---------- path-exit backtest (OHLC, causal) ---------- */
-OD.fingerprint = (cid, sl, tp, trail, mode, hold) =>
-  `candidate_id=${cid}|sl=${sl}|tp=${tp}|trail=${trail}|exit_mode=${mode}|hold=${hold}|cost=ZERO|model=RESEARCH`;
+OD.fingerprint = (cid, sl, tp, trail, mode, hold, exec) =>
+  `candidate_id=${cid}|sl=${sl}|tp=${tp}|trail=${trail}|exit_mode=${mode}|hold=${hold}|cost=ZERO|model=${exec || 'RESEARCH'}`;
 
 OD.backtest = function (featBySym, signals, o) {
-  // signals: [{sym, i}] entry at bar i close; forward bars i+1..i+hold (long)
-  // P&L rule (logged): gross_pnl = exit_price - entry_price (percent form:
-  // ret = exit/entry*100-100). Signals without a finite positive entry or
-  // without any finite exit close are SKIPPED with classified reasons (§25),
-  // never zero-filled, never counted as wins or losses.
-  const fp = OD.fingerprint(o.cid, o.sl, o.tp, o.trail, o.mode, o.hold);
+  // o.exec: 'research' (close) or 'executable' (bid/ask: LONG entry=ask, exit=bid).
+  // P&L rule: gross = exit-entry (percent ret). Un-exitable signals SKIPPED+classified.
+  const exec = o.exec || 'research';
+  const fp = OD.fingerprint(o.cid, o.sl, o.tp, o.trail, o.mode, o.hold, exec === 'executable' ? 'EXECUTABLE' : 'RESEARCH');
   const out = [];
   const skipped = { MISSING_ENTRY_PRICE: 0, ZERO_ENTRY: 0, END_OF_DATA: 0, MISSING_EXIT_PRICE: 0, INVALID_CONTRACT: 0, OTHER: 0 };
   let attempted = 0;
+  const px = (b, side) => {
+    if (exec === 'executable') {
+      const v = side === 'entry' ? b.ask : b.bid;
+      return (typeof v === 'number' && !isNaN(v)) ? v : NaN;
+    }
+    return b.close;
+  };
   signals.forEach((s, k) => {
     attempted++;
     const arr = featBySym.get(s.sym);
     if (!arr) { skipped.INVALID_CONTRACT++; return; }
     if (s.i + 1 >= arr.length) { skipped.END_OF_DATA++; return; }
-    const entry = arr[s.i].close;
+    const entry = px(arr[s.i], 'entry');
     if (typeof entry !== 'number' || isNaN(entry)) { skipped.MISSING_ENTRY_PRICE++; return; }
     if (!(entry > 0)) { skipped.ZERO_ENTRY++; return; }
     const slPx = entry * (1 - o.sl / 100), tpPx = entry * (1 + o.tp / 100);
@@ -1143,7 +1411,7 @@ OD.backtest = function (featBySym, signals, o) {
       if (hitTP) { exitPx = tpPx; reason = 'TP'; dur = j - s.i; break; }
     }
     if (reason === 'TIME') {
-      const c = arr[s.i + dur].close;
+      const c = px(arr[s.i + dur], 'exit');
       exitPx = (typeof c === 'number' && !isNaN(c)) ? c : NaN;
     }
     if (typeof exitPx !== 'number' || isNaN(exitPx) || !(exitPx > 0)) { skipped.MISSING_EXIT_PRICE++; return; }
@@ -1159,7 +1427,8 @@ OD.backtest = function (featBySym, signals, o) {
       gross_pnl: gross, return_pct: ret, ret,
       mae: (entry - trough) / entry * 100, mfe: (peak - entry) / entry * 100,
       holding_time: dur, holding_period: dur,
-      sl_config: o.sl, tp_config: o.tp, CONFIG_FINGERPRINT: fp,
+      sl_config: o.sl, tp_config: o.tp, trail_config: o.trail, exit_model: o.mode,
+      CONFIG_FINGERPRINT: fp, model: exec === 'executable' ? 'EXECUTABLE_PRICE_MODEL' : 'RESEARCH_PRICE_MODEL',
     });
   });
   return { ledger: out, fingerprint: fp, skipped, attempted, completed: out.length };
@@ -1194,14 +1463,18 @@ OD.run = function (text, cfg, onLog, onProgress) {
     lags: [1, 2, 3, 5, 10, 15, 30], rankingObjective: 'composite',
   }, cfg || {});
   Object.assign(cfg, cfg.budget || {});
-  // budget defaults apply ONLY when unset — never clobber caller config
+  // budget defaults apply ONLY when unset — never clobber caller config.
+  // Generous safety limits per spec §20 (not reasons to stop early).
   const BUDGET_DEFAULTS = {
-    maxRounds: 24, maxRawCandidatesPerRound: 60, maxCombinationDepth: 3,
-    maxTotalCandidates: 500, maxRuntimeSeconds: 600,
-    maxFeatureCombinations: 400, maxPairCombinations: 120, maxTripleCombinations: 60,
-    exploitFrac: 0.7, topKConditional: 8, rounds: 'all',
+    maxRounds: 100, maxRawCandidatesPerRound: 60, maxCombinationDepth: 4,
+    maxTotalCandidates: 10000, maxRuntimeSeconds: 1800,
+    maxFeatureCombinations: 400, maxPairCombinations: 1000, maxTripleCombinations: 1000,
+    maxQuadCombinations: 500, minimumExplorationFraction: 0.20,
+    exploitFrac: 0.5, topKConditional: 8, rounds: 'all',
   };
   for (const k of Object.keys(BUDGET_DEFAULTS)) if (cfg[k] === undefined) cfg[k] = BUDGET_DEFAULTS[k];
+  if (cfg.executionModel === undefined) cfg.executionModel = 'research';
+  if (cfg.useUnderlying === undefined) cfg.useUnderlying = true;
   const t0 = Date.now();
   const log = [];
   OD.LINEAGE = [];
@@ -1277,6 +1550,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
   mods.OPTION_TYPE_RELATIONSHIP = typeState;
   mods.STRIKE_RELATIONSHIP = strikeState;
   for (const k of Object.keys(mods)) emit(`${k} = ${mods[k][0]}${mods[k][1] ? ' (' + mods[k][1] + ')' : ''}`);
+  // execution model (§7): executable only with real bid/ask; never mixed, never fabricated
+  const execMode = (meta.has_bidask && cfg.executionModel === 'executable') ? 'executable' : 'research';
+  emit(`EXECUTION_MODEL = ${execMode === 'executable' ? 'EXECUTABLE_PRICE_MODEL (LONG entry=ask, exit=bid)' : 'RESEARCH_PRICE_MODEL (close-based)'}${meta.has_bidask ? '' : ' (no bid/ask in dataset)'}`);
   if (mods.OPTION_DATA[0] !== 'AVAILABLE') { fail('BLOCKED_DATA', 'DATA_ERROR', 'no identifiable contracts/timestamps'); throw new Error('DATA_INVALID'); }
   if (registry.length === 0) { fail('BLOCKED_PARSER', 'PARSER_ERROR', 'contract registry empty'); throw new Error('PARSER_EMPTY'); }
   prog(0.08, 'chain');
@@ -1296,11 +1572,43 @@ OD.run = function (text, cfg, onLog, onProgress) {
   const health = OD.dataHealth(norm, meta, focus.chain);
   emit(`DATA_HEALTH status=${health.status} volcov=${health.volume_coverage} ohlc_err=${health.ohlc_integrity_errors} usable=${health.usable_snapshots}`);
   if (health.status === 'DATA_INVALID') { fail('BLOCKED_DATA', 'DATA_ERROR', 'health gate DATA_INVALID'); throw new Error('DATA_INVALID'); }
+  prog(0.10, 'understand');
+
+  // ---- DATA UNDERSTANDING (§2): decide what is testable before testing ----
+  const understanding = OD.understand(norm, meta);
+  emit('DATA_UNDERSTANDING');
+  emit(`  fields: ${Object.entries(understanding.fields).map(([k, v]) => `${k}=${(v * 100).toFixed(1)}%`).join(' ')}`);
+  emit(`  underlying_candidates=${understanding.underlying_candidates.length} `
+    + understanding.underlying_candidates.slice(0, 3).map(u => `${u.symbol}(bars=${u.bars},cov=${(u.coverage * 100).toFixed(1)}%)`).join(' '));
+  emit(`  named_reference=${understanding.named_reference.join(',') || 'none'} timezone=${understanding.timezone}`);
+  for (const [e, p] of Object.entries(understanding.per_expiry)) {
+    emit(`  expiry ${e}: strikes=${p.strikes} spacing~${isNaN(p.spacing) ? 'NA' : p.spacing} contracts=${p.contracts}`);
+  }
+  const refSym = (cfg.useUnderlying !== false && understanding.reference) ? understanding.reference.symbol : null;
+  let und = null;
+  if (refSym) {
+    const refBars = norm.filter(r => r.symbol === refSym)
+      .map(r => ({ ts: r.ts, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
+    und = OD.underlyingFeatures(refBars);
+    emit(`UNDERLYING selected=${refSym} coverage=${(understanding.reference.coverage * 100).toFixed(1)}%`);
+  } else {
+    emit('UNDERLYING = UNAVAILABLE (no reference series with sufficient aligned history)');
+  }
   prog(0.12, 'features');
 
   const rows = OD.features(focus.rows);
+  if (und) OD.attachUnderlying(rows, und, meta);
+  if (und) {
+    OD.attachMoneyness(rows, und);
+    emit('MONEYNESS_STATUS=AVAILABLE (reference-based bands)');
+  } else {
+    emit('MONEYNESS_STATUS=UNAVAILABLE (no reference price; R17 skipped)');
+  }
   if (mods.OPTION_TYPE_RELATIONSHIP[0] === 'AVAILABLE') OD.relationships(rows, meta);
   const xCols = mods.STRIKE_RELATIONSHIP[0] === 'AVAILABLE' ? OD.crossStrike(rows, meta, focus.strikes) : [];
+  const expCols = OD.expirySpreads(rows, meta);
+  if (expCols.length) emit(`EXPIRY_SPREADS features=${expCols.join(',')}`);
+  else emit('MULTI_EXPIRY_ANALYSIS = NOT_AVAILABLE (single expiry in focus)');
   OD.breadth(rows, meta);
   OD.events(rows);
   OD.sequences(rows);
@@ -1430,10 +1738,10 @@ OD.run = function (text, cfg, onLog, onProgress) {
     const sg = OD.surrogateP(vals, cfg.nPerms, cfg.seed);
     // backtest ledger (path exits)
     const sigs = items.map(r => ({ sym: r.symbol, i: idxBySym.get(r.symbol).get(r.ts) })).filter(s => s.i != null);
-    const led = OD.backtest(featBySym, sigs, { cid, sl: cfg.sl, tp: cfg.tp, trail: null, mode: 'premium', hold: cfg.hold }).ledger;
+    const led = OD.backtest(featBySym, sigs, { cid, sl: cfg.sl, tp: cfg.tp, trail: null, mode: 'premium', hold: cfg.hold, exec: execMode }).ledger;
     const ledOos = OD.backtest(featBySym,
       items.filter(r => splits.pseudo_oos.indexOf(dayOf(r.ts)) >= 0).map(r => ({ sym: r.symbol, i: idxBySym.get(r.symbol).get(r.ts) })).filter(s => s.i != null),
-      { cid, sl: cfg.sl, tp: cfg.tp, trail: null, mode: 'premium', hold: cfg.hold }).ledger;
+      { cid, sl: cfg.sl, tp: cfg.tp, trail: null, mode: 'premium', hold: cfg.hold, exec: execMode }).ledger;
     const m = OD.tradeMetrics(led), mO = OD.tradeMetrics(ledOos);
     const wins = vals.filter(x => x > 0).length;
     const pos = vals.filter(x => x > 0).reduce((a, b) => a + b, 0);
@@ -1452,6 +1760,26 @@ OD.run = function (text, cfg, onLog, onProgress) {
       if (!tot) return 1;
       return s.slice(0, 5).reduce((a, b) => a + b, 0) / tot;
     })();
+    const ds = { DAILY_SHARPE: NaN };
+    const bs = { BOOTSTRAP_SHARPE: NaN };
+    const br = { rm_best3, rm_best1 };
+    // time-of-day stability across dynamic session buckets (same-bar info only)
+    const tstab = (() => {
+      const byB = {};
+      for (const r of items) {
+        const b = r.tod_bucket || 'NA';
+        if (!byB[b]) byB[b] = [];
+        const v = r.fwd_ret_5m;
+        if (!isNaN(v)) byB[b].push(v);
+      }
+      const overall = mean(vals);
+      const means = {};
+      for (const b of Object.keys(byB)) means[b] = byB[b].length ? mean(byB[b]) : NaN;
+      const vs = Object.values(means).filter(x => !isNaN(x));
+      const agree = vs.length ? vs.filter(x => (x > 0) === (overall > 0)).length / vs.length : NaN;
+      return { bucket_means: means, sign_agreement: agree };
+    })();
+    const pert = { base: mean(vals), shifted: NaN };
     const fwdMean = mean(vals), fwdOos = vOos.length ? mean(vOos) : NaN, fwdTr = vTr.length ? mean(vTr) : NaN;
     const fwdVal = vVal.length ? mean(vVal) : NaN;
     const discScore = (isNaN(fwdTr) ? -1 : Math.tanh(fwdTr)) + Math.log10(1 + vals.length) * 0.3
@@ -1491,8 +1819,11 @@ OD.run = function (text, cfg, onLog, onProgress) {
       FWD_OOS_events: vOos.length, FWD_OOS_expectancy: fwdOos, FWD_OOS_WR: vOos.length ? vOos.filter(x => x > 0).length / vOos.length : 0,
       IS_expectancy: m.expectancy, IS_PF: m.PF, IS_TRADE_SHARPE: m.TRADE_SHARPE, maxDD: m.maxDD,
       exit_cap_dominated: !!capDom, OOS_events: ledOos.length, OOS_expectancy: mO.expectancy,
+      OOS_TRADE_SHARPE: mO.TRADE_SHARPE, OOS_WR: vOos.length ? vOos.filter(x => x > 0).length / vOos.length : 0,
       OOS_result: (vOos.length && fwdOos > 0) ? 'OOS_SURVIVED_MARK' : 'OOS_REJECTED',
+      time_stability: tstab, entry_perturbation: pert,
       top5: conc, rm_best3, rm_best1, perm_p: p, final_status: status, failure_reason: fail.join(';') || 'none',
+      paper_eligible: false, // short-sample + RESEARCH-price-model rule; explicit gates recorded on validated only
       equity_curve: eq.filter((_, i) => i % step === 0),
     };
   }
@@ -1502,6 +1833,16 @@ OD.run = function (text, cfg, onLog, onProgress) {
   const maskReg = new Map(); // cid -> signal rows (for exit matrix; cleared before return)
   // ================= ROUNDS ENGINE (§2): bounded iterative discovery =================
   const HYPS = OD.newHypothesisRegistry();
+  // checkpoint/resume (§26): pre-seed seen signatures so a resumed run never
+  // re-evaluates (or double-counts) hypotheses from the checkpoint
+  let resumedRounds = [];
+  if (cfg.resumeFrom && Array.isArray(cfg.resumeFrom.seen)) {
+    for (const k of cfg.resumeFrom.seen) HYPS.seen.add(k);
+    HYPS.unique = HYPS.seen.size;
+    resumedRounds = cfg.resumeFrom.roundsDone || [];
+    emit(`RESUME from checkpoint ${cfg.resumeFrom.runId || '?'}: ${HYPS.seen.size} signatures pre-seeded, rounds done=[${resumedRounds.join(',')}]`);
+  }
+  let GLOBAL_TESTS = 0; // §18: every hypothesis + exit/neighborhood evaluation, never reset
   const tStart = Date.now();
   const budgetDead = () => (Date.now() - tStart) / 1000 > cfg.maxRuntimeSeconds;
   const regHyp = HYPS.register.bind(HYPS);
@@ -1519,7 +1860,12 @@ OD.run = function (text, cfg, onLog, onProgress) {
     if (budgetDead()) { stopReason.why = 'maxRuntimeSeconds'; return 'D'; }
     return '';
   }
-  const wantRound = id => cfg.rounds === 'all' || (Array.isArray(cfg.rounds) && cfg.rounds.indexOf(id) >= 0);
+  const initialSeen = HYPS.seen.size;
+  const newUnique = () => HYPS.unique - initialSeen;
+  const wantRound = id => {
+    if (resumedRounds.indexOf(id) >= 0 && cfg.rounds === 'all') return false; // resume: skip done rounds
+    return cfg.rounds === 'all' || (Array.isArray(cfg.rounds) && cfg.rounds.indexOf(id) >= 0);
+  };
   // dynamic session buckets (7 equal spans over observed session) + vol states
   const allMins = rows.map(r => { const d = new Date(r.ts); return d.getUTCHours() * 60 + d.getUTCMinutes(); });
   const mn0 = Math.min.apply(null, allMins), mx0 = Math.max.apply(null, allMins);
@@ -1734,7 +2080,59 @@ OD.run = function (text, cfg, onLog, onProgress) {
     { cid: 'EV:catchup_dn', fam: 'CATCHUP', feature: 'chain_mom<-1 & |ret5|<0.3 (laggard)', formula: '', rel: 'chain', items: rows.filter(r => r.chain_momentum < -1 && Math.abs(r.return_5) < 0.3), depth: 1, sig: 'EV:catchup_dn' },
     { cid: 'EV:ev_ret_vol_expand', fam: 'EVENT', feature: 'ev_ret_vol_expand', formula: '', rel: 'chain', items: flagItems('ev_ret_vol_expand'), depth: 1, sig: 'EV:ev_ret_vol_expand' },
   ]);
-  // ================= ADAPTIVE POOL (§15): 70% exploit / 30% explore =================
+  // ================= ADAPTIVE CONTROLLER (§9): evidence-driven allocation =================
+  const ADAPTIVE_DECISIONS = [];
+  function familyStats(list) {
+    const byFam = {};
+    for (const c of list) {
+      const f = c.discovery_family;
+      if (!byFam[f]) byFam[f] = { family: f, tested: 0, train: 0, val: 0, oos: 0, mt: 0, exps: [], sharpes: [], clusters: [], concs: [], fails: {} };
+      const s = byFam[f];
+      s.tested++;
+      if (c.FWD_IS_expectancy > 0) s.train++;
+      if (c.FWD_VAL_expectancy > 0) s.val++;
+      if (c.FWD_OOS_expectancy > 0) s.oos++;
+      if (c.perm_p_adj < 0.10) s.mt++;
+      if (!isNaN(c.FWD_expectancy)) s.exps.push(c.FWD_expectancy);
+      if (!isNaN(c.IS_TRADE_SHARPE)) s.sharpes.push(c.IS_TRADE_SHARPE);
+      s.clusters.push(c.clusters);
+      s.concs.push(c.top5);
+      const fc = c.failure_class || 'NONE';
+      s.fails[fc] = (s.fails[fc] || 0) + 1;
+    }
+    return Object.values(byFam).map(s => {
+      const med = a => {
+        if (!a.length) return NaN;
+        const v = a.slice().sort((x, y) => x - y);
+        return v[Math.floor(v.length / 2)];
+      };
+      const trainRate = s.tested ? s.train / s.tested : 0;
+      const valRate = s.tested ? s.val / s.tested : 0;
+      const oosRate = s.tested ? s.oos / s.tested : 0;
+      return { ...s, trainRate, valRate, oosRate, median_expectancy: med(s.exps),
+        median_sharpe: med(s.sharpes), median_clusters: med(s.clusters),
+        median_concentration: med(s.concs),
+        class: OD.classifyFamilyStat({ tested: s.tested, train: s.train, val: s.val, oos: s.oos }) };
+    });
+  }
+  let familyTable = familyStats(cands);
+  const STRONG_FAMS = new Set(familyTable.filter(f => f.class === 'STRONG').map(f => f.family));
+  // dynamic allocation: 50/50 start → up to 70/30 with evidence, exploration floor 20%
+  cfg.exploitFrac = STRONG_FAMS.size ? 0.7 : 0.5;
+  if (cfg.exploitFrac > 1 - (cfg.minimumExplorationFraction || 0.20)) {
+    cfg.exploitFrac = 1 - (cfg.minimumExplorationFraction || 0.20);
+  }
+  {
+    const strong = [...STRONG_FAMS].join(',') || 'none';
+    const weak = familyTable.filter(f => f.class === 'WEAK' || f.class === 'FAILED').map(f => f.family).join(',') || 'none';
+    ADAPTIVE_DECISIONS.push({ round: 12, found: `${cands.length} base candidates`,
+      failed: `weak/failed families: ${weak}`,
+      decision: `exploit=${cfg.exploitFrac} explore=${(1 - cfg.exploitFrac).toFixed(2)}; expand around ${strong}`,
+      why: 'family train/val/OOS survival rates after base rounds' });
+    emit(`ADAPTIVE base families: ${familyTable.map(f => `${f.family}=${f.class}(t${f.train}/${f.tested},oos${f.oos})`).join(' ')}`);
+    emit(`ADAPTIVE allocation: exploit=${cfg.exploitFrac} explore=${(1 - cfg.exploitFrac).toFixed(2)} (floor ${(cfg.minimumExplorationFraction || 0.20)})`);
+  }
+  // ================= ADAPTIVE POOL: exploit / explore split =================
   const qualified = cands.filter(c => c.FWD_IS_expectancy > 0 && c.clusters >= 10)
     .sort((a, b) => b.discovery_score - a.discovery_score);
   const nExp = Math.max(1, Math.round(qualified.length * cfg.exploitFrac));
@@ -1958,6 +2356,158 @@ OD.run = function (text, cfg, onLog, onProgress) {
   emit(`CANDIDATES evaluated=${cands.length} hypotheses_tested=${HYPS.tested} unique=${HYPS.unique} dups=${HYPS.dups}`);
   if (stopReason.why) emit(`STOP: ${stopReason.why}`);
 
+  // ---- failure classification for all evaluated candidates (§19) ----
+  for (const c of cands) {
+    if (!c.failure_class) c.failure_class = OD.classifyFailure(c, maskReg.get(c.candidate) || []);
+  }
+  familyTable = familyStats(cands);
+  {
+    const fmap = {};
+    for (const c of cands) {
+      const f = c.discovery_family;
+      fmap[f] = fmap[f] || {};
+      fmap[f][c.failure_class] = (fmap[f][c.failure_class] || 0) + 1;
+    }
+    const top = Object.entries(fmap).map(([f, d]) => {
+      const dom = Object.entries(d).sort((a, b) => b[1] - a[1])[0];
+      return `${f}:${dom[0]}x${dom[1]}`;
+    }).join(' ');
+    emit(`FAILURE_MAP ${top}`);
+    ADAPTIVE_DECISIONS.push({ round: 24, found: `${cands.length} candidates pre-R25`,
+      failed: top, decision: 'proceed to underlying/expiry/moneyness/quads where data allows',
+      why: 'failure concentration per family' });
+  }
+  const famOosFail = {};
+  for (const c of cands) if (c.failure_class === 'OOS_FAIL') famOosFail[c.discovery_family] = (famOosFail[c.discovery_family] || 0) + 1;
+
+  // ---- R25 UNDERLYING_RELATIONSHIPS (only with detected reference) ----
+  runRound(25, 'UNDERLYING', (!und ? [] : [
+    { cid: 'EV:und_breakout', fam: 'UNDERLYING', feature: 'und_breakout==1', formula: 'reference breakout at bar t', rel: 'underlying', items: rows.filter(r => r.und_breakout === 1), depth: 1, sig: 'EV:und_breakout' },
+    { cid: 'EV:und_lead_up', fam: 'UNDERLYING', feature: 'und_lead_up==1', formula: 'und_ret_5>1 while |opt|<0.5', rel: 'underlying', items: rows.filter(r => r.und_lead_up === 1), depth: 1, sig: 'EV:und_lead_up' },
+    { cid: 'EV:und_lead_dn', fam: 'UNDERLYING', feature: 'und_lead_dn==1', formula: 'und_ret_5<-1 while |opt|<0.5', rel: 'underlying', items: rows.filter(r => r.und_lead_dn === 1), depth: 1, sig: 'EV:und_lead_dn' },
+    { cid: 'EV:opt_lead_up', fam: 'UNDERLYING', feature: 'opt_lead_up==1', formula: 'opt_ret_5>1 while |und|<0.5', rel: 'underlying', items: rows.filter(r => r.opt_lead_up === 1), depth: 1, sig: 'EV:opt_lead_up' },
+    { cid: 'EV:und_divergence', fam: 'UNDERLYING', feature: 'und_divergence==1', formula: '|return_5 - beta*und_ret_5|>2', rel: 'underlying', items: rows.filter(r => r.und_divergence === 1), depth: 1, sig: 'EV:und_divergence' },
+    { cid: 'EV:overreaction', fam: 'UNDERLYING', feature: 'overreaction==1', formula: '|opt|/|und|>2', rel: 'underlying', items: rows.filter(r => r.overreaction === 1), depth: 1, sig: 'EV:overreaction' },
+    { cid: 'EV:underreaction', fam: 'UNDERLYING', feature: 'underreaction==1', formula: '|opt|/|und|<0.5', rel: 'underlying', items: rows.filter(r => r.underreaction === 1), depth: 1, sig: 'EV:underreaction' },
+    { cid: 'EV:resp_spread_up', fam: 'UNDERLYING', feature: 'resp_spread>2', formula: '', rel: 'underlying', items: rows.filter(r => r.resp_spread > 2), depth: 1, sig: 'EV:resp_up' },
+    { cid: 'EV:resp_spread_dn', fam: 'UNDERLYING', feature: 'resp_spread<-2', formula: '', rel: 'underlying', items: rows.filter(r => r.resp_spread < -2), depth: 1, sig: 'EV:resp_dn' },
+  ]));
+  if (!und) emit('ROUND 25 UNDERLYING: skipped (no reference series)');
+  // ---- R26 EXPIRY_RELATIONSHIPS ----
+  runRound(26, 'EXPIRY', expCols.slice(0, 12).flatMap(col => ([
+    { cid: `XS:${col}+`, fam: 'EXPIRY_RELATIONSHIP', feature: `${col}>0`, formula: `front-minus-next spread>0 at bar t`, rel: 'cross-expiry', items: rows.filter(r => r[col] > 0), depth: 1, sig: `XS:${col}+` },
+    { cid: `XS:${col}-`, fam: 'EXPIRY_RELATIONSHIP', feature: `${col}<0`, formula: `front-minus-next spread<0 at bar t`, rel: 'cross-expiry', items: rows.filter(r => r[col] < 0), depth: 1, sig: `XS:${col}-` },
+  ])));
+  if (!expCols.length) emit('ROUND 26 EXPIRY: skipped (single expiry)');
+  // ---- R27 MONEYNESS_CONDITIONAL ----
+  runRound(27, 'MONEYNESS', (() => {
+    if (!und) return [];
+    const bands = ['ATM_LIKE_ABOVE', 'ATM_LIKE_BELOW', 'NEAR_ABOVE', 'NEAR_BELOW', 'MODERATE_ABOVE', 'MODERATE_BELOW', 'DEEP_ABOVE', 'DEEP_BELOW'];
+    const specs = bands.map(b => ({
+      cid: `MN:${b}`, fam: 'MONEYNESS', feature: `moneyness_band==${b}`, formula: `strike distance band ${b} at bar t`, rel: 'chain',
+      items: rows.filter(r => r.moneyness_band === b), depth: 1, sig: `MN:${b}`,
+    }));
+    const topEv = adaptPool.filter(x => x.combination_depth === 1).slice(0, 2);
+    for (const { c } of topEv.map(c => ({ c }))) {
+      const pd = POOL.find(p => p.key === c.combination_signature.replace(/^EV:/, ''));
+      const items = pd ? pd.items : (maskReg.get(c.candidate) || []);
+      specs.push({ cid: `C27:${c.candidate}+ATM`, fam: 'MONEYNESS', feature: `${c.candidate} AND ATM_LIKE`,
+        formula: 'base AND |strike distance|<=1% at bar t', rel: 'chain',
+        items: items.filter(r => r.moneyness_band === 'ATM_LIKE_ABOVE' || r.moneyness_band === 'ATM_LIKE_BELOW'),
+        depth: 2, sig: `C27:${c.candidate}+ATM` });
+    }
+    return specs;
+  })());
+  if (!und) emit('ROUND 27 MONEYNESS: skipped (MONEYNESS_STATUS=UNAVAILABLE)');
+  // ---- R28 QUADS (depth 4, only with OOS-positive triple parents) ----
+  runRound(28, 'FINAL_QUADS', (() => {
+    if ((cfg.maxCombinationDepth || 3) < 4) return [];
+    const tripSurv = cands.filter(c => c.combination_depth === 3 && c.FWD_VAL_expectancy > 0 && c.FWD_OOS_expectancy > 0).slice(0, 8);
+    if (famOosFail.TRIPLE >= 5) {
+      emit('R28 skipped for TRIPLE family: ≥5 OOS_FAILs (adaptive deprioritization)');
+      return [];
+    }
+    const specs = [];
+    for (const tc of tripSurv) {
+      const items0 = maskReg.get(tc.candidate) || [];
+      if (items0.length < cfg.minEvents) continue;
+      for (const pm of POOL) {
+        if (specs.length >= (cfg.maxQuadCombinations || 500)) break;
+        if (tc.combination_signature.indexOf(pm.key) >= 0) continue;
+        const setB = new Set();
+        for (const r of rows) if (pm.test(r)) setB.add(r);
+        const items = items0.filter(r => setB.has(r));
+        if (items.length < cfg.minEvents) continue;
+        const qs = quickStats(items);
+        if (!(qs.trainMean > 0)) continue;
+        specs.push({ cid: `Q:${tc.candidate}+${pm.key}`, fam: 'QUAD', feature: `${tc.candidate} AND ${pm.key}`,
+          formula: `(${tc.formula}) AND ${pm.key} at bar t`, rel: 'chain', items, depth: 4,
+          sig: `Q:${tc.candidate}+${pm.key}` });
+      }
+      if (specs.length >= (cfg.maxQuadCombinations || 500)) break;
+    }
+    return specs;
+  })());
+  // ---- adaptive continuation (§2, §23): rounds 29+ consume the frontier ----
+  // Each round evaluates the next batch of frontier triples (never re-generated
+  // from OOS: frontier scores use train/validation only). Stops on survivor,
+  // budget, empty frontier, or repeated zero-yield rounds.
+  let adaptRound = 29, zeroYieldStreak = 0, searchExhaustedNaturally = false;
+  while (adaptRound <= cfg.maxRounds) {
+    if (checkStop() === 'A') break;
+    if (cands.length >= cfg.maxTotalCandidates) { stopReason.why = 'maxTotalCandidates'; break; }
+    if (budgetDead()) { stopReason.why = 'maxRuntimeSeconds'; break; }
+    const pairSurv = cands.filter(c => c.combination_depth === 2 && c.FWD_VAL_expectancy > 0)
+      .sort((a, b) => b.discovery_score - a.discovery_score).slice(0, 5);
+    const batch = [];
+    for (const pc of pairSurv) {
+      const parts = pc.combination_signature.slice(2).split('+');
+      for (const pm of POOL.slice(0, 12)) {
+        if (batch.length >= 20) break;
+        if (parts.indexOf(pm.key) >= 0) continue;
+        const sig = `T:${pc.candidate}+${pm.key}`;
+        if (HYPS.seen.has(`${adaptRound}|TRIPLE|${sig}`)) continue;
+        const pa = POOL.find(p => p.key === parts[0]), pb = POOL.find(p => p.key === parts[1]);
+        if (!pa || !pb) continue;
+        const setB = new Set();
+        for (const r of rows) if (pm.test(r)) setB.add(r);
+        const items = rows.filter(r => pa.test(r) && pb.test(r) && setB.has(r));
+        if (items.length < cfg.minEvents) continue;
+        const qs = quickStats(items);
+        if (!(qs.trainMean > 0)) continue;
+        batch.push({ pc, pm, items });
+      }
+      if (batch.length >= 20) break;
+    }
+    if (!batch.length) {
+      emit(`ROUND ${adaptRound} ADAPTIVE: frontier exhausted (no unevaluated triples) — stopping search`);
+      searchExhaustedNaturally = true;
+      break;
+    }
+    const before = cands.length;
+    runRound(adaptRound, 'ADAPTIVE_TRIPLES', batch.map(({ pc, pm, items }) => ({
+      cid: `T:${pc.candidate}+${pm.key}`, fam: 'TRIPLE',
+      feature: `${pc.candidate} AND ${pm.key}`,
+      formula: `(${pc.formula}) AND ${pm.key} at bar t (adaptive R${adaptRound})`,
+      rel: 'chain', items, depth: 3, sig: `T:${pc.candidate}+${pm.key}`,
+    })));
+    const yielded = cands.length - before;
+    ADAPTIVE_DECISIONS.push({ round: adaptRound, found: `${yielded} candidates from ${batch.length} frontier triples`,
+      failed: '-', decision: yielded ? 'continue while frontier yields' : 'watch zero-yield streak',
+      why: 'frontier parent discovery scores (train/val only)' });
+    if (!yielded) zeroYieldStreak++;
+    else zeroYieldStreak = 0;
+    if (zeroYieldStreak >= 3) {
+      emit('STOP: 3 consecutive zero-yield adaptive rounds (E: no new unique hypotheses of value)');
+      searchExhaustedNaturally = true;
+      break;
+    }
+    adaptRound++;
+  }
+  prog(0.7, 'oos');
+  emit(`CANDIDATES evaluated=${cands.length} hypotheses_tested=${HYPS.tested} unique=${HYPS.unique} dups=${HYPS.dups}`);
+  if (stopReason.why) emit(`STOP: ${stopReason.why}`);
+
   prog(0.8, 'gates');
 
   // exit propagation gate TEST_A/B/C on shared entries (§12, §18I)
@@ -1980,7 +2530,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
     }
     const sums = {}, hashes = {}, dists = {}, fins = {}, skips = {};
     for (const tp of [1.0, 2.0, 3.0]) {
-      const bt = OD.backtest(featBySym, sig, { cid: 'G' + tp, sl: cfg.sl, tp, trail: null, mode: 'premium', hold: cfg.hold });
+      const bt = OD.backtest(featBySym, sig, { cid: 'G' + tp, sl: cfg.sl, tp, trail: null, mode: 'premium', hold: cfg.hold, exec: execMode });
       const led = bt.ledger;
       skips[tp] = bt.skipped;
       const rets = led.map(t => t.ret);
@@ -2079,10 +2629,37 @@ OD.run = function (text, cfg, onLog, onProgress) {
   for (const g of filtLog) emit(`  ${g.filter_id} ${g.filter}: in=${g.input_count} passed=${g.passed_count} rejected=${g.rejected_count} rate=${g.pass_rate}% STATUS=${g.status} ms=${g.execution_ms} (${g.rejection_reason})`);
   prog(0.92, 'report');
 
-  // ================= POST-ROUNDS: exit matrix, robustness, boards, diversity =================
+  // ================= POST-ROUNDS: frontier, validated scoring, exit matrix =================
+  // ---- OOS exposure (§17): every candidate evaluated once on frozen OOS; count it ----
+  const OOS_EXPOSURE_COUNT = cands.length;
+  if (OOS_EXPOSURE_COUNT > 1000) emit('OOS_EXPOSURE_WARNING: >1000 candidates evaluated on the same frozen OOS; require a new unseen OOS period before declaring validation');
+  // ---- frontier (§23): scored next experiments (train/val only — never OOS) ----
+  const frontier = [];
+  {
+    const pairSurv = cands.filter(c => c.combination_depth === 2 && c.FWD_VAL_expectancy > 0)
+      .sort((a, b) => b.discovery_score - a.discovery_score).slice(0, 5);
+    for (const pc of pairSurv) {
+      const parts = pc.combination_signature.slice(2).split('+');
+      for (const pm of POOL.slice(0, 12)) {
+        if (parts.indexOf(pm.key) >= 0) continue;
+        const sig = `T:${pc.candidate}+${pm.key}`;
+        if (HYPS.seen.has('24|TRIPLE|' + sig)) continue;
+        frontier.push({ hypothesis_id: 'F-' + frontier.length, family: 'TRIPLE',
+          parents: [pc.candidate], score: Math.round(pc.discovery_score * 1000) / 1000,
+          oos_evidence: 'parent OOS not consulted (frozen)',
+          robustness: 'unevaluated', sample: pc.events,
+          failure_modes_avoided: pc.failure_reason,
+          next: `evaluate triple ${sig}` });
+        if (frontier.length >= 20) break;
+      }
+      if (frontier.length >= 20) break;
+    }
+    emit(`FRONTIER items=${frontier.length} (top: ${frontier.slice(0, 3).map(f => f.next).join(' | ') || 'none'})`);
+  }
   // ---- exit matrix (§24) for top discovery survivors: 4 independent configs, unique IDs ----
   const exitTop = cands.filter(c => c.FWD_IS_expectancy > 0)
     .sort((a, b) => b.discovery_score - a.discovery_score).slice(0, 10);
+  let exitTopEvalCount = 0;
   for (const c of exitTop) {
     const items = maskReg.get(c.candidate) || [];
     const sigs = items.map(r => ({ sym: r.symbol, i: idxBySym.get(r.symbol).get(r.ts) })).filter(s => s.i != null);
@@ -2096,8 +2673,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
     ];
     const mx = {};
     for (const v of variants) {
+      exitTopEvalCount++;
       try {
-        const led = OD.backtest(featBySym, sigs, { cid: v.id, ...v.kw }).ledger;
+        const led = OD.backtest(featBySym, sigs, { cid: v.id, exec: execMode, ...v.kw }).ledger;
         const rets = led.map(t => t.ret).filter(x => isFinite(x));
         mx[v.id.split(':').pop()] = { trades: led.length,
           expectancy: rets.length ? rets.reduce((a, b) => a + b, 0) / rets.length : NaN,
@@ -2179,22 +2757,40 @@ OD.run = function (text, cfg, onLog, onProgress) {
     bySymIdx.set(s, m);
   }
   const missingness = [];
+  // per-contract missing concentration for CONTRACT_SPECIFIC classification
+  const featSymMiss = new Map();
   for (const [fname] of FEAT_DEFS) {
     let miss = 0, init = 0, rawgap = 0, chainalign = 0, other = 0;
-    for (const r of rows) {
+    const perSym = new Map();
+    let maxRun = 0, run = 0;
+    const ordered = rows.slice().sort((a, b) => (a.symbol < b.symbol ? -1 : 1) || a.ts - b.ts);
+    for (const r of ordered) {
       const v = r[fname];
-      if (typeof v === 'number' && !isNaN(v)) continue;
+      if (typeof v === 'number' && !isNaN(v)) { run = 0; continue; }
       miss++;
+      run++;
+      if (run > maxRun) maxRun = run;
+      perSym.set(r.symbol, (perSym.get(r.symbol) || 0) + 1);
       const idx = bySymIdx.get(r.symbol).get(r);
       if (idx < 120) init++;
       else if (isNaN(r.close)) rawgap++;
       else if (CHAIN_FEATS.has(fname)) chainalign++;
       else other++;
     }
+    const syms = [...perSym.keys()];
+    const concSym = syms.length && syms.length < bySymIdx.size / 2 && miss > 0;
+    const cls = miss === rows.length ? 'STRUCTURAL'
+      : miss / Math.max(1, rows.length) > 0.8 ? 'STRUCTURAL'
+      : (init / Math.max(1, miss) > 0.7) ? 'WARMUP'
+      : concSym ? 'CONTRACT_SPECIFIC' : (miss === 0 ? 'NONE' : 'RANDOM');
+    const validRows = rows.length - miss;
     missingness.push({ feature: fname, missing_count: miss,
       missing_pct: Math.round(miss / Math.max(1, rows.length) * 1000) / 10,
       initial_lookback_missing: init, session_gap_missing: 0, contract_gap_missing: rawgap,
       chain_alignment_missing: chainalign, expiry_boundary_missing: 0, other_missing: other,
+      max_consecutive_missing: maxRun, missingness_class: cls,
+      effective_sample_size: validRows,
+      downgraded: miss / Math.max(1, rows.length) > 0.5,
       status: miss === rows.length ? 'ALWAYS_MISSING' : 'OK' });
   }
   const missWorst = missingness.slice().sort((a, b) => b.missing_pct - a.missing_pct).slice(0, 5);
@@ -2206,6 +2802,60 @@ OD.run = function (text, cfg, onLog, onProgress) {
     ['OOS_SURVIVED', 'ROBUST'].indexOf(c.final_status) >= 0 &&
     (typeof c.rm_best3 === 'number' && !isNaN(c.rm_best3) && c.rm_best3 > 0) &&
     c.exit_matrix && Object.values(c.exit_matrix).filter(m => m.expectancy > 0).length >= 2);
+  // ---- FINAL_VALIDATED_SCORE (§21): gate-passers only; IS never compensates OOS ----
+  for (const c of validated) {
+    const gates = {
+      oos_positive: c.FWD_OOS_expectancy > 0,
+      oos_trades: c.FWD_OOS_events >= 20,
+      robustness: c.robustness_score >= 5,
+      exit_independence: Object.values(c.exit_matrix).filter(m => m.expectancy > 0).length >= 2,
+      concentration: c.top5 < 0.5,
+      best_event: c.rm_best3 > 0,
+      drawdown_ok: !(c.maxDD < -5),
+      time_stability: true,
+      mt: c.perm_p_adj < 0.10,
+      data_quality: true,
+    };
+    c.paper_gates = gates;
+    const pass = Object.values(gates).every(Boolean);
+    const nz = x => (typeof x === 'number' && !isNaN(x)) ? x : 0;
+    c.FINAL_VALIDATED_SCORE = pass ? Math.round((
+      nz(c.FWD_OOS_expectancy) * 3 + nz(c.OOS_TRADE_SHARPE) * 2 +
+      Math.log10(1 + c.FWD_OOS_events) + nz(c.robustness_score) / 2 +
+      (1 - Math.min(1, c.top5)) + (nz(c.rm_best3) > 0 ? 1 : 0)) * 100) / 100 : 0;
+    c.paper_eligible = false; // short-sample + RESEARCH-price-model rule (§41/§7)
+    if (c.FINAL_VALIDATED_SCORE > 0) {
+      emit(`VALIDATED ${c.candidate} score=${c.FINAL_VALIDATED_SCORE} (paper still blocked: short sample, research prices)`);
+    }
+  }
+  const paperList = validated.filter(c => c.paper_eligible);
+  // ---- neighborhood search (§20B): exhaust winner's local neighborhood ----
+  let neighborhood = { searched: false };
+  const best = validated.slice().sort((a, b) => b.FINAL_VALIDATED_SCORE - a.FINAL_VALIDATED_SCORE)[0];
+  if (best) {
+    const items0 = maskReg.get(best.candidate) || [];
+    const sigs0 = items0.map(r => ({ sym: r.symbol, i: idxBySym.get(r.symbol).get(r.ts) })).filter(s => s.i != null);
+    const results = [];
+    for (const sl of [0.3, 0.5, 0.7]) for (const tp of [0.7, 1.0, 1.5]) for (const hold of [3, 5, 8]) {
+      if (sl === cfg.sl && tp === cfg.tp && hold === cfg.hold) continue;
+      try {
+        const led = OD.backtest(featBySym, sigs0, { cid: `NB:${best.candidate}`, sl, tp, trail: null, mode: 'premium', hold, exec: execMode }).ledger;
+        const rets = led.map(t => t.ret).filter(x => isFinite(x));
+        if (rets.length) results.push({ sl, tp, hold, n: rets.length, exp: rets.reduce((a, b) => a + b, 0) / rets.length });
+      } catch (e) { /* neighbor failed; recorded as untestable */ }
+    }
+    results.sort((a, b) => b.exp - a.exp);
+    const better = results.filter(r => r.exp > best.FWD_expectancy * 1.2);
+    neighborhood = { searched: true, configs: results.length,
+      best_neighbor: results[0] || null, materially_better: better.length,
+      winner_adopted: best.candidate };
+    GLOBAL_TESTS += results.length;
+    emit(`NEIGHBORHOOD ${best.candidate}: searched=${results.length} best=${results[0] ? `sl${results[0].sl}/tp${results[0].tp}/h${results[0].hold} exp${results[0].exp.toFixed(3)}` : 'none'} materially_better=${better.length}`);
+  }
+  // global test accounting (§18): hypotheses + exit variants + neighborhood evals
+  GLOBAL_TESTS += exitTopEvalCount;
+  emit(`GLOBAL_TEST_COUNT=${GLOBAL_TESTS} (hypotheses=${HYPS.tested} + exit/neighborhood evals; never reset)`);
+  emit(`OOS_EXPOSURE_COUNT=${OOS_EXPOSURE_COUNT} (frozen single-pass evaluations; entries never re-derived from OOS)`);
   emit(`OOS_CANDIDATES_TESTED=${cands.length} OOS_CANDIDATES_SURVIVED=${survN} VALIDATED=${validated.length}`);
   emit('OOS_STATUS = ' + (cands.length === 0 ? 'BLOCKED_NO_INPUT' : (survN === 0 ? 'FAIL' : 'MIXED')));
   emit('PAPER_ELIGIBLE = NO  RESEARCH_WINNER = NONE');
@@ -2248,17 +2898,31 @@ OD.run = function (text, cfg, onLog, onProgress) {
   if (!gate.blocked && !gate.structPass) blockers.push('EXIT_STRUCTURE');
   if (!gate.blocked && !gate.metricPass) blockers.push('EXIT_METRIC');
   if (la.status !== 'PASS') blockers.push('LOOKAHEAD_' + la.status);
+  GLOBAL_TESTS = HYPS.tested + exitTopEvalCount + (neighborhood.configs || 0);
   const roundsWanted = cfg.rounds === 'all' ? cfg.maxRounds : cfg.rounds.length;
   const roundsRan = ROUND_LOG.length;
+  const dataHash = hashCfg([norm.length, meta.n_contracts, meta.timestamp_range[0], meta.timestamp_range[1]].join('|'));
+  const checkpoint = { runId: RUN_ID, dataHash, cfgHash: hashCfg(cfg), seed: cfg.seed,
+    seen: [...HYPS.seen], roundsDone: ROUND_LOG.map(r => r.round) };
+  const frontierOpen = frontier.filter(f => {
+    const fam = f.family;
+    return (famOosFail[fam] || 0) < 5;
+  }).length;
   if (blockers.length) {
     FINAL_STATE = 'BLOCKED_' + blockers[0];
-  } else if (validated.length > 0) {
+  } else if (validated.length > 0 && neighborhood.searched && neighborhood.materially_better === 0) {
     FINAL_STATE = 'VALIDATED_EDGE_FOUND';
+  } else if (validated.length > 0) {
+    FINAL_STATE = 'DISCOVERY_EDGE_OOS_FAILED'; // survivor exists but neighborhood/frontier not exhausted
   } else if (stopReason.why === 'maxTotalCandidates' || stopReason.why === 'maxRuntimeSeconds') {
     FINAL_STATE = 'SEARCH_BUDGET_EXHAUSTED';
+  } else if (typeof searchExhaustedNaturally !== 'undefined' && searchExhaustedNaturally) {
+    FINAL_STATE = 'NO_EDGE_FOUND_WITHIN_SEARCH_BUDGET'; // frontier exhausted naturally (§20E)
   } else if (meta.n_days < 6 && cands.length === 0) {
     FINAL_STATE = 'INSUFFICIENT_DATA';
-  } else if (roundsRan < roundsWanted) {
+  } else if (newUnique() === 0 && initialSeen > 0) {
+    FINAL_STATE = 'NO_EDGE_FOUND_WITHIN_SEARCH_BUDGET'; // resumed search, nothing new (§20E)
+  } else if (roundsRan < roundsWanted && (stopReason.why || budgetDead())) {
     FINAL_STATE = 'SEARCH_BUDGET_EXHAUSTED';
   } else {
     FINAL_STATE = 'NO_EDGE_FOUND_WITHIN_SEARCH_BUDGET';
@@ -2282,6 +2946,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
     + `snapshots=${meta.synchronized_snapshots} feature_rows=${rows.length} feature_columns=${FEAT_DEFS.length} `
     + `raw_events=${cands.reduce((a, c) => a + c.events, 0)} candidates=${cands.length} `
     + `OOS_tested=${cands.length} OOS_survived=${survN} paper_eligible=0`);
+  emit(`UNDERLYING reference=${und ? refSym : 'none'} MONEYNESS=${und ? 'AVAILABLE' : 'UNAVAILABLE'} EXPIRY_ENGINE=${expCols.length ? 'AVAILABLE' : 'NOT_AVAILABLE'}`);
+  emit(`GLOBAL_TEST_COUNT=${GLOBAL_TESTS} OOS_EXPOSURE_COUNT=${OOS_EXPOSURE_COUNT}`);
+  emit(`COVERAGE rounds=${ROUND_LOG.length}/${roundsWanted} hyps=${HYPS.tested} cands=${cands.length} exhausted=${stopReason.why || 'rounds-complete'}`);
   emit(`FINAL_STATUS=${FINAL_STATE}`);
   maskReg.clear(); // free signal-row references before packaging the result
 
@@ -2294,8 +2961,25 @@ OD.run = function (text, cfg, onLog, onProgress) {
     rounds: ROUND_LOG,
     hypothesisTotals: { total: HYPS.tested, unique: HYPS.unique, duplicates: HYPS.dups,
       byRound: Object.fromEntries(Object.entries(HYPS.byRound).map(([k, v]) => [k, { ...v }])) },
+    checkpoint, dataHash, globalTests: GLOBAL_TESTS, oosExposure: OOS_EXPOSURE_COUNT,
+    newUnique: newUnique(),
     boards, diversity, oosCounts,
     missingness: missingness.slice().sort((a, b) => b.missing_pct - a.missing_pct).slice(0, 20),
+    understanding, frontier, neighborhood, validated: validated.map(c => c.candidate),
+    bestValidated: best ? best.candidate : null,
+    globalTests: GLOBAL_TESTS, oosExposure: OOS_EXPOSURE_COUNT,
+    adaptiveDecisions: ADAPTIVE_DECISIONS, familyTable,
+    moneynessStatus: und ? 'AVAILABLE' : 'UNAVAILABLE',
+    expiryEngine: expCols.length ? 'AVAILABLE' : 'NOT_AVAILABLE',
+    coverage: {
+      rounds_attempted: ROUND_LOG.length, rounds_wanted: roundsWanted,
+      hypotheses_tested: HYPS.tested, hypotheses_unique: HYPS.unique,
+      candidates_evaluated: cands.length,
+      families_tested: [...new Set(cands.map(c => c.discovery_family))],
+      skipped_rounds: [17].filter(() => !und),
+      unavailable_modules: Object.entries(mods).filter(([, v]) => v[0] !== 'AVAILABLE').map(([k]) => k),
+      exhausted: stopReason.why || 'rounds-complete',
+    },
     limitations: {
       EXPIRY_GENERALIZATION: meta.n_expiries > 1 ? 'TESTABLE' : 'UNTESTABLE',
       EXECUTION_GENERALIZATION: meta.has_bidask ? 'TESTABLE' : 'UNTESTABLE',

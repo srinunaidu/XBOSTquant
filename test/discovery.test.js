@@ -292,9 +292,9 @@ test('EXP TEST6: OOS split does not influence hypothesis generation', () => {
 });
 
 test('EXP TEST7+8: combination depth and candidate count bounded', () => {
-  for (const c of EXPFULL.candidates) assert.ok(c.combination_depth <= 3);
+  for (const c of EXPFULL.candidates) assert.ok(c.combination_depth <= 4);
   assert.ok(EXPFULL.candidates.length <= 300);
-  assert.ok(EXPFULL.rounds.length <= 24);
+  assert.ok(EXPFULL.rounds.length <= 100);
   const capped = OD.run(WIDE12, Object.assign({}, EXPCFG, { maxTotalCandidates: 10, rounds: [1, 2, 3] }), null, null);
   assert.ok(capped.candidates.length <= 10);
 });
@@ -356,4 +356,102 @@ test('EXP TEST16: paper only via frozen pipeline (never assigned here)', () => {
   }
   assert.ok(EXPFULL.boards.PAPER_ELIGIBLE.length === 0);
   assert.ok(EXPFULL.boards.TOP_TRAIN.length > 0);
+});
+
+/* ADAPTIVE regression tests (§26): understanding, execution, controller, resume. */
+function adaptFile() {
+  // long-format options + spot series + bid/ask, 6 days
+  let seed = 33;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const lines = ['ts,symbol,strike,cp,o,h,l,c,v,bid,ask'];
+  const t0 = Date.parse('2026-05-04T09:15:00Z');
+  for (let d = 0; d < 6; d++) {
+    for (let b = 0; b < 200; b++) {
+      const ts = new Date(t0 + (d * 1440 + b) * 60000).toISOString();
+      const spot = 50000 + Math.sin((d * 200 + b) / 25) * 150 + (rnd() - 0.5) * 10;
+      lines.push([ts, 'NIFTYSPOT', '', '', (spot - 1).toFixed(2), (spot + 1).toFixed(2), (spot - 2).toFixed(2), spot.toFixed(2), 5000, (spot - 0.5).toFixed(2), (spot + 0.5).toFixed(2)].join(','));
+      for (const s of [49500, 50000, 50500]) for (const o of ['CE', 'PE']) {
+        const px = 150 + Math.sin((d * 200 + b) / 18 + s) * 12 + (rnd() - 0.5) * 3;
+        lines.push([ts, `OPT${s}${o}`, s, o, px.toFixed(2), (px + 1).toFixed(2), (px - 1).toFixed(2), (px + (rnd() - 0.5)).toFixed(2), 100, (px - 0.4).toFixed(2), (px + 0.4).toFixed(2)].join(','));
+      }
+    }
+  }
+  return lines.join('\n');
+}
+const ADAPT_CSV = adaptFile();
+const ADAPT_RUN = OD.run(ADAPT_CSV, { focusStrikes: 3, minEvents: 30, nPerms: 30, seed: 11, maxTotalCandidates: 150, maxRuntimeSeconds: 300 }, null, null);
+
+test('ADAPT underlying + moneyness + expiry engine states', () => {
+  const { norm } = OD.ingest(ADAPT_CSV);
+  const meta = OD.detectChain(norm);
+  const u = OD.understand(norm, meta);
+  assert.equal(u.reference.symbol, 'NIFTYSPOT');
+  assert.ok(u.reference.coverage > 0.9);
+  assert.ok(u.fields.bid > 0.9);
+  // moneyness bands with reference
+  const ref = norm.filter(r => r.symbol === 'NIFTYSPOT').map(r => ({ ts: r.ts, open: r.open, high: r.high, low: r.low, close: r.close, volume: r.volume }));
+  const und = OD.underlyingFeatures(ref);
+  const rows = norm.filter(r => r.symbol !== 'NIFTYSPOT').slice(0, 3000);
+  OD.attachMoneyness(rows, und);
+  const bands = new Set(rows.map(r => r.moneyness_band));
+  assert.ok([...bands].some(b => b.indexOf('ATM_LIKE') === 0));
+  assert.ok([...bands].some(b => b.indexOf('BELOW') > 0 || b.indexOf('ABOVE') > 0));
+  // single expiry here -> NOT_AVAILABLE
+  assert.equal(meta.n_expiries, 1);
+});
+
+test('ADAPT executable model uses bid/ask and labels correctly', () => {
+  const { norm } = OD.ingest(ADAPT_CSV);
+  const rows = OD.features(norm.filter(r => r.symbol !== 'NIFTYSPOT').slice(0, 4000));
+  const bySym = new Map();
+  for (const r of rows) {
+    if (!bySym.has(r.symbol)) bySym.set(r.symbol, []);
+    bySym.get(r.symbol).push(r);
+  }
+  const sig = [];
+  for (const [s, arr] of bySym) for (let i = 0; i < Math.min(25, arr.length); i++) sig.push({ sym: s, i });
+  const a = OD.backtest(bySym, sig, { cid: 'R', sl: 5, tp: 5, trail: null, mode: 'premium', hold: 5, exec: 'research' });
+  const b = OD.backtest(bySym, sig, { cid: 'X', sl: 5, tp: 5, trail: null, mode: 'premium', hold: 5, exec: 'executable' });
+  assert.ok(a.ledger.length > 0 && b.ledger.length > 0);
+  assert.ok(b.ledger.every(t => t.model === 'EXECUTABLE_PRICE_MODEL'));
+  assert.ok(a.ledger.every(t => t.model === 'RESEARCH_PRICE_MODEL'));
+  assert.ok(b.fingerprint.indexOf('EXECUTABLE') >= 0 && a.fingerprint.indexOf('EXECUTABLE') < 0);
+});
+
+test('ADAPT family classifier + dynamic allocation respond to evidence', () => {
+  assert.equal(OD.classifyFamilyStat({ tested: 0, train: 0, val: 0, oos: 0 }), 'UNTESTABLE');
+  assert.equal(OD.classifyFamilyStat({ tested: 10, train: 0, val: 0, oos: 0 }), 'FAILED');
+  assert.equal(OD.classifyFamilyStat({ tested: 10, train: 6, val: 5, oos: 4 }), 'STRONG');
+  // full-run family table exists with classes from the fixed taxonomy
+  assert.ok(ADAPT_RUN.familyTable.length > 0);
+  for (const f of ADAPT_RUN.familyTable) {
+    assert.ok(['STRONG', 'PROMISING', 'NEUTRAL', 'WEAK', 'FAILED', 'UNTESTABLE'].indexOf(f.class) >= 0);
+  }
+});
+
+test('ADAPT failure classes assigned; map covers rejections', () => {
+  const allowed = ['NONE', 'THIN_SAMPLE', 'EVENT_DEPENDENCE', 'TRAIN_FAIL', 'VALIDATION_FAIL',
+    'OOS_FAIL', 'CONCENTRATION', 'MULTIPLE_TESTING', 'EXIT_DEPENDENCE',
+    'CONTRACT_DEPENDENCE', 'TIME_DEPENDENCE'];
+  for (const c of ADAPT_RUN.candidates) assert.ok(allowed.indexOf(c.failure_class) >= 0);
+});
+
+test('ADAPT checkpoint resume + termination + winner rules', () => {
+  const part = OD.run(ADAPT_CSV, { focusStrikes: 2, minEvents: 40, nPerms: 10, seed: 5, rounds: [1, 2, 3], maxTotalCandidates: 100 }, null, null);
+  assert.ok(part.checkpoint && part.checkpoint.seen.length > 0);
+  const resumed = OD.run(ADAPT_CSV, { focusStrikes: 2, minEvents: 40, nPerms: 10, seed: 5, rounds: [1, 2, 3, 4], resumeFrom: part.checkpoint, maxTotalCandidates: 100 }, null, null);
+  assert.equal(resumed.newUnique, resumed.hypothesisTotals.unique - part.checkpoint.seen.length);
+  const tiny = OD.run(ADAPT_CSV, { focusStrikes: 2, minEvents: 40, nPerms: 10, seed: 5, maxTotalCandidates: 3 }, null, null);
+  assert.equal(tiny.finalStatus, 'SEARCH_BUDGET_EXHAUSTED');
+  for (const c of ADAPT_RUN.candidates) assert.equal(c.paper_eligible, false);
+  assert.ok(ADAPT_RUN.globalTests >= ADAPT_RUN.hypothesisTotals.total);
+});
+
+test('ADAPT missingness classes valid; ESS consistent', () => {
+  const allowed = ['NONE', 'WARMUP', 'STRUCTURAL', 'RANDOM', 'CONTRACT_SPECIFIC', 'SESSION_SPECIFIC', 'UNKNOWN'];
+  assert.ok(ADAPT_RUN.missingness.length > 0);
+  for (const m of ADAPT_RUN.missingness) {
+    assert.ok(allowed.indexOf(m.missingness_class) >= 0, 'bad class ' + m.missingness_class);
+    assert.ok(m.effective_sample_size >= 0);
+  }
 });

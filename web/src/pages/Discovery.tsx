@@ -400,6 +400,15 @@ export default function Discovery() {
                   hypotheses tested={res.hypothesisTotals.total} · unique={res.hypothesisTotals.unique} · duplicates={res.hypothesisTotals.duplicates}
                   {res.oosCounts && (<span> · OOS tested={res.oosCounts.OOS_TESTED} positive={res.oosCounts.OOS_POSITIVE} threshold={res.oosCounts.OOS_THRESHOLD_PASS} final={res.oosCounts.OOS_FINAL_SURVIVOR}</span>)}
                   {res.finalStatus && (<span> · FINAL_STATUS={res.finalStatus}</span>)}
+                  {res.globalTests !== undefined && (<span> · GLOBAL_TESTS={res.globalTests} · OOS_EXPOSURE={res.oosExposure}</span>)}
+                </div>
+              )}
+              {res.understanding && (
+                <div className="text-[11px] num text-zinc-400 mb-2">
+                  underlying={res.understanding.reference ? res.understanding.reference.symbol : 'none'}
+                  {res.moneynessStatus && (<span> · MONEYNESS={res.moneynessStatus}</span>)}
+                  {res.expiryEngine && (<span> · EXPIRY_ENGINE={res.expiryEngine}</span>)}
+                  {res.bestValidated && (<span> · BEST_VALIDATED={res.bestValidated}</span>)}
                 </div>
               )}
               {res.rounds && res.rounds.length > 0 && (
@@ -422,6 +431,36 @@ export default function Discovery() {
                       <div className="text-zinc-300 truncate">{Array.isArray(v) ? v.slice(0, 3).join(', ') : ''}</div>
                     </div>
                   ))}
+                </div>
+              )}
+              {res.adaptiveDecisions && res.adaptiveDecisions.length > 0 && (
+                <div className="mt-2">
+                  <div className="lbl mb-1">ADAPTIVE DECISIONS</div>
+                  <div className="text-[11px] num flex flex-col gap-0.5">
+                    {res.adaptiveDecisions.map((d: any, i: number) => (
+                      <div key={i}><span className="text-zinc-500">R{d.round}</span> found: {fmt(d.found)} · failed: {fmt(d.failed)} · → {fmt(d.decision)} <span className="text-zinc-600">({fmt(d.why)})</span></div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {res.frontier && res.frontier.length > 0 && (
+                <div className="mt-2">
+                  <div className="lbl mb-1">RESEARCH FRONTIER ({res.frontier.length})</div>
+                  <div className="text-[11px] num flex flex-col gap-0.5">
+                    {res.frontier.slice(0, 10).map((f: any, i: number) => (
+                      <div key={i}><span className="text-zinc-500">{f.hypothesis_id} [{f.family}]</span> score={fmt(f.score)} · next: {fmt(f.next)}</div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {res.familyTable && res.familyTable.length > 0 && (
+                <div className="mt-2">
+                  <div className="lbl mb-1">FAMILY PERFORMANCE (adaptive controller)</div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {res.familyTable.map((f: any, i: number) => (
+                      <span key={i} title={`tested=${f.tested} train=${f.train} val=${f.val} oos=${f.oos} mt=${f.mt}`} className="text-[10px] num px-2 py-0.5 rounded-full border border-zinc-700 text-zinc-300">{f.family} · {f.class}</span>
+                    ))}
+                  </div>
                 </div>
               )}
               {res.limitations && (
