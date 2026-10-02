@@ -19,6 +19,7 @@ self.onmessage = function (e) {
     result.wallMs = Date.now() - t0;
     self.postMessage({ type: 'done', result });
   } catch (err) {
-    self.postMessage({ type: 'error', message: String((err && err.message) || err).slice(0, 800) });
+    self.postMessage({ type: 'error', message: String((err && err.message) || err).slice(0, 800),
+      log: (err && err.log) || [], finalStatus: (err && err.finalStatus) || 'BLOCKED_DATA' });
   }
 };

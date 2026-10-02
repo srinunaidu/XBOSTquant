@@ -10,7 +10,7 @@ import itertools
 import pandas as pd
 import numpy as np
 from .ingestion import (load_dataset, detect_chain, select_focus,
-                        module_availability, data_health)
+                        module_availability, data_health, build_registry)
 from .chain_normalizer import normalize
 from .settings import DiscoverySettings
 from .timeframe import detect_frequency, resample_ohlcv
@@ -78,6 +78,29 @@ def main():
     meta = detect_chain(norm)
     print("OPTIONS_INGESTION_AUDIT\n-----------------------")
     print(f"source_file: {a.path}\nlayout: {layout}\nrows: {len(norm)}")
+    # ---- contract registry: enrich identity metadata parsed from tokens ----
+    registry = build_registry(norm, layout)
+    reg_by_sym = {r["contract_id"]: r for r in registry}
+    n_ps = sum(1 for r in registry if str(r["strike"]) != "nan" and r["strike"] != "UNKNOWN")
+    n_pt = sum(1 for r in registry if r["option_type"] != "UNKNOWN")
+    print("CONTRACT_PARSER_AUDIT")
+    print(f"detected_contracts={len(registry)} parsed_strikes={n_ps} parsed_types={n_pt}")
+    for r in registry:
+        print(f"  {r['contract_id']} | expiry={'+'.join(r['expiry'])} | strike={r['strike']} | "
+              f"type={r['option_type']} | src={r['metadata_source']} | method={r['parse_method']} | "
+              f"conf={r['parse_confidence']} | "
+              f"status={'PARSE_GAP' if r['reason_disabled'] else 'OK'}"
+              f"{' reason=' + r['reason_disabled'] if r['reason_disabled'] else ''}")
+    for sym, rec in reg_by_sym.items():
+        m = norm["symbol"].astype(str) == sym
+        if str(rec["strike"]) not in ("nan", "UNKNOWN", "None"):
+            norm.loc[m & pd.to_numeric(norm["strike"], errors="coerce").isna(), "strike"] = float(rec["strike"])
+        if rec["option_type"] != "UNKNOWN":
+            norm.loc[m & (norm["option_type"].astype(str) == "UNKNOWN"), "option_type"] = rec["option_type"]
+        if rec["underlying"] != "UNKNOWN":
+            norm.loc[m & (norm["underlying"].astype(str) == "UNKNOWN"), "underlying"] = rec["underlying"]
+    meta = detect_chain(norm)  # rebuild on enriched identity metadata
+    meta["registry"] = registry
     print(f"underlying: {meta['underlying']}")
     print(f"contracts: {meta['n_contracts']} {meta['contracts'][:12]}"
           f"{'...' if meta['n_contracts'] > 12 else ''}")
@@ -99,6 +122,17 @@ def main():
 
     # ---- 2. module availability (disable only what data cannot support) ----
     mods = module_availability(meta)
+    # parse-aware states (§3): BLOCKED_PARSE when extraction failed for all contracts
+    if n_pt > 0:
+        pass
+    elif len(registry) > 0:
+        mods["OPTION_TYPE_RELATIONSHIP"] = (
+            "BLOCKED_PARSE", f"option_type extraction failed for {len(registry)}/{len(registry)} contracts")
+    if n_ps > 0:
+        pass
+    elif len(registry) > 0:
+        mods["STRIKE_RELATIONSHIP"] = (
+            "BLOCKED_PARSE", f"strike extraction failed for {len(registry)}/{len(registry)} contracts")
     for m, (st, why) in mods.items():
         print(f"{m} = {st}" + (f" ({why})" if why else ""))
     if mods["OPTION_DATA"][0] != "AVAILABLE":
@@ -130,6 +164,10 @@ def main():
     if mods["STRIKE_RELATIONSHIP"][0] == "AVAILABLE":
         feat = add_crossstrike(feat, meta, strikes)
     feat = add_breadth(feat, meta)
+    dup = int(feat.duplicated(subset=["timestamp", "symbol"]).sum())
+    if dup:
+        print(f"FEATURE_ERROR: {dup} duplicate (timestamp,symbol) rows after relationship joins")
+        raise SystemExit("FEATURE_ERROR duplicate rows")
     feat = add_divergence_events(feat)
     feat = add_convergence_events(feat, REGISTRY["x_cols"])
     feat = add_catchup_events(feat, REGISTRY["x_cols"])
@@ -207,6 +245,7 @@ def main():
         fwd_oos = label_metrics(feat.loc[mask & feat["day"].isin(splits["pseudo_oos"]), "fwd_ret_5m"])
         fwd_all = label_metrics(feat.loc[mask, "fwd_ret_5m"])
         cl = cluster(feat.loc[mask, ["timestamp", "symbol"]].assign(
+            expiry=feat.loc[mask, "expiry"],
             strike=feat.loc[mask, "strike"], option_type=feat.loc[mask, "option_type"]))
         n_clu = int(cl["cluster_id"].nunique())
         ds = daily_sharpe(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
@@ -289,10 +328,10 @@ def main():
             if fam == "OPTION_TYPE_RELATIONSHIP" and mods["OPTION_TYPE_RELATIONSHIP"][0] != "AVAILABLE":
                 continue
             push(f"EV:{ec}", fam, ec, "fwd_ret_5m", "chain", "long", "5m", feat[ec] == 1)
-    # cross-strike spreads from registry (no name parsing)
+    # cross-strike spreads from registry (no name parsing; expiry-tagged ok)
     if mods["STRIKE_RELATIONSHIP"][0] == "AVAILABLE":
         for col in REGISTRY["x_cols"]:
-            if col.endswith("_retdiff"):
+            if "_retdiff" in col:
                 push(f"XS:{col}", "STRIKE_RELATIONSHIP", col, "fwd_ret_5m",
                      "cross-strike", "long", "5m", (feat[col] > 0).fillna(False))
     # breadth

@@ -148,3 +148,40 @@ def test_no_hardcoded_contract_assumptions():
                 line = src[max(0, m.start() - 60):m.end() + 60].split("\n")[0]
                 hits.append(f"{fn}: {line.strip()}")
     assert not hits, f"hardcoded assumptions found:\n" + "\n".join(hits)
+
+
+def test_reported_wide_shape_parses_contracts(tmp_path):
+    """Reported failure: 12-contract / 2-expiry wide file parsed as UNKNOWN/0.
+    Must yield 12 registry rows, valid strikes/types, non-empty focus chain."""
+    import datetime
+    import random
+    from xbost_option_discovery import ingestion
+    random.seed(5)
+    toks = [f"BNF{e}{s}{t}" for e in ["29SEP26", "27OCT26"]
+            for s in [54700, 54800, 54900] for t in ["CE", "PE"]]
+    head = ["ts", "expiry"] + [c for t in toks for c in
+                               [t + "_o", t + "_h", t + "_l", t + "_c", t + "_v"]]
+    lines = [",".join(head)]
+    t0 = datetime.datetime(2026, 8, 20, 9, 15)
+    for b in range(300):
+        ts = (t0 + datetime.timedelta(minutes=b)).strftime("%Y-%m-%d %H:%M:%S")
+        exp = "29SEP2026" if b < 200 else "27OCT2026"
+        row = [ts, exp]
+        for t in toks:
+            px = 200 + random.uniform(-25, 25)
+            row += [f"{px:.2f}", f"{px + 1:.2f}", f"{px - 1:.2f}",
+                    f"{px + random.uniform(-1, 1):.2f}", "100"]
+        lines.append(",".join(row))
+    p = str(tmp_path / "wide12.csv")
+    open(p, "w").write("\n".join(lines))
+    norm, layout = ingestion.load_dataset(p)
+    assert layout == "wide"
+    reg = ingestion.build_registry(norm, layout)
+    assert len(reg) == 12
+    assert sum(1 for r in reg if str(r["strike"]) != "nan") == 12
+    assert sum(1 for r in reg if r["option_type"] != "UNKNOWN") == 12
+    assert {s for r in reg for s in r["expiry"]} >= {"29SEP2026", "27OCT2026"}
+    assert sorted(set(r["strike"] for r in reg)) == [54700.0, 54800.0, 54900.0]
+    meta = ingestion.detect_chain(norm)
+    sub, strikes, chain = ingestion.select_focus(norm, meta, 3)
+    assert len(chain) > 0  # FOCUS chain (0) regression

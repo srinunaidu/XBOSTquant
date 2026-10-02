@@ -84,12 +84,100 @@ def _infer_wide_contracts(df):
     return {k: v for k, v in contracts.items() if "close" in v}
 
 
+OTYPE_TOKENS = ["CALL", "PUT", "CE", "PE", "C", "P"]  # longest-first; alias config, not contracts
+MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN",
+          "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
+
+def parse_contract_token(token):
+    """Multi-strategy token parse (mirrors JS engine): type suffix → expiry infix
+    (stripped first so digits can't merge into the strike) → trailing strike →
+    underlying prefix. Returns dict with parse_method/confidence."""
+    import re
+    up = re.sub(r"[\s\-]+", "_", str(token).upper())
+    otype, rest, method = None, up, []
+    for t in OTYPE_TOKENS:
+        if re.search(r"_?" + t + r"$", rest):
+            otype = _norm_otype(t)
+            rest = re.sub(r"_?" + t + r"$", "", rest)
+            method.append("type-suffix:" + t)
+            break
+    exp_infix, m4 = None, None
+    pat4 = re.compile(r"(\d{1,2})(" + "|".join(MONTHS) + r")(\d{4})(?!\d)")
+    pat2 = re.compile(r"(\d{1,2})(" + "|".join(MONTHS) + r")(\d{2})(?=\d|$|_)")
+    m4 = pat4.search(rest) or pat2.search(rest)
+    if m4:
+        yy = m4.group(3) if len(m4.group(3)) == 4 else "20" + m4.group(3)
+        exp_infix = m4.group(1).zfill(2) + m4.group(2) + yy
+        rest = rest.replace(m4.group(0), "_", 1)
+        method.append("expiry-infix")
+    strike, ms = np.nan, re.search(r"(\d{2,7}(?:\.\d+)?)$", rest)
+    if ms:
+        strike = float(ms.group(1))
+        rest = rest[: -len(ms.group(1))]
+        method.append("trailing-strike")
+    underlying, mu = None, re.search(r"^([A-Z]{2,})", rest)
+    if mu:
+        underlying = mu.group(1)
+        method.append("underlying-prefix")
+    have_both = otype is not None and not np.isnan(strike)
+    return {
+        "underlying": underlying, "expiry_infix": exp_infix, "strike": strike,
+        "option_type": otype or "UNKNOWN",
+        "parse_method": ("token:" + "+".join(method)) if method else "none",
+        "parse_confidence": ("high" if have_both else
+                             "medium" if (otype is not None or not np.isnan(strike)) else "low"),
+    }
+
+
 def _split_contract_token(token):
-    """Best-effort strike/type split of a wide contract token using discovered
-    option-type tokens is impossible without metadata, so keep the raw token as
-    symbol and leave strike/option_type to be refined by detect_chain() when the
-    token embeds them. Returns (strike_or_None, otype_or_None, symbol)."""
-    return None, None, str(token)
+    p = parse_contract_token(token)
+    return (None if np.isnan(p["strike"]) else p["strike"],
+            None if p["option_type"] == "UNKNOWN" else p["option_type"],
+            str(token))
+
+
+def build_registry(norm, layout):
+    """Canonical contract registry (§2): one row per detected contract with
+    parse method/confidence; never silently discards."""
+    rows = []
+    for sym, g in norm.groupby(norm["symbol"].astype(str)):
+        g0 = g.iloc[0]
+        has_strike = pd.to_numeric(g["strike"], errors="coerce").notna().any()
+        has_otype = ((g["option_type"].astype(str) != "UNKNOWN")).any()
+        if has_strike or has_otype:
+            strike = pd.to_numeric(g["strike"], errors="coerce").dropna()
+            strike = float(strike.iloc[0]) if len(strike) else np.nan
+            otype = g.loc[g["option_type"].astype(str) != "UNKNOWN", "option_type"]
+            otype = str(otype.iloc[0]) if len(otype) else "UNKNOWN"
+            und = g.loc[g["underlying"].astype(str) != "UNKNOWN", "underlying"]
+            rec = {"underlying": str(und.iloc[0]) if len(und) else "UNKNOWN",
+                   "strike": strike, "option_type": otype,
+                   "metadata_source": "explicit",
+                   "parse_method": "explicit:" + "+".join(
+                       (["strike"] if has_strike else []) + (["otype"] if has_otype else [])),
+                   "parse_confidence": "high" if (has_strike and has_otype) else "medium"}
+        else:
+            p = parse_contract_token(sym)
+            rec = {"underlying": p["underlying"] or "UNKNOWN", "strike": p["strike"],
+                   "option_type": p["option_type"], "metadata_source": "token",
+                   "parse_method": p["parse_method"], "parse_confidence": p["parse_confidence"]}
+        reasons = []
+        if rec["strike"] is np.nan or (isinstance(rec["strike"], float) and np.isnan(rec["strike"])):
+            reasons.append("strike extraction failed")
+        if rec["option_type"] == "UNKNOWN":
+            reasons.append("option_type extraction failed")
+        rows.append({
+            "contract_id": sym, "source_name": sym, "underlying": rec["underlying"],
+            "expiry": sorted(g["expiry"].astype(str).unique().tolist()),
+            "strike": rec["strike"], "option_type": rec["option_type"],
+            "metadata_source": rec["metadata_source"], "parse_method": rec["parse_method"],
+            "parse_confidence": rec["parse_confidence"], "enabled": True,
+            "reason_disabled": "; ".join(reasons),
+            "volume": float(pd.to_numeric(g["volume"], errors="coerce").fillna(0).sum()),
+            "bars": int(len(g)),
+        })
+    return sorted(rows, key=lambda r: -r["volume"])
 
 
 def load_long(df, schema_over=None):
@@ -127,15 +215,17 @@ def load_wide(df, schema_over=None):
     ts = pd.to_datetime(df[ts_col], errors="coerce")
     recs = []
     for token, fmap in contracts.items():
-        strike, otype, symbol = _split_contract_token(token)
+        p = parse_contract_token(token)
         n = len(df)
+        strike = None if np.isnan(p["strike"]) else p["strike"]
+        otype = p["option_type"]
         rec = pd.DataFrame({
             "timestamp": ts,
             "expiry": df[exp_col].astype(str) if exp_col else "UNKNOWN",
             "strike": pd.to_numeric(pd.Series([strike] * n), errors="coerce"),
-            "option_type": pd.Series([otype if otype else "UNKNOWN"] * n).map(_norm_otype),
-            "symbol": pd.Series([symbol] * n).astype(str),
-            "underlying": "UNKNOWN",
+            "option_type": pd.Series([otype] * n).map(_norm_otype),
+            "symbol": pd.Series([str(token)] * n).astype(str),
+            "underlying": pd.Series([p["underlying"] or "UNKNOWN"] * n).astype(str),
         })
         for role in ("open", "high", "low", "close", "volume", "oi", "bid", "ask"):
             rec[role] = pd.to_numeric(df[fmap[role]], errors="coerce") if role in fmap else np.nan
@@ -192,10 +282,18 @@ def detect_chain(norm):
 
 
 def select_focus(norm, meta, n_strikes=3, expiry=None):
-    """Most-liquid N strikes (option-type agnostic) for the synchronized chain."""
+    """Most-liquid N strikes (option-type agnostic) for the synchronized chain.
+    Falls back to most-liquid symbols when no strike parsed (discovery can still
+    run single-contract analysis; strike modules report BLOCKED_PARSE)."""
     sub = norm if expiry is None else norm[norm["expiry"].astype(str) == str(expiry)]
     vol = sub.groupby("strike")["volume"].sum().sort_values(ascending=False)
+    vol = vol[vol.index.to_series().apply(lambda s: pd.notna(s) and str(s) != "nan")]
     strikes = vol.head(n_strikes).index.tolist()
+    if not strikes:
+        sym_vol = sub.groupby(sub["symbol"].astype(str))["volume"].sum().sort_values(ascending=False)
+        chain = sym_vol.head(max(2, n_strikes * 2)).index.tolist()
+        chain = sorted(chain)
+        return sub[sub["symbol"].astype(str).isin(chain)].copy(), [], chain
     chain = sorted(sub[sub["strike"].isin(strikes)]["symbol"].astype(str).unique().tolist())
     return sub[sub["symbol"].astype(str).isin(chain)].copy(), [str(s) for s in strikes], chain
 

@@ -18,15 +18,15 @@ def add_type_relationship(df, meta):
     vol = df.groupby("option_type")["volume"].sum().sort_values(ascending=False)
     t0, t1 = str(vol.index[0]), str(vol.index[1])
     REGISTRY["type_pair"] = (t0, t1)
-    a = df[df["option_type"] == t0][["timestamp", "strike", "return_1", "return_5",
+    a = df[df["option_type"] == t0][["timestamp", "expiry", "strike", "return_1", "return_5",
                                      "accel_1_3", "volume", "range"]].rename(
         columns={"return_1": "t0_r1", "return_5": "t0_r5", "accel_1_3": "t0_acc",
                  "volume": "t0_vol", "range": "t0_rng"})
-    b = df[df["option_type"] == t1][["timestamp", "strike", "return_1", "return_5",
+    b = df[df["option_type"] == t1][["timestamp", "expiry", "strike", "return_1", "return_5",
                                      "accel_1_3", "volume", "range"]].rename(
         columns={"return_1": "t1_r1", "return_5": "t1_r5", "accel_1_3": "t1_acc",
                  "volume": "t1_vol", "range": "t1_rng"})
-    m = pd.merge(a, b, on=["timestamp", "strike"], how="inner")
+    m = pd.merge(a, b, on=["timestamp", "expiry", "strike"], how="inner")
     m["type_ret_diff"] = m["t0_r5"] - m["t1_r5"]
     m["type_ret_ratio"] = m["t0_r5"] / m["t1_r5"].replace(0, np.nan)
     m["type_vol_ratio"] = m["t0_vol"] / m["t1_vol"].replace(0, np.nan)
@@ -45,37 +45,41 @@ def add_type_relationship(df, meta):
             f"ev_{t0}_leads_{t1}", f"ev_{t1}_leads_{t0}",
             f"ev_{t0}_accel_{t1}_stall", f"ev_{t1}_accel_{t0}_stall"]
     REGISTRY["type_cols"] = keep
-    lut = m.set_index(["timestamp", "strike"])[keep]
-    df = df.join(lut, on=["timestamp", "strike"])
+    lut = m.set_index(["timestamp", "expiry", "strike"])[keep]
+    # dedupe guard: same (ts,expiry,strike) twice would fan out the join
+    lut = lut[~lut.index.duplicated(keep="first")]
+    df = df.join(lut, on=["timestamp", "expiry", "strike"])
     df["type_pair"] = f"{t0}/{t1}"
     REL_COUNT["n"] += len(keep)
     return df
 
 
 def add_crossstrike(df, meta, strikes):
-    """Per-option-type strike spreads for every discovered option type."""
+    """Per-option-type, per-expiry strike spreads for every discovered option type."""
     df = df.copy()
     REGISTRY["x_cols"] = []
     ts = df["timestamp"]
     strikes = [str(s) for s in strikes]
-    for otype in meta["option_types"]:
-        sub = df[df["option_type"] == otype][["timestamp", "strike", "return_5",
-                                              "accel_1_3", "volume", "range"]].copy()
-        sub["strike"] = sub["strike"].astype(str)  # key-normalize: pivot cols are strings
-        for f, fn in [("return_5", "retdiff"), ("accel_1_3", "accdiff"),
-                      ("volume", "volspread"), ("range", "rngspread")]:
-            try:
-                wp = sub.pivot_table(index="timestamp", columns="strike", values=f, aggfunc="first")
-                for i in range(len(strikes)):
-                    for j in range(i + 1, len(strikes)):
-                        sa, sb = str(strikes[i]), str(strikes[j])
-                        if sa in wp.columns and sb in wp.columns:
-                            col = f"x_{otype}_{sa}_{sb}_{fn}"
-                            df[col] = ts.map(wp[sa] - wp[sb])
-                            REGISTRY["x_cols"].append(col)
-                            REL_COUNT["n"] += 1
-            except Exception:
-                continue
+    for exp, gexp in df.groupby(df["expiry"].astype(str)):
+        tag = "" if len(meta["expiries"]) <= 1 else f"_{exp}"
+        for otype in meta["option_types"]:
+            sub = gexp[gexp["option_type"] == otype][["timestamp", "strike", "return_5",
+                                                      "accel_1_3", "volume", "range"]].copy()
+            sub["strike"] = sub["strike"].astype(str)  # key-normalize: pivot cols are strings
+            for f, fn in [("return_5", "retdiff"), ("accel_1_3", "accdiff"),
+                          ("volume", "volspread"), ("range", "rngspread")]:
+                try:
+                    wp = sub.pivot_table(index="timestamp", columns="strike", values=f, aggfunc="first")
+                    for i in range(len(strikes)):
+                        for j in range(i + 1, len(strikes)):
+                            sa, sb = str(strikes[i]), str(strikes[j])
+                            if sa in wp.columns and sb in wp.columns:
+                                col = f"x_{otype}_{sa}_{sb}_{fn}{tag}"
+                                df[col] = ts.map(wp[sa] - wp[sb])
+                                REGISTRY["x_cols"].append(col)
+                                REL_COUNT["n"] += 1
+                except Exception:
+                    continue
     return df
 
 

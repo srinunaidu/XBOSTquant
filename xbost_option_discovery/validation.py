@@ -25,10 +25,14 @@ def walk_forward(days, train_n=8, test_n=3):
     return out
 
 def cluster(sig, minutes=3):
-    sig = sig.sort_values(["strike", "option_type", "timestamp"]).copy()
+    sig = sig.copy()
+    keys = [k for k in ("expiry", "strike", "option_type") if k in sig.columns]
+    if not keys:
+        keys = ["strike", "option_type"]
+    sig = sig.sort_values(keys + ["timestamp"]).copy()
     sig["cluster_id"] = -1
     eid = 0
-    for _, grp in sig.groupby(["strike", "option_type"]):
+    for _, grp in sig.groupby(keys):
         last = None; cur = -1
         for i, t in zip(grp.index, pd.to_datetime(grp["timestamp"])):
             if last is None or (t - last).total_seconds() / 60 > minutes:

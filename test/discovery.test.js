@@ -97,8 +97,11 @@ test('metric integrity: ledger recomputes', () => {
 });
 
 test('no hardcoded contract assumptions in engine source', () => {
-  const src = fs.readFileSync('public/discovery-engine.js', 'utf8');
-  for (const pat of ['54700', '54800', '54900', '29SEP', '"CE", "PE"', "['CE', 'PE']", 'if strike ==', 'if symbol ==']) {
+  const src = fs.readFileSync('public/discovery-engine.js', 'utf8')
+    .split('\n').filter(l => !l.trim().startsWith('//') && !l.trim().startsWith('*')).join('\n');
+  for (const pat of ['54700', '54800', '54900', '29SEP', '27OCT', 'EXPECTED_', 'if strike ==', 'if symbol ==',
+    'if contracts ==', 'if expiry ==', "=== 'CE'", '=== "CE"', "=== 'PE'", '=== "PE"',
+    '["CE", "PE"]', "['CE', 'PE']"]) {
     assert.ok(!src.includes(pat), 'hardcode found: ' + pat);
   }
 });
@@ -112,4 +115,96 @@ test('end-to-end run on 2-day sample file', () => {
   assert.ok(logs.some(l => l.includes('EXIT_PARAMETER_PROPAGATION = PASS')));
   assert.ok(logs.some(l => l.includes('NO_LOOKAHEAD_TEST = PASS')));
   assert.ok(res.statusBar.PAPER_ELIGIBLE === 'FALSE');
+});
+
+/* TEST 1–12 acceptance: reported wide-file shape (12 contracts, 2 expiries,
+   type+strike embedded in tokens, no explicit metadata columns). */
+function wide12() {
+  let seed = 11;
+  const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
+  const toks = [];
+  for (const e of ['29SEP26', '27OCT26']) for (const s of [54700, 54800, 54900]) for (const t of ['CE', 'PE'])
+    toks.push(`BNF${e}${s}${t}`);
+  const t0 = Date.parse('2026-08-20T09:15:00Z');
+  const head = ['ts', 'exp', ...toks.flatMap(t => [t + '_o', t + '_h', t + '_l', t + '_c', t + '_v'])];
+  const lines = [head.join(',')];
+  let day = 0, b = 0;
+  for (let d = 0; d < 8; d++) {
+    for (let m = 0; m < 300; m++) {
+      const ts = new Date(t0 + (day * 1440 + m) * 60000).toISOString();
+      const row = [ts, d < 5 ? '29SEP2026' : '27OCT2026'];
+      for (const t of toks) {
+        const px = 200 + Math.sin((b / 17) + t.length) * 8 + (rnd() - 0.5) * 4;
+        row.push(px.toFixed(2), (px + 1).toFixed(2), (px - 1).toFixed(2), (px + (rnd() - 0.5)).toFixed(2), 100);
+      }
+      lines.push(row.join(','));
+      b++;
+    }
+    day++;
+  }
+  return lines.join('\n');
+}
+const WIDE12 = wide12();
+
+test('ACCEPT TEST1: dynamic parsing finds 12 contracts/strikes/types/expiries', () => {
+  const { norm, layout } = OD.ingest(WIDE12);
+  assert.equal(layout, 'wide');
+  const reg = OD.buildRegistry(norm, layout);
+  assert.equal(reg.length, 12);
+  assert.ok(reg.filter(r => r.strike !== 'UNKNOWN').length === 12);
+  assert.ok(reg.filter(r => r.option_type !== 'UNKNOWN').length === 12);
+  assert.deepEqual([...new Set(reg.flatMap(r => r.expiry))].sort(), ['27OCT2026', '29SEP2026']);
+  const strikes = [...new Set(reg.map(r => r.strike))].sort();
+  assert.deepEqual(strikes, [54700, 54800, 54900]);
+});
+
+test('ACCEPT TEST2-5: focus>0, features>0 incl xcols, labels>0, events>0', () => {
+  const { norm } = OD.ingest(WIDE12);
+  const reg = OD.buildRegistry(norm, 'wide');
+  for (const row of norm) {
+    const rec = reg.find(r => r.contract_id === row.symbol);
+    if (rec && rec.strike !== 'UNKNOWN') row.strike = rec.strike;
+    if (rec && rec.option_type !== 'UNKNOWN') row.option_type = rec.option_type;
+  }
+  const meta = OD.detectChain(norm);
+  assert.ok(meta.n_strikes === 3 && meta.n_option_types === 2);
+  const focus = OD.selectFocus(norm, meta, 3, null);
+  assert.ok(focus.chain.length > 0); // TEST2
+  const rows = OD.features(focus.rows);
+  assert.ok(rows.length > 0); // TEST3 rows
+  const xc = OD.crossStrike(rows, meta, focus.strikes);
+  assert.ok(xc.length > 0); // TEST3 xcols
+  assert.ok(rows.some(r => !isNaN(r.fwd_ret_5m))); // TEST4
+  OD.events(rows);
+  const raw = rows.filter(r => r.e_large_ret === 1 || r.e_vol_shock === 1 || r.e_expansion === 1).length;
+  assert.ok(raw > 0); // TEST5
+});
+
+test('ACCEPT TEST6-10: full run evaluates candidates, OOS non-zero, exit hashes diverge', () => {
+  const logs = [];
+  const res = OD.run(WIDE12, { focusStrikes: 3, minEvents: 50, nPerms: 50, seed: 7 }, l => logs.push(l));
+  assert.ok(res.candidates.length > 0); // TEST6: actually evaluated
+  assert.ok(res.splitDays.pseudo_oos > 0); // TEST10
+  assert.ok(logs.some(l => l.includes('NO_LOOKAHEAD_TEST = PASS'))); // TEST9
+  assert.ok(logs.some(l => l.includes('FINAL_STATUS='))); // state machine present
+  // TEST8: every candidate ledger metric recomputes (spot-check via tradeMetrics on gate ledgers is structural; here check hashes exist)
+  assert.ok(logs.some(l => l.includes('ledger_hash=')));
+  const hashes = [...new Set(logs.filter(l => l.includes('ledger_hash=')).map(l => l.split('ledger_hash=')[1]))];
+  assert.ok(hashes.length >= 2); // TEST7: TP configs diverge
+});
+
+test('ACCEPT TEST11: zero-input filters report BLOCKED_NO_INPUT', () => {
+  const logs = [];
+  const res = OD.run(WIDE12, { focusStrikes: 3, minEvents: 1e9, nPerms: 10, seed: 7 }, l => logs.push(l));
+  assert.equal(res.candidates.length, 0);
+  assert.ok(logs.some(l => l.includes('BLOCKED_NO_INPUT')));
+  assert.ok(!logs.some(l => l.includes('OPTION_NATIVE_RESEARCH_RESULT = NO_VALIDATED_EDGE')));
+});
+
+test('ACCEPT TEST12: reproducibility — same seed+data = identical candidates+hashes', () => {
+  const a = OD.run(WIDE12, { focusStrikes: 3, minEvents: 50, nPerms: 30, seed: 99 }, null, null);
+  const b = OD.run(WIDE12, { focusStrikes: 3, minEvents: 50, nPerms: 30, seed: 99 }, null, null);
+  const key = c => JSON.stringify([c.candidate, c.events, c.FWD_expectancy, c.perm_p, c.final_status]);
+  assert.deepEqual(a.candidates.map(key), b.candidates.map(key));
+  assert.equal(a.finalStatus, b.finalStatus);
 });

@@ -95,6 +95,7 @@ export default function Discovery() {
   const [stage, setStage] = useState('');
   const [log, setLog] = useState<string[]>([]);
   const [res, setRes] = useState<any | null>(null);
+  const [abort, setAbort] = useState<{ message: string; finalStatus: string } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [fam, setFam] = useState('ALL');
   const [status, setStatus] = useState('ALL');
@@ -120,6 +121,7 @@ export default function Discovery() {
     setFileName(f.name);
     setCsvText(await f.text());
     setRes(null);
+    setAbort(null);
     pushLog(`source: uploaded ${f.name}`);
   };
 
@@ -154,7 +156,7 @@ export default function Discovery() {
 
   const run = () => {
     if (!csvText) { setErr('Upload an option CSV or load the sample first.'); return; }
-    setErr(null); setRes(null); setLog([]); setRunning(true); setProg(0);
+    setErr(null); setRes(null); setAbort(null); setLog([]); setRunning(true); setProg(0);
     workerRef.current?.terminate();
     let w: Worker;
     try { w = new Worker('./discovery-worker.js'); }
@@ -170,7 +172,9 @@ export default function Discovery() {
         w.terminate(); workerRef.current = null;
       } else if (m.type === 'error') {
         setErr(m.message); setRunning(false);
-        pushLog(`ERROR: ${m.message}`);
+        setAbort({ message: m.message, finalStatus: m.finalStatus || 'BLOCKED_DATA' });
+        for (const line of (m.log || [])) pushLog(line);
+        pushLog(`ERROR: ${m.message} FINAL_STATUS=${m.finalStatus || 'BLOCKED_DATA'}`);
         w.terminate(); workerRef.current = null;
       }
     };
@@ -312,9 +316,19 @@ export default function Discovery() {
         )}
 
         {/* 4. results */}
+        {abort && !res && (
+          <section className="card p-4 border-red-900">
+            <div className="lbl mb-1 !text-red-300">RUN BLOCKED — {abort.finalStatus}</div>
+            <div className="text-[12px] text-zinc-400">{abort.message}</div>
+            <div className="text-[11px] text-zinc-500 mt-1">The log above contains the full audit up to the blocking layer. This is an engineering/data failure, not a research result.</div>
+          </section>
+        )}
         {res && (
           <>
-            <section className="px-1 flex flex-wrap gap-1.5">
+            <section className="px-1 flex flex-wrap gap-1.5 items-center">
+              {res.finalStatus && (
+                <span className="text-[11px] num px-2 py-0.5 rounded-full border border-emerald-800 bg-emerald-950/40 text-emerald-300">FINAL_STATUS · {String(res.finalStatus)}</span>
+              )}
               {Object.entries(sb).map(([k, v]) => (
                 <span key={k} className={`text-[10px] num px-2 py-0.5 rounded-full border ${pill(String(v))}`}>{k} · {String(v)}</span>
               ))}

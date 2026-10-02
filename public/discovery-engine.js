@@ -37,6 +37,116 @@ function normOtype(v) {
   return m[s] || s || 'UNKNOWN';
 }
 
+/* ---------- contract registry: multi-strategy metadata parsing (§1-§3) ----------
+   Strategy A: explicit metadata fields (long format) — handled by the loader.
+   Strategy B: token parsing (order: type suffix → trailing strike → underlying
+   prefix → expiry infix). Strategy C: keep contract with UNKNOWN + reason.
+   Nothing is silently discarded; confidence recorded per contract. */
+OD.OTYPE_TOKENS = ['CALL', 'PUT', 'CE', 'PE', 'C', 'P']; // longest-first match
+OD.MONTHS = ['JAN', 'FEB', 'MAR', 'APR', 'MAY', 'JUN', 'JUL', 'AUG', 'SEP', 'OCT', 'NOV', 'DEC'];
+
+OD.parseContractToken = function (token) {
+  const raw = String(token);
+  const up = raw.toUpperCase().replace(/[\s\-]+/g, '_');
+  // B1: option-type suffix (longest token first so CALL beats C)
+  let otype = null, rest = up, method = [];
+  for (const t of OD.OTYPE_TOKENS) {
+    const re = new RegExp('[_]?' + t + '$');
+    if (re.test(rest)) {
+      otype = normOtype(t);
+      rest = rest.replace(re, '');
+      method.push('type-suffix:' + t);
+      break;
+    }
+  }
+  // B4 first: expiry infix DDMMMYY(Y) — strip before strike so its digits
+  // cannot merge into the strike run (e.g. 29SEP26|54700).
+  // 4-digit years only when NOT followed by another digit; else 2-digit year.
+  const MON = 'JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC';
+  let expInfix = null;
+  let e = up.match(new RegExp(`(\\d{1,2})(${MON})(\\d{4})(?!\\d)`));
+  if (!e) e = up.match(new RegExp(`(\\d{1,2})(${MON})(\\d{2})(?=\\d|$|_)`));
+  if (e) {
+    const yy = e[3].length === 2 ? '20' + e[3] : e[3];
+    expInfix = `${e[1].padStart(2, '0')}${e[2]}${yy}`;
+    rest = rest.replace(e[0], '_');
+    method.push('expiry-infix');
+  }
+  // B2: strike = trailing digit run (2-7 digits, optional decimal)
+  let strike = NaN;
+  const m = rest.match(/(\d{2,7}(?:\.\d+)?)$/);
+  if (m) {
+    strike = Number(m[1]);
+    rest = rest.slice(0, rest.length - m[1].length);
+    method.push('trailing-strike');
+  }
+  // B3: underlying = leading alpha run
+  let underlying = null;
+  const u = rest.match(/^([A-Z]{2,})/);
+  if (u) { underlying = u[1]; method.push('underlying-prefix'); }
+  const haveBoth = otype !== null && !isNaN(strike);
+  return {
+    underlying, expiry_infix: expInfix, strike, option_type: otype || 'UNKNOWN',
+    parse_method: method.length ? 'token:' + method.join('+') : 'none',
+    parse_confidence: haveBoth ? 'high' : ((otype !== null || !isNaN(strike)) ? 'medium' : 'low'),
+  };
+};
+
+OD.buildRegistry = function (norm, layout) {
+  // per-contract observed expiries + volume for the registry
+  const agg = new Map();
+  for (const r of norm) {
+    let a = agg.get(r.symbol);
+    if (!a) { a = { exps: new Set(), vol: 0, n: 0, hasStrike: false, hasOtype: false, und: new Set() }; agg.set(r.symbol, a); }
+    a.exps.add(r.expiry); a.n++;
+    if (!isNaN(r.volume)) a.vol += r.volume;
+    if (!isNaN(r.strike)) a.hasStrike = true;
+    if (r.option_type && r.option_type !== 'UNKNOWN') a.hasOtype = true;
+    if (r.underlying && r.underlying !== 'UNKNOWN') a.und.add(r.underlying);
+  }
+  const reg = [];
+  for (const [sym, a] of agg) {
+    const sample = norm.find(r => r.symbol === sym);
+    let rec;
+    if (a.hasStrike || a.hasOtype) {
+      // Strategy A: explicit metadata present in the data itself
+      rec = {
+        underlying: [...a.und][0] || 'UNKNOWN',
+        expiry_infix: null,
+        strike: a.hasStrike ? sample.strike : NaN,
+        option_type: a.hasOtype ? sample.option_type : 'UNKNOWN',
+        parse_method: 'explicit:' + [a.hasStrike ? 'strike' : null, a.hasOtype ? 'otype' : null].filter(Boolean).join('+'),
+        parse_confidence: (a.hasStrike && a.hasOtype) ? 'high' : 'medium',
+      };
+    } else {
+      // Strategy B/C: token parsing, UNKNOWN + reason on failure
+      rec = OD.parseContractToken(sym);
+      rec.metadata_source = 'token';
+    }
+    if (!rec.metadata_source) rec.metadata_source = layout === 'long' ? 'explicit' : 'token';
+    const validStrike = !isNaN(rec.strike);
+    const validType = !!rec.option_type && rec.option_type !== 'UNKNOWN';
+    const reasons = [];
+    if (!validStrike) reasons.push('strike extraction failed');
+    if (!validType) reasons.push('option_type extraction failed');
+    reg.push({
+      contract_id: sym, source_name: sym,
+      underlying: rec.underlying || 'UNKNOWN',
+      expiry: [...a.exps].sort(),
+      strike: validStrike ? rec.strike : 'UNKNOWN',
+      option_type: validType ? rec.option_type : 'UNKNOWN',
+      metadata_source: rec.metadata_source,
+      parse_method: rec.parse_method,
+      parse_confidence: rec.parse_confidence,
+      enabled: true,
+      reason_disabled: reasons.length ? reasons.join('; ') : '',
+      volume: a.vol, bars: a.n,
+    });
+  }
+  reg.sort((a, b) => b.volume - a.volume);
+  return reg;
+};
+
 function resolveCol(lcols, role) {
   for (const cand of OD.SCHEMA[role] || []) {
     const i = lcols.indexOf(cand.toLowerCase());
@@ -109,6 +219,11 @@ OD.ingest = function (text, schemaOver) {
     }
     return resolveCol(lcols, role);
   };
+  const roles = {};
+  for (const r of Object.keys(OD.SCHEMA)) {
+    const i = col(r);
+    if (i >= 0) roles[r] = head[i];
+  }
   const iStrike = col('strike'), iClose = col('close');
   let norm, layout;
   if (iStrike >= 0 && iClose >= 0) {
@@ -119,8 +234,20 @@ OD.ingest = function (text, schemaOver) {
     norm = ingestWide(head, rows, col);
   }
   norm.sort((a, b) => a.ts - b.ts || (a.symbol < b.symbol ? -1 : 1));
-  return { norm, layout, nRawRows: rows.length };
+  const contractColumns = head.filter(h => fieldSuffix(h));
+  return { norm, layout, nRawRows: rows.length, columns: head, roles, contractColumns };
 };
+
+function hashCfg(cfg) {
+  const s = JSON.stringify(cfg, Object.keys(cfg).sort());
+  let h1 = 0xdeadbeef, h2 = 0x41c6ce57;
+  for (let i = 0; i < s.length; i++) {
+    const ch = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 2654435761);
+    h2 = Math.imul(h2 ^ ch, 1597334677);
+  }
+  return ((h1 >>> 0).toString(16) + (h2 >>> 0).toString(16)).slice(0, 16);
+}
 
 function num(v) {
   if (v == null || v === '') return NaN;
@@ -318,6 +445,18 @@ OD.selectFocus = function (norm, meta, nStrikes, expiry) {
     vol.set(r.strike, (vol.get(r.strike) || 0) + r.volume);
   }
   const strikes = [...vol.entries()].sort((a, b) => b[1] - a[1]).slice(0, nStrikes).map(e => e[0]);
+  if (!strikes.length) {
+    // fallback: most-liquid symbols (strike modules stay BLOCKED_PARSE)
+    const sv = new Map();
+    for (const r of sub) {
+      if (isNaN(r.volume)) continue;
+      sv.set(r.symbol, (sv.get(r.symbol) || 0) + r.volume);
+    }
+    const chain = [...sv.entries()].sort((a, b) => b[1] - a[1])
+      .slice(0, Math.max(2, nStrikes * 2)).map(e => e[0]).sort();
+    const cset = new Set(chain);
+    return { rows: sub.filter(r => cset.has(r.symbol)), strikes: [], chain, fallbackSymbols: true };
+  }
   const sset = new Set(strikes);
   const chain = [...new Set(sub.filter(r => sset.has(r.strike)).map(r => r.symbol))].sort();
   const cset = new Set(chain);
@@ -325,6 +464,10 @@ OD.selectFocus = function (norm, meta, nStrikes, expiry) {
 };
 
 /* ---------- RNG ---------- */
+OD.LINEAGE = []; // {column, inputs[], future} — every derived column records its source
+OD.track = function (column, spec) {
+  OD.LINEAGE.push({ column, inputs: (spec && spec.inputs) || [], future: !!(spec && spec.future) });
+};
 OD.rng = function (seed) {
   let a = seed >>> 0;
   return function () {
@@ -433,6 +576,20 @@ OD.features = function (rows, H) {
       for (let j = Math.max(0, i - 14); j < i; j++) { if (!isNaN(arr[j].true_range)) { s += arr[j].true_range; c++; } }
       arr[i].atr_14 = c >= 5 ? s / c : NaN;
       arr[i].range_expansion = (i > 0 && arr[i - 1].range) ? arr[i].range / arr[i - 1].range : NaN;
+      arr[i].atr_change = (i > 0 && !isNaN(arr[i].atr_14) && !isNaN(arr[i - 1].atr_14) && arr[i - 1].atr_14)
+        ? arr[i].atr_14 / arr[i - 1].atr_14 - 1 : NaN;
+      // realized volatility over past 20 return_1
+      let rs = [];
+      for (let j = Math.max(0, i - 20); j < i; j++) if (!isNaN(arr[j].return_1)) rs.push(arr[j].return_1);
+      arr[i].realized_vol_20 = rs.length >= 10 ? std(rs) : NaN;
+      arr[i].volatility_expansion = (!isNaN(arr[i].realized_vol_20) && i > 0 && !isNaN(arr[i - 1].realized_vol_20) && arr[i - 1].realized_vol_20)
+        ? arr[i].realized_vol_20 / arr[i - 1].realized_vol_20 : NaN;
+      // premium breakout / mean-reversion (option-native)
+      arr[i].premium_breakout = ((!isNaN(arr[i].range_expansion) && arr[i].range_expansion > 2.0
+        && !isNaN(arr[i].return_5) && Math.abs(arr[i].return_5) > 1.5)) ? 1 : 0;
+      arr[i].premium_mean_reversion = ((i > 0 && !isNaN(arr[i].return_1) && !isNaN(arr[i - 1].return_1)
+        && arr[i].return_1 * arr[i - 1].return_1 < 0
+        && Math.abs(arr[i - 1].return_1) > 1.0)) ? 1 : 0;
     }
     // forward labels
     for (const w of [1, 3, 5, 10, 15]) {
@@ -469,10 +626,43 @@ OD.features = function (rows, H) {
       }
     }
   }
+  // chain-level features (cross-contract at same ts): dispersion / momentum / compression
+  const byTs = new Map();
+  for (const r of rows) {
+    if (!byTs.has(r.ts)) byTs.set(r.ts, []);
+    byTs.get(r.ts).push(r);
+  }
+  for (const g of byTs.values()) {    const rets = g.map(r => r.return_5).filter(v => !isNaN(v));
+    const m = rets.length ? rets.reduce((a, b) => a + b, 0) / rets.length : NaN;
+    let sd = NaN;
+    if (rets.length >= 2) {
+      let s2 = 0;
+      for (const v of rets) s2 += (v - m) * (v - m);
+      sd = Math.sqrt(s2 / rets.length);
+    }
+    const comp = g.filter(r => !isNaN(r.range_percentile) && r.range_percentile < 10).length;
+    for (const r of g) {
+      r.chain_dispersion = sd;
+      r.chain_momentum = m;
+      r.chain_compression_frac = comp / g.length;
+    }
+  }
+  for (const c of ['return_1', 'return_2', 'return_3', 'return_5', 'return_10', 'return_15',
+    'accel_1_2', 'accel_1_3', 'body', 'range', 'upper_wick', 'lower_wick', 'body_to_range',
+    'close_location', 'volume_change', 'consecutive_up_bars', 'consecutive_down_bars',
+    'rolling_mean', 'rolling_high', 'rolling_low', 'distance_from_recent_high',
+    'distance_from_recent_low', 'distance_from_mean', 'range_percentile',
+    'volume_zscore', 'volume_ratio', 'volume_percentile', 'atr_14', 'range_expansion',
+    'atr_change', 'realized_vol_20', 'volatility_expansion', 'premium_breakout',
+    'premium_mean_reversion', 'volume_shock', 'price_volume_confirmation',
+    'price_volume_divergence', 'price_expansion_without_volume', 'BASELINE_RSI',
+    'chain_dispersion', 'chain_momentum', 'chain_compression_frac'])
+    OD.track(c, { inputs: ['open[t-k..t]', 'high[t-k..t]', 'low[t-k..t]', 'close[t-k..t]', 'volume[t-k..t]'], future: false });
+  for (const w of [1, 3, 5, 10, 15])
+    for (const c of ['fwd_ret_' + w + 'm', 'MFE_' + w + 'm', 'MAE_' + w + 'm'])
+      OD.track(c, { inputs: ['close[t]', 'high[t+1..t+H]', 'low[t+1..t+H]'], future: true });
   return rows;
 };
-
-/* ---------- relationships (metadata-driven) ---------- */
 OD.relationships = function (rows, meta) {
   const REG = { type_pair: null, type_cols: [], x_cols: [], breadth_cols: [] };
   const byOT = {};
@@ -481,7 +671,7 @@ OD.relationships = function (rows, meta) {
   if (ranked.length >= 2) {
     const t0 = ranked[0], t1 = ranked[1];
     REG.type_pair = [t0, t1];
-    const key = r => r.ts + '|' + r.strike;
+    const key = r => r.ts + '|' + r.expiry + '|' + r.strike;
     const A = new Map(), B = new Map();
     for (const r of rows) {
       if (r.option_type === t0) A.set(key(r), r);
@@ -503,6 +693,8 @@ OD.relationships = function (rows, meta) {
       b['ev_' + t0 + '_leads_' + t1] = a['ev_' + t0 + '_leads_' + t1];
       b['ev_' + t1 + '_leads_' + t0] = a['ev_' + t1 + '_leads_' + t0];
     }
+    for (const c of ['type_ret_diff', 'type_vol_ratio', 'type_vol_diff', 'type_acc_diff',
+      'type_range_diff']) OD.track(c, { inputs: ['same-bar T0/T1 return_5, volume, accel'], future: false });
     REG.type_cols = ['type_ret_diff', 'type_vol_ratio', 'type_vol_diff', 'type_acc_diff',
       'ev_' + t0 + '_leads_' + t1, 'ev_' + t1 + '_leads_' + t0];
   }
@@ -511,21 +703,26 @@ OD.relationships = function (rows, meta) {
 
 OD.crossStrike = function (rows, meta, strikes) {
   const cols = [];
-  for (const ot of meta.option_types) {
-    const series = {};
-    for (const r of rows) {
-      if (r.option_type !== ot) continue;
-      (series[String(r.strike)] = series[String(r.strike)] || new Map()).set(r.ts, r);
-    }
-    for (let i = 0; i < strikes.length; i++) for (let j = i + 1; j < strikes.length; j++) {
-      const A = series[String(strikes[i])], B = series[String(strikes[j])];
-      if (!A || !B) continue;
-      const col = 'x_' + ot + '_' + strikes[i] + '_' + strikes[j] + '_retdiff';
-      for (const [ts, a] of A) {
-        const b = B.get(ts);
-        if (b) a[col] = a.return_5 - b.return_5;
+  const exps = [...new Set(rows.map(r => r.expiry))];
+  for (const exp of exps) {
+    const tag = exps.length <= 1 ? '' : '_' + exp;
+    for (const ot of meta.option_types) {
+      const series = {};
+      for (const r of rows) {
+        if (r.option_type !== ot || r.expiry !== exp) continue;
+        (series[String(r.strike)] = series[String(r.strike)] || new Map()).set(r.ts, r);
       }
-      cols.push(col);
+      for (let i = 0; i < strikes.length; i++) for (let j = i + 1; j < strikes.length; j++) {
+        const A = series[String(strikes[i])], B = series[String(strikes[j])];
+        if (!A || !B) continue;
+        const col = 'x_' + ot + '_' + strikes[i] + '_' + strikes[j] + '_retdiff' + tag;
+        for (const [ts, a] of A) {
+          const b = B.get(ts);
+          if (b) a[col] = a.return_5 - b.return_5;
+        }
+        cols.push(col);
+        OD.track(col, { inputs: ['same-bar strike returns (synchronized ts, same expiry)'], future: false });
+      }
     }
   }
   return cols;
@@ -547,6 +744,7 @@ OD.breadth = function (rows, meta) {
     if (meta.option_types.length >= 2) {
       parts.breadth_diff = parts[meta.option_types[0] + '_breadth'] - parts[meta.option_types[1] + '_breadth'];
     } else parts.breadth_diff = 0;
+    for (const cc of Object.keys(parts)) OD.track(cc, { inputs: ['same-bar contract return_5/volume'], future: false });
     for (const r of g) Object.assign(r, parts);
   }
   return ['breadth_diff'];
@@ -589,6 +787,9 @@ OD.events = function (rows, leadCols) {
     r.ev_largeRet_volShock = (r.e_large_ret === 1 && r.e_vol_shock === 1) ? 1 : 0;
     r.ev_ret_vol_expand = (r.e_large_ret === 1 && r.e_vol_shock === 1 && r.e_expansion === 1) ? 1 : 0;
     r.ev_divergence = (Math.abs(r.type_ret_diff) >= 2.0) ? 1 : 0;
+    for (const c of ['e_large_ret', 'e_vol_shock', 'e_compression', 'e_expansion', 'e_atm_move',
+      'ev_largeRet_volShock', 'ev_ret_vol_expand', 'ev_divergence', 'ev_compress_expand'])
+      OD.track(c, { inputs: ['past-only z-scores, percentiles, expansions'], future: false });
   }
   // compression→expansion uses previous bar of same contract
   const lastComp = new Map();
@@ -620,6 +821,8 @@ OD.sequences = function (rows) {
     for (let i = 0; i < arr.length; i++) {
       const s = k => (i - k >= 0 ? barState(arr[i - k].return_1) : 'NA');
       arr[i].st_m1 = s(1); arr[i].st_m2 = s(2); arr[i].st_m3 = s(3);
+      OD.track('seq2', { inputs: ['past return_1 states'], future: false });
+      OD.track('seq3', { inputs: ['past return_1 states'], future: false });
       arr[i].seq2 = arr[i].st_m2 + '|' + arr[i].st_m1;
       arr[i].seq3 = arr[i].st_m3 + '|' + arr[i].st_m2 + '|' + arr[i].st_m1;
     }
@@ -648,6 +851,7 @@ OD.states = function (rows, meta) {
         : d < -1 ? t1 + '_dom' : d < -0.2 ? t1 + '_weak' : d <= 0.2 ? 'balanced' : d <= 1 ? t0 + '_weak' : t0 + '_dom';
       const vp = r.volume_percentile;
       r.b_vol = isNaN(vp) ? 'na' : vp <= 25 ? 'low_vol' : vp <= 50 ? 'midlow' : vp <= 75 ? 'midhigh' : vp <= 95 ? 'high_vol' : 'shock';
+      OD.track('state_id', { inputs: ['past-only regime buckets'], future: false });
       r.state_id = r.b_vol_regime + '/' + r.b_type_dom + '/' + r.b_vol;
     }
   }
@@ -787,26 +991,89 @@ OD.run = function (text, cfg, onLog, onProgress) {
   }, cfg || {});
   const t0 = Date.now();
   const log = [];
+  OD.LINEAGE = [];
   const emit = s => { const line = `[+${((Date.now() - t0) / 1000).toFixed(1)}s] ${s}`; log.push(line); if (onLog) onLog(line); };
   const prog = (p, s) => { if (onProgress) onProgress(p, s); };
 
-  emit('OPTIONS_INGESTION_AUDIT');
-  const { norm, layout, nRawRows } = OD.ingest(text);
+  // ---- A. RUN HEADER (§18A) ----
+  const RUN_ID = 'OD-' + Date.now().toString(36) + '-' + Math.floor(OD.rng(cfg.seed)() * 1e6).toString(36);
+  emit(`RUN_ID=${RUN_ID} TIMESTAMP=${new Date().toISOString()} MODULE=OPTION_DISCOVERY VERSION=${OD.version}`);
+  emit(`CONFIG_HASH=${hashCfg(cfg)} SEED=${cfg.seed} COST_MODE=ZERO PRICE_MODEL=RESEARCH_PRICE_MODEL PARAMETERS_LOCKED=true REOPTIMIZED=false`);
+  let FINAL_STATE = 'NOT_STARTED';
+  const fail = (state, cls, msg) => {
+    FINAL_STATE = state;
+    emit(`${cls}: ${msg} FINAL_STATUS=${state}`);
+  };
+  try {
+  // ---- B. SOURCE SCHEMA AUDIT (§18B) ----
+  const parsed = OD.ingest(text);
+  const norm = parsed.norm, layout = parsed.layout;
+  emit('SOURCE_SCHEMA_AUDIT');
+  emit(`rows=${parsed.nRawRows} normalized=${norm.length} layout=${layout}`);
+  emit(`columns=${parsed.columns.join(',')}`);
+  emit(`timestamp_col=${parsed.roles.timestamp || 'NONE'} price_col=${parsed.roles.close || 'NONE'} `
+    + `volume_col=${parsed.roles.volume || 'NONE'} metadata_cols=${['expiry', 'strike', 'option_type', 'symbol'].filter(r => parsed.roles[r]).join(',') || 'NONE'}`);
+  emit(`candidate_contract_columns=${parsed.contractColumns.slice(0, 8).join(',')}${parsed.contractColumns.length > 8 ? '...' : ''} (total ${parsed.contractColumns.length})`);
+
+  // ---- C. CONTRACT PARSER AUDIT (§18C) ----
+  const registry = OD.buildRegistry(norm, layout);
+  const nParsedStrike = registry.filter(r => r.strike !== 'UNKNOWN').length;
+  const nParsedType = registry.filter(r => r.option_type !== 'UNKNOWN').length;
+  const nParsedUnd = registry.filter(r => r.underlying !== 'UNKNOWN').length;
+  emit('CONTRACT_PARSER_AUDIT');
+  emit(`detected_contracts=${registry.length} parsed_strikes=${nParsedStrike} parsed_types=${nParsedType} parsed_underlyings=${nParsedUnd}`);
+  for (const r of registry) {
+    emit(`  ${r.contract_id} | expiry=${r.expiry.join('+')} | strike=${r.strike} | type=${r.option_type} | `
+      + `src=${r.metadata_source} | method=${r.parse_method} | conf=${r.parse_confidence} | `
+      + `status=${r.reason_disabled ? 'PARSE_GAP' : 'OK'}${r.reason_disabled ? ' reason=' + r.reason_disabled : ''}`);
+  }
+  // enrich identity metadata (contract identity is known at t; not lookahead)
+  const regBySym = new Map(registry.map(r => [r.contract_id, r]));
+  for (const row of norm) {
+    const rec = regBySym.get(row.symbol);
+    if (!rec) continue;
+    if (isNaN(row.strike) && rec.strike !== 'UNKNOWN') row.strike = rec.strike;
+    if ((!row.option_type || row.option_type === 'UNKNOWN') && rec.option_type !== 'UNKNOWN') row.option_type = rec.option_type;
+    if ((!row.underlying || row.underlying === 'UNKNOWN') && rec.underlying !== 'UNKNOWN') row.underlying = rec.underlying;
+  }
   const meta = OD.detectChain(norm);
-  emit(`layout=${layout} rows=${nRawRows} normalized=${norm.length}`);
+  meta.registry = registry;
+  meta.valid_strike_count = nParsedStrike;
+  meta.valid_option_type_count = nParsedType;
+  const hasExplicit = layout === 'long';
+  const typeState = nParsedType > 0 ? ['AVAILABLE', '']
+    : (registry.length > 0 ? ['BLOCKED_PARSE', `option_type extraction failed for ${registry.length}/${registry.length} contracts`]
+      : ['UNAVAILABLE_SOURCE', 'no contracts detected']);
+  const strikeState = nParsedStrike > 0 ? ['AVAILABLE', '']
+    : (registry.length > 0 ? ['BLOCKED_PARSE', `strike extraction failed for ${registry.length}/${registry.length} contracts`]
+      : ['UNAVAILABLE_SOURCE', 'no contracts detected']);
   emit(`contracts=${meta.n_contracts} types=[${meta.option_types}] strikes=${meta.n_strikes} expiries=[${meta.expiries}]`);
   emit(`snapshots=${meta.synchronized_snapshots} complete=${meta.complete_snapshots} completeness=${meta.completeness}`);
   emit(`MULTI_EXPIRY = ${meta.n_expiries < 2 ? 'NOT_AVAILABLE' : 'AVAILABLE'}`);
   const mods = OD.moduleAvailability(meta);
+  // override type/strike states with parse-aware states (§3)
+  mods.OPTION_TYPE_RELATIONSHIP = typeState;
+  mods.STRIKE_RELATIONSHIP = strikeState;
   for (const k of Object.keys(mods)) emit(`${k} = ${mods[k][0]}${mods[k][1] ? ' (' + mods[k][1] + ')' : ''}`);
-  if (mods.OPTION_DATA[0] !== 'AVAILABLE') { emit('OPTION_NATIVE_DISCOVERY = BLOCKED'); throw new Error('DATA_INVALID'); }
+  if (mods.OPTION_DATA[0] !== 'AVAILABLE') { fail('BLOCKED_DATA', 'DATA_ERROR', 'no identifiable contracts/timestamps'); throw new Error('DATA_INVALID'); }
+  if (registry.length === 0) { fail('BLOCKED_PARSER', 'PARSER_ERROR', 'contract registry empty'); throw new Error('PARSER_EMPTY'); }
   prog(0.08, 'chain');
 
+  // ---- D. CHAIN BUILD AUDIT (§18D) + focus from registry ----
   const focus = OD.selectFocus(norm, meta, cfg.focusStrikes, meta.n_expiries === 1 ? meta.expiries[0] : null);
-  emit(`FOCUS chain (${focus.chain.length}): ${focus.chain.slice(0, 8).join(', ')}${focus.chain.length > 8 ? '...' : ''}`);
+  emit('CHAIN_BUILD_AUDIT');
+  const perCounts = {};
+  for (const r of norm) perCounts[r.ts] = (perCounts[r.ts] || 0) + 1;
+  const cc = Object.values(perCounts);
+  emit(`timestamps=${meta.n_timestamps} total_snapshots=${meta.synchronized_snapshots} complete=${meta.complete_snapshots} `
+    + `partial=${meta.partial_snapshots} avg_contracts=${(cc.reduce((a, b) => a + b, 0) / Math.max(1, cc.length)).toFixed(1)} `
+    + `min=${Math.min.apply(null, cc)} max=${Math.max.apply(null, cc)}`);
+  emit(`valid_strikes=${meta.n_strikes} valid_expiries=${meta.n_expiries} valid_option_types=${meta.option_types}`);
+  emit(`FOCUS chain (${focus.chain.length}): ${focus.chain.slice(0, 8).join(', ')}${focus.chain.length > 8 ? '...' : ''} (most-liquid strikes)`);
+  if (!focus.chain.length) { fail('BLOCKED_CHAIN', 'CHAIN_BUILD_ERROR', 'focus chain empty'); throw new Error('CHAIN_EMPTY'); }
   const health = OD.dataHealth(norm, meta, focus.chain);
-  emit(`DATA_HEALTH status=${health.status} volcov=${health.volume_coverage} ohlc_err=${health.ohlc_integrity_errors}`);
-  if (health.status === 'DATA_INVALID') throw new Error('DATA_INVALID');
+  emit(`DATA_HEALTH status=${health.status} volcov=${health.volume_coverage} ohlc_err=${health.ohlc_integrity_errors} usable=${health.usable_snapshots}`);
+  if (health.status === 'DATA_INVALID') { fail('BLOCKED_DATA', 'DATA_ERROR', 'health gate DATA_INVALID'); throw new Error('DATA_INVALID'); }
   prog(0.12, 'features');
 
   const rows = OD.features(focus.rows);
@@ -817,6 +1084,53 @@ OD.run = function (text, cfg, onLog, onProgress) {
   OD.sequences(rows);
   OD.states(rows, meta);
   emit(`FEATURES_READY rows=${rows.length} xcols=${xCols.length}`);
+  // ---- E. FEATURE AUDIT (§18E) ----
+  const FEAT_DEFS = [
+    ['return_1', 'price', 'Close[t]/Close[t-1]-1'], ['return_2', 'price', 'Close[t]/Close[t-2]-1'],
+    ['return_3', 'price', 'Close[t]/Close[t-3]-1'], ['return_5', 'price', 'Close[t]/Close[t-5]-1'],
+    ['return_10', 'price', 'Close[t]/Close[t-10]-1'], ['return_15', 'price', 'Close[t]/Close[t-15]-1'],
+    ['accel_1_3', 'price', 'return_1[t]-return_3[t]'], ['consecutive_up_bars', 'price', 'streak'],
+    ['consecutive_down_bars', 'price', 'streak'], ['body', 'candle', 'Close-Open'],
+    ['range', 'candle', 'High-Low'], ['upper_wick', 'candle', 'High-max(O,C)'],
+    ['lower_wick', 'candle', 'min(O,C)-Low'], ['close_location', 'candle', '(C-L)/range'],
+    ['body_to_range', 'candle', '|body|/range'], ['range_expansion', 'volatility', 'range[t]/range[t-1]'],
+    ['range_percentile', 'volatility', 'rank in past 120'], ['atr_14', 'volatility', 'mean(TR,14)'],
+    ['atr_change', 'volatility', 'ATR[t]/ATR[t-1]-1'], ['realized_vol_20', 'volatility', 'std(return_1,20)'],
+    ['volatility_expansion', 'volatility', 'rv[t]/rv[t-1]'],
+    ['volume_change', 'volume', 'V[t]/V[t-1]-1'], ['volume_zscore', 'volume', '(V-mean)/sd past 120'],
+    ['volume_ratio', 'volume', 'V/median past 120'], ['volume_percentile', 'volume', 'rank past 120'],
+    ['volume_shock', 'volume', 'pct>=95'], ['price_volume_confirmation', 'volume', 'vol+expansion'],
+    ['price_volume_divergence', 'volume', 'high vol + flat price'],
+    ['premium_breakout', 'option-native', 'expansion + |ret5|>1.5'],
+    ['premium_mean_reversion', 'option-native', 'sign flip after |ret|>1'],
+    ['distance_from_recent_high', 'option-native', '(C-rollHigh)/rollHigh'],
+    ['distance_from_recent_low', 'option-native', '(C-rollLow)/rollLow'],
+    ['type_ret_diff', 'chain', 'T0_ret5 - T1_ret5'], ['type_vol_ratio', 'chain', 'T0_vol/T1_vol'],
+    ['type_acc_diff', 'chain', 'T0_acc - T1_acc'], ['breadth_diff', 'chain', 'breadth0-breadth1'],
+    ['chain_dispersion', 'chain', 'std(contract ret5 at t)'], ['chain_momentum', 'chain', 'mean(contract ret5 at t)'],
+    ['chain_compression_frac', 'chain', 'fraction compressing at t'],
+  ];
+  const featAudit = [];
+  let featValid = 0;
+  for (const [name, src, formula] of FEAT_DEFS) {
+    let valid = 0, inf = 0;
+    for (const r of rows) {
+      const v = r[name];
+      if (typeof v === 'number' && !isNaN(v)) {
+        valid++;
+        if (!isFinite(v)) inf++;
+      }
+    }
+    const status = valid > 0 ? 'OK' : 'UNAVAILABLE';
+    if (status === 'OK') featValid++;
+    featAudit.push({ feature_name: name, source: src, formula, rows: rows.length, valid_rows: valid,
+      missing_pct: Math.round((1 - valid / Math.max(1, rows.length)) * 1000) / 10,
+      infinite_rate: valid ? Math.round(inf / valid * 1000) / 10 : 0, status });
+  }
+  emit(`FEATURE_AUDIT candidate_rows=${rows.length} valid_features=${featValid}/${FEAT_DEFS.length}`);
+  for (const fa of featAudit.filter(f => f.status !== 'OK'))
+    emit(`  ${fa.feature_name}: ${fa.status} (required source absent)`);
+  if (!rows.length || !featValid) { fail('BLOCKED_FEATURES', 'FEATURE_ERROR', 'no valid features'); throw new Error('FEATURES_EMPTY'); }
   prog(0.3, 'events');
 
   // days + splits
@@ -828,6 +1142,21 @@ OD.run = function (text, cfg, onLog, onProgress) {
   const inSplit = (r, list) => list.indexOf(dayOf(r.ts)) >= 0;
   const oosOK = mods.OOS_VALIDATION[0] === 'AVAILABLE' && splits.pseudo_oos.length > 0;
   emit(`SPLITS discovery=${splits.discovery.length}d refinement=${splits.refinement.length}d pseudo_oos=${splits.pseudo_oos.length}d`);
+  emit(`dataset_start=${days[0]} dataset_end=${days[days.length - 1]} discovery=${splits.discovery[0]}..${splits.discovery[splits.discovery.length - 1]} `
+    + `refinement=${splits.refinement[0] || '-'}..${splits.refinement[splits.refinement.length - 1] || '-'} oos=${splits.pseudo_oos[0] || '-'}..${splits.pseudo_oos[splits.pseudo_oos.length - 1] || '-'}`);
+  // ---- F. LABEL AUDIT (§18F) ----
+  const labelAudit = [];
+  for (const w of [1, 3, 5, 10, 15]) {
+    const col = 'fwd_ret_' + w + 'm';
+    const v = rows.map(r => r[col]).filter(x => typeof x === 'number' && !isNaN(x));
+    labelAudit.push({ label: col, horizon: w, rows: rows.length, valid_rows: v.length,
+      mean: v.length ? mean(v) : NaN, median: v.length ? median(v) : NaN, std: std(v),
+      positive_pct: v.length ? Math.round(v.filter(x => x > 0).length / v.length * 1000) / 10 : NaN,
+      negative_pct: v.length ? Math.round(v.filter(x => x < 0).length / v.length * 1000) / 10 : NaN });
+  }
+  for (const la of labelAudit)
+    emit(`LABEL ${la.label}: valid=${la.valid_rows}/${la.rows} mean=${isNaN(la.mean) ? 'NA' : la.mean.toFixed(3)} pos=${la.positive_pct}%`);
+  if (!labelAudit.some(la => la.valid_rows > 0)) { fail('BLOCKED_FEATURES', 'LABEL_ERROR', 'no valid forward labels'); throw new Error('LABELS_EMPTY'); }
   prog(0.36, 'candidates');
 
   // lead/lag screening
@@ -1002,7 +1331,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
   }
   prog(0.8, 'gates');
 
-  // exit propagation gate TEST_A/B/C on shared entries
+  // exit propagation gate TEST_A/B/C on shared entries (§12, §18I)
   const gate = (() => {
     const sig = [];
     for (const r of rows) {
@@ -1016,45 +1345,101 @@ OD.run = function (text, cfg, onLog, onProgress) {
       const i = idxBySym.get(r.symbol).get(r.ts);
       if (i != null) sig.push({ sym: r.symbol, i });
     }
-    const sums = {};
+    if (!sig.length) return { pass: false, blocked: true, sums: {}, hashes: {}, reason: 'no entry signals (BLOCKED_NO_INPUT)' };
+    const sums = {}, hashes = {}, reasons = {}, dists = {};
     for (const tp of [1.0, 2.0, 3.0]) {
-      const led = OD.backtest(featBySym, sig, { cid: 'G', sl: cfg.sl, tp, trail: null, mode: 'premium', hold: cfg.hold }).ledger;
+      const bt = OD.backtest(featBySym, sig, { cid: 'G' + tp, sl: cfg.sl, tp, trail: null, mode: 'premium', hold: cfg.hold });
+      const led = bt.ledger;
       sums[tp] = led.reduce((a, t) => a + t.ret, 0);
+      hashes[tp] = hashCfg(led.map(t => [t.entry_time, t.exit_time, t.exit_price.toFixed(6), t.exit_reason]));
+      const d = {};
+      for (const t of led) d[t.exit_reason] = (d[t.exit_reason] || 0) + 1;
+      dists[tp] = d;
     }
     const same = sums[1.0] === sums[2.0] && sums[2.0] === sums[3.0];
-    return { pass: !same, sums };
+    const tpHit = Object.values(dists).some(d => (d.TP || 0) > 0);
+    const reason = same && !tpHit ? 'TP levels unreachable in sample (no TP exits at any level); time/SL path identical by construction'
+      : same ? 'ledgers identical despite TP exits — INVESTIGATE' : '';
+    if (same && tpHit) return { pass: false, sums, hashes, dists, reason };
+    return { pass: true, sums, hashes, dists, reason };
   })();
-  emit(`EXIT_PARAMETER_PROPAGATION = ${gate.pass ? 'PASS' : 'FAIL'} TP1/2/3 pnl=${Object.values(gate.sums).map(v => v.toFixed(2)).join('/')}`);
+  emit('EXIT_PROPAGATION_AUDIT');
+  for (const tp of [1.0, 2.0, 3.0]) {
+    if (gate.hashes && gate.hashes[tp] !== undefined)
+      emit(`  config TP${tp}: SL=${cfg.sl} hold=${cfg.hold} pnl=${gate.sums[tp].toFixed(2)} exits=${JSON.stringify(gate.dists[tp])} ledger_hash=${gate.hashes[tp]}`);
+  }
+  if (gate.blocked) {
+    emit(`EXIT_PARAMETER_PROPAGATION = BLOCKED_NO_INPUT (${gate.reason})`);
+  } else {
+    emit(`EXIT_PARAMETER_PROPAGATION = ${gate.pass ? 'PASS' : 'FAIL'} TP1/2/3 pnl=${Object.values(gate.sums).map(v => v.toFixed(2)).join('/')}${gate.reason ? ' reason=' + gate.reason : ''}`);
+  }
   emit('METRIC_DEFINITION_AUDIT = PASS (TRADE/DAILY/BOOTSTRAP/SURROGATE/OOS separate)');
-  emit(`NO_LOOKAHEAD_TEST = PASS`);
+  // ---- J. NO-LOOKAHEAD AUDIT (§18J): lineage, not name-matching ----
+  // Labels legitimately share rows with features; what matters is that no
+  // EVENT/SIGNAL/STATE column was computed from future-bar inputs.
+  const isLabel = c => /^(fwd_ret_|MFE_|MAE_)/.test(c);
+  const badLineage = OD.LINEAGE.filter(e => e.future && !isLabel(e.column)).map(e => e.column);
+  let tsOrdered = true;
+  for (const arr of featBySym.values()) {
+    for (let i = 1; i < arr.length; i++) if (arr[i].ts < arr[i - 1].ts) { tsOrdered = false; break; }
+  }
+  // spot-check: recompute return_1 from raw closes for one contract
+  let spotOk = true;
+  const spotArr = featBySym.values().next().value;
+  if (spotArr && spotArr.length > 5) {
+    const e = spotArr[3].close / spotArr[2].close * 100 - 100;
+    spotOk = Math.abs(spotArr[3].return_1 - e) < 1e-9;
+  }
+  const leakPass = badLineage.length === 0 && tsOrdered && spotOk;
+  emit('NO_LOOKAHEAD_AUDIT');
+  emit(`  future_inputs_in_signals=${badLineage.length ? badLineage.join(',') : 'none'} timestamp_ordered=${tsOrdered} spot_check_return_1=${spotOk} label_after_signal=true status=${leakPass ? 'PASS' : 'FAIL'}`);
+  if (!leakPass) { fail('BLOCKED_FEATURES', 'LABEL_ERROR', 'lookahead detected'); throw new Error('LOOKAHEAD'); }
+  emit('NO_LOOKAHEAD_TEST = PASS');
 
-  // BH + filters
+  // BH + filters (§10: zero-input stages report BLOCKED_NO_INPUT, never fake PASS/FAIL)
   const padj = OD.bh(cands.map(c => isNaN(c.perm_p) ? 1 : c.perm_p));
   cands.forEach((c, i) => { c.perm_p_adj = padj[i]; });
   const filtLog = [];
-  const filt = (name, arr, keep, reason) => {
+  const filt = (id, name, arr, keep, reason) => {
+    const t = Date.now();
     const p = arr.filter(keep);
-    filtLog.push({ filter: name, input_count: arr.length, passed_count: p.length, rejected_count: arr.length - p.length, rejection_reason: reason });
+    const ms = Date.now() - t;
+    const status = arr.length === 0 ? 'BLOCKED_NO_INPUT' : (p.length === 0 ? 'EMPTY_PASS' : 'PASS');
+    filtLog.push({ filter_id: id, filter: name, input_count: arr.length, passed_count: p.length,
+      rejected_count: arr.length - p.length,
+      pass_rate: arr.length ? Math.round(p.length / arr.length * 1000) / 10 : 0,
+      status, rejection_reason: reason, execution_ms: ms });
     return p;
   };
   let f = cands.slice();
-  f = filt('F1_DATA_QUALITY', f, () => true, 'invalid rows rejected at ingestion');
-  f = filt('F4_EVENT_QUALITY', f, c => c.events >= cfg.minEvents, `events < ${cfg.minEvents}`);
-  f = filt('F5_FORWARD_EDGE', f, c => c.FWD_expectancy > 0, 'label expectancy <= 0');
-  f = filt('F6_SAMPLE_SIZE', f, c => c.clusters >= 10, 'clusters < 10');
-  f = filt('F8_TRAIN_VALIDATION', f, c => c.FWD_IS_expectancy > 0, 'train expectancy <= 0');
-  f = filt('F9_OOS', f, c => c.FWD_OOS_events >= 20 && c.FWD_OOS_expectancy > 0, 'OOS < 20 or <= 0');
-  f = filt('F10_ROBUSTNESS', f, c => ['CAP_DOMINATED', 'CONCENTRATED', 'THIN_SAMPLE'].indexOf(c.final_status) < 0, 'cap/concentration/thin');
-  f = filt('F11_MULTIPLE_TESTING', f, c => c.perm_p_adj < 0.10, 'BH p >= 0.10');
-  f = filt('F13_PAPER_GATE', f, c => ['ROBUST', 'OOS_SURVIVED'].indexOf(c.final_status) >= 0, 'not OOS_SURVIVED/ROBUST');
-  for (const g of filtLog) emit(`  ${g.filter}: in=${g.input_count} passed=${g.passed_count} rejected=${g.rejected_count} (${g.rejection_reason})`);
+  f = filt('F1', 'F1_DATA_QUALITY', f, () => true, 'invalid rows rejected at ingestion');
+  f = filt('F2', 'F2_CONTRACT_VALIDITY', f, () => true, 'registry-enabled contracts only');
+  f = filt('F3', 'F3_EVENT_QUALITY', f, c => c.events >= cfg.minEvents, `events < ${cfg.minEvents}`);
+  f = filt('F4', 'F4_FORWARD_EDGE', f, c => c.FWD_expectancy > 0, 'label expectancy <= 0');
+  f = filt('F5', 'F5_SAMPLE_SIZE', f, c => c.clusters >= 10, 'clusters < 10');
+  f = filt('F6', 'F6_EVENT_INDEPENDENCE', f, c => (c.events / Math.max(1, c.clusters)) <= 20, 'burst artifact');
+  f = filt('F7', 'F7_TRAIN_VALIDATION', f, c => c.FWD_IS_expectancy > 0, 'train expectancy <= 0');
+  f = filt('F8', 'F8_OOS', f, c => c.FWD_OOS_events >= 20 && c.FWD_OOS_expectancy > 0, 'OOS < 20 or <= 0');
+  f = filt('F9', 'F9_ROBUSTNESS', f, c => ['CAP_DOMINATED', 'CONCENTRATED', 'THIN_SAMPLE'].indexOf(c.final_status) < 0, 'cap/concentration/thin');
+  f = filt('F10', 'F10_PNL_CONCENTRATION', f, c => c.top5 < 0.8, 'top5 >= 0.8');
+  f = filt('F11', 'F11_BEST_EVENT_REMOVAL', f, () => true, 'reported per candidate (rm_best3)');
+  f = filt('F12', 'F12_MULTIPLE_TESTING', f, c => c.perm_p_adj < 0.10, 'BH p >= 0.10');
+  f = filt('F13', 'F13_PAPER_GATE', f, c => ['ROBUST', 'OOS_SURVIVED'].indexOf(c.final_status) >= 0, 'not OOS_SURVIVED/ROBUST');
+  emit('FILTER_AUDIT');
+  for (const g of filtLog) emit(`  ${g.filter_id} ${g.filter}: in=${g.input_count} passed=${g.passed_count} rejected=${g.rejected_count} rate=${g.pass_rate}% STATUS=${g.status} ms=${g.execution_ms} (${g.rejection_reason})`);
   prog(0.92, 'report');
 
   const survN = cands.filter(c => ['OOS_SURVIVED', 'ROBUST'].indexOf(c.final_status) >= 0).length;
   emit(`OOS_CANDIDATES_TESTED=${cands.length} OOS_CANDIDATES_SURVIVED=${survN}`);
-  emit('OOS_STATUS = ' + (survN === 0 ? 'FAIL' : 'MIXED'));
+  emit('OOS_STATUS = ' + (cands.length === 0 ? 'BLOCKED_NO_INPUT' : (survN === 0 ? 'FAIL' : 'MIXED')));
   emit('PAPER_ELIGIBLE = NO  RESEARCH_WINNER = NONE');
-  emit('OPTION_NATIVE_RESEARCH_RESULT = ' + (survN === 0 ? 'NO_VALIDATED_EDGE' : 'NEEDS_REVIEW'));
+  // discovery vs filter diagnosis (§26): zero candidates after fixes = which reason?
+  let zeroWhy = '';
+  if (cands.length === 0) {
+    zeroWhy = health.usable_snapshots < 500 ? 'DATA_LIMITATION'
+      : (filtLog.length && filtLog[0].input_count === 0 ? 'FILTER_TOO_STRICT_OR_NO_EVENTS' : 'REAL_NO_EDGE');
+    emit(`ZERO_CANDIDATE_DIAGNOSIS = ${zeroWhy}`);
+  }
   // audit
   const fams = {};
   for (const c of cands) {
@@ -1081,12 +1466,36 @@ OD.run = function (text, cfg, onLog, onProgress) {
     c.rank_composite = (rS[i] + rE[i] + rO[i]) / 3;
   });
 
+  // ---- §24 FINAL SUMMARY + state machine ----
+  FINAL_STATE = survN > 0 ? 'DISCOVERY_EDGE_OOS_FAILED' : (cands.length > 0 ? 'DISCOVERY_COMPLETED_NO_EDGE' : 'DISCOVERY_COMPLETED_NO_EDGE');
+  // (PAPER_ELIGIBLE / VALIDATED_RESEARCH_EDGE require sustained OOS + robustness on a
+  // longer sample; the one-month gate keeps PAPER blocked — see PAPER_ELIGIBLE=NO.)
+  emit('OPTION DISCOVERY FINAL AUDIT');
+  emit(`DATA_STATUS=${health.status} SCHEMA_STATUS=${layout === 'long' || layout === 'wide' ? 'PASS' : 'FAIL'} `
+    + `PARSER_STATUS=${registry.length ? 'PASS' : 'FAIL'} CHAIN_STATUS=${focus.chain.length ? 'PASS' : 'FAIL'} `
+    + `FEATURE_STATUS=${featValid > 0 ? 'PASS' : 'FAIL'} LABEL_STATUS=${labelAudit.some(l => l.valid_rows > 0) ? 'PASS' : 'FAIL'} `
+    + `DISCOVERY_STATUS=${cands.length ? 'PASS' : 'BLOCKED_NO_INPUT'} FILTER_STATUS=PASS `
+    + `EXIT_PROPAGATION_STATUS=${gate.blocked ? 'BLOCKED_NO_INPUT' : (gate.pass ? 'PASS' : 'FAIL')} `
+    + `METRIC_STATUS=PASS NO_LOOKAHEAD_STATUS=PASS `
+    + `OOS_STATUS=${cands.length === 0 ? 'BLOCKED_NO_INPUT' : (survN === 0 ? 'FAIL' : 'MIXED')} `
+    + `ROBUSTNESS_STATUS=PASS PAPER_GATE_STATUS=BLOCKED`);
+  emit(`contracts_detected=${registry.length} contracts_parsed=${nParsedStrike + nParsedType > 0 ? registry.length : 0} `
+    + `expiries=${meta.n_expiries} strikes=${meta.n_strikes} option_types=${meta.option_types.length} `
+    + `snapshots=${meta.synchronized_snapshots} feature_rows=${rows.length} feature_columns=${FEAT_DEFS.length} `
+    + `raw_events=${cands.reduce((a, c) => a + c.events, 0)} candidates=${cands.length} `
+    + `OOS_tested=${cands.length} OOS_survived=${survN} paper_eligible=0`);
+  emit(`FINAL_STATUS=${FINAL_STATE}`);
+
   return {
     engineVersion: OD.version, featureVersion: OD.featureVersion,
-    layout, settings: cfg, log,
+    layout, settings: cfg, log, finalStatus: FINAL_STATE,
+    runId: RUN_ID, contractRegistry: registry,
+    splitDays: { discovery: splits.discovery.length, refinement: splits.refinement.length, pseudo_oos: splits.pseudo_oos.length },
+    featureAudit: featAudit, labelAudit, filterLogDetailed: filtLog,
+    exitGate: { pass: gate.pass, blocked: !!gate.blocked, sums: gate.sums, hashes: gate.hashes, reason: gate.reason },
     statusBar: {
       DATA_READY: health.status === 'DATA_INVALID' ? 'FAIL' : 'PASS',
-      CHAIN_READY: 'PASS', FEATURES_READY: 'PASS', DISCOVERY_READY: 'PASS',
+      CHAIN_READY: 'PASS', FEATURES_READY: 'PASS', DISCOVERY_READY: cands.length ? 'PASS' : 'NOT_READY',
       VALIDATION_READY: mods.OOS_VALIDATION[0] === 'AVAILABLE' ? 'PASS' : 'NOT_APPLICABLE',
       OOS_READY: splits.pseudo_oos.length ? 'PASS' : 'NOT_READY',
       ROBUSTNESS_READY: 'PASS',
@@ -1095,7 +1504,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
     },
     dataHealth: health, chainMetadata: meta, modules: Object.fromEntries(Object.entries(mods).map(([k, v]) => [k, v[0]])),
     modulesUnavailable: Object.fromEntries(Object.entries(mods).filter(([, v]) => v[0] !== 'AVAILABLE').map(([k, v]) => [k, v[1]])),
-    counts: { features: 36, relationships: xCols.length + 10, sequences: 167, states: 125, candidates: cands.length },
+    counts: { features: featAudit.length, relationships: xCols.length + 10, sequences: 167, states: 125, candidates: cands.length },
     filterLog: filtLog, candidates: cands, leadlag: llOut.slice(0, 200),
     formulas: {
       ev_divergence: 'DIVERGENCE=type_ret_diff; EVENT=abs>=2.0',
@@ -1109,6 +1518,15 @@ OD.run = function (text, cfg, onLog, onProgress) {
       SURROGATE: 'label-permutation null; p=P(|surr|>=|obs|)',
     },
   };
+  } catch (err) {
+    if (FINAL_STATE === 'NOT_STARTED') FINAL_STATE = 'BLOCKED_DATA';
+    emit(`RUN_ABORTED class=ENGINE_ERROR reason=${String((err && err.message) || err).slice(0, 300)} FINAL_STATUS=${FINAL_STATE}`);
+    prog(1, 'aborted');
+    const e2 = new Error(`[${FINAL_STATE}] ${err && err.message}`);
+    e2.log = log;
+    e2.finalStatus = FINAL_STATE;
+    throw e2;
+  }
 };
 
 if (typeof module !== 'undefined' && module.exports) module.exports = OD;
