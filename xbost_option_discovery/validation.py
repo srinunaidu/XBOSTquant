@@ -1,11 +1,19 @@
 """Chronological validation (§17) + clustering (§16) + OOS gate (§31)."""
 import pandas as pd
 
-def splits_50_20_30(days):
+def chronological_splits(days, fractions=(0.5, 0.2, 0.3)):
+    """Configurable chronological discovery/refinement/pseudo-OOS split (§13)."""
     days = sorted(days)
     n = len(days)
-    i1 = int(n * 0.5); i2 = i1 + int(n * 0.2)
+    if n < 3:
+        return None  # VALIDATION_INSUFFICIENT_DATA
+    i1 = max(1, int(n * fractions[0])); i2 = i1 + max(1, int(n * fractions[1]))
+    i2 = min(i2, n - 1)
     return {"discovery": days[:i1], "refinement": days[i1:i2], "pseudo_oos": days[i2:]}
+
+
+def splits_50_20_30(days):
+    return chronological_splits(days, (0.5, 0.2, 0.3))
 
 def walk_forward(days, train_n=8, test_n=3):
     days = sorted(days)

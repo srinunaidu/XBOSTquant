@@ -1,0 +1,162 @@
+{
+  "run_id": "20261002-103512-854fae",
+  "dataset_path": "Data test/banknifty_options.csv",
+  "data_format": "long",
+  "chain": [
+    "BANKNIFTY29SEP2656500CE",
+    "BANKNIFTY29SEP2656500PE",
+    "BANKNIFTY29SEP2657000CE",
+    "BANKNIFTY29SEP2657000PE",
+    "BANKNIFTY29SEP2657500CE",
+    "BANKNIFTY29SEP2657500PE"
+  ],
+  "chain_metadata": {
+    "underlying": [
+      "UNKNOWN"
+    ],
+    "expiries": [
+      "29SEP2026"
+    ],
+    "n_expiries": 1,
+    "contracts_per_expiry": {
+      "29SEP2026": 42
+    },
+    "strikes": [
+      "55500.0",
+      "55600.0",
+      "55700.0",
+      "55800.0",
+      "55900.0",
+      "56000.0",
+      "56100.0",
+      "56200.0",
+      "56300.0",
+      "56400.0",
+      "56500.0",
+      "56600.0",
+      "56700.0",
+      "56800.0",
+      "56900.0",
+      "57000.0",
+      "57100.0",
+      "57200.0",
+      "57300.0",
+      "57400.0",
+      "57500.0"
+    ],
+    "n_strikes": 21,
+    "option_types": [
+      "CE",
+      "PE"
+    ],
+    "n_option_types": 2,
+    "contracts": [
+      "BANKNIFTY29SEP2655500CE",
+      "BANKNIFTY29SEP2655500PE",
+      "BANKNIFTY29SEP2655600CE",
+      "BANKNIFTY29SEP2655600PE",
+      "BANKNIFTY29SEP2655700CE",
+      "BANKNIFTY29SEP2655700PE",
+      "BANKNIFTY29SEP2655800CE",
+      "BANKNIFTY29SEP2655800PE",
+      "BANKNIFTY29SEP2655900CE",
+      "BANKNIFTY29SEP2655900PE",
+      "BANKNIFTY29SEP2656000CE",
+      "BANKNIFTY29SEP2656000PE",
+      "BANKNIFTY29SEP2656100CE",
+      "BANKNIFTY29SEP2656100PE",
+      "BANKNIFTY29SEP2656200CE",
+      "BANKNIFTY29SEP2656200PE",
+      "BANKNIFTY29SEP2656300CE",
+      "BANKNIFTY29SEP2656300PE",
+      "BANKNIFTY29SEP2656400CE",
+      "BANKNIFTY29SEP2656400PE",
+      "BANKNIFTY29SEP2656500CE",
+      "BANKNIFTY29SEP2656500PE",
+      "BANKNIFTY29SEP2656600CE",
+      "BANKNIFTY29SEP2656600PE",
+      "BANKNIFTY29SEP2656700CE",
+      "BANKNIFTY29SEP2656700PE",
+      "BANKNIFTY29SEP2656800CE",
+      "BANKNIFTY29SEP2656800PE",
+      "BANKNIFTY29SEP2656900CE",
+      "BANKNIFTY29SEP2656900PE",
+      "BANKNIFTY29SEP2657000CE",
+      "BANKNIFTY29SEP2657000PE",
+      "BANKNIFTY29SEP2657100CE",
+      "BANKNIFTY29SEP2657100PE",
+      "BANKNIFTY29SEP2657200CE",
+      "BANKNIFTY29SEP2657200PE",
+      "BANKNIFTY29SEP2657300CE",
+      "BANKNIFTY29SEP2657300PE",
+      "BANKNIFTY29SEP2657400CE",
+      "BANKNIFTY29SEP2657400PE",
+      "BANKNIFTY29SEP2657500CE",
+      "BANKNIFTY29SEP2657500PE"
+    ],
+    "n_contracts": 42,
+    "timestamp_range": [
+      "2026-08-20 09:15:00",
+      "2026-09-18 15:39:00"
+    ],
+    "n_timestamps": 7895,
+    "n_days": 21,
+    "synchronized_snapshots": 7895,
+    "complete_snapshots": 153,
+    "partial_snapshots": 7742,
+    "completeness": 0.0194,
+    "missing_data": 0,
+    "duplicate_observations": 0,
+    "has_bidask": false,
+    "has_oi": false
+  },
+  "modules": {
+    "OPTION_DATA": "AVAILABLE",
+    "CHAIN_STRUCTURE": "AVAILABLE",
+    "RAW_PRICE": "AVAILABLE",
+    "VOLUME": "AVAILABLE",
+    "OPTION_TYPE_RELATIONSHIP": "AVAILABLE",
+    "STRIKE_RELATIONSHIP": "AVAILABLE",
+    "EXPIRY_RELATIONSHIP": "UNAVAILABLE",
+    "LEAD_LAG": "AVAILABLE",
+    "SEQUENCE": "AVAILABLE",
+    "CHAIN_STATE": "AVAILABLE",
+    "EXECUTABLE_MODEL": "UNAVAILABLE",
+    "OOS_VALIDATION": "AVAILABLE"
+  },
+  "modules_unavailable": {
+    "EXPIRY_RELATIONSHIP": "only 1 expir(ies)",
+    "EXECUTABLE_MODEL": "no bid/ask fields; RESEARCH_PRICE_MODEL only"
+  },
+  "code_version": "od-v5-dynamic",
+  "seed": 42,
+  "splits": {
+    "discovery": [
+      "2026-08-20",
+      "2026-08-21",
+      "2026-08-24",
+      "2026-08-25",
+      "2026-08-26",
+      "2026-08-27",
+      "2026-08-28",
+      "2026-08-31",
+      "2026-09-01",
+      "2026-09-02"
+    ],
+    "refinement": [
+      "2026-09-03",
+      "2026-09-04",
+      "2026-09-07",
+      "2026-09-08"
+    ],
+    "pseudo_oos": [
+      "2026-09-09",
+      "2026-09-10",
+      "2026-09-11",
+      "2026-09-15",
+      "2026-09-16",
+      "2026-09-17",
+      "2026-09-18"
+    ]
+  }
+}

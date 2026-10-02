@@ -50,34 +50,56 @@ def write_report(outdir, meta, health, contracts_txt, expiry_txt, cands, ll, sta
         json.dump(meta, f, indent=2, default=str)
     L = []
     A = L.append
+    md = meta.get("chain_metadata", {})
     A("# XBOST Option-Native Discovery — Final Report (RESEARCH_PRICE_MODEL)")
-    A(f"run {meta['run_id']} | format={meta['data_format']} | chain={meta['chain']}")
-    A("LIMITATION: One-month 1-minute option data is sufficient for discovery and structural research, but insufficient for strong long-horizon robustness claims.")
+    A(f"run {meta.get('run_id')} | layout={meta.get('data_format')} | contracts={md.get('n_contracts')}")
+    A("LIMITATION: short-horizon option data is sufficient for discovery and structural research, "
+      "but insufficient for strong long-horizon robustness claims.")
     A("")
+    disc = cands[cands["final_status"].isin(["ROBUST", "OOS_SURVIVED"])] if len(cands) else cands
+    oos_ok = cands[cands["OOS_result"] == "OOS_SURVIVED_MARK"] if len(cands) and "OOS_result" in cands else cands.iloc[0:0]
     secs = [
-        ("1. DATA HEALTH", [f"status={health['status']}", f"rows={health['rows']}", f"timestamps={health['timestamps']}",
-                            f"days={health['unique_days']} {health['date_start']}..{health['date_end']}",
-                            f"missing={health['missing_interval_count']} dup={health['duplicate_timestamp_count']}",
-                            f"completeness={health['chain_completeness']} volcov={health['volume_coverage']}"]),
-        ("2. CONTRACT / EXPIRY AUDIT", [contracts_txt, expiry_txt]),
-        ("3. DISCOVERY SEARCH SPACE", [json.dumps(counts)]),
-        ("4. RAW PRICE DISCOVERIES", [f"{len(cands[cands['type']=='price'])} price candidates" if 'type' in cands else f"{len(cands)} total"]),
-        ("5. VOLUME DISCOVERIES", ["volume_shock/confirmation/divergence tested; see candidates"]),
-        ("6. CE/PE DISCOVERIES", ["cepe_ret_diff/ratio/vol/acc + 4 lead events tested"]),
-        ("7. CROSS-STRIKE DISCOVERIES", [f"spreads on {meta['chain']}"]),
-        ("8. LEAD/LAG DISCOVERIES", [f"{len(ll)} pair-lag tests k=1,2,3,5,10"]),
-        ("9. SEQUENCE DISCOVERIES", [f"{len(seqs)} seq patterns len<=3"]),
-        ("10. STATE DISCOVERIES", [f"{len(states)} states"]),
-        ("11. INDICATOR BASELINES", ["BASELINE_RSI/BB/MA/ROC/VWAP/ATR kept separate as INDICATOR_BASELINE (VolRate pair = INDICATOR_BASELINE, not OPTION_CHAIN_DISCOVERY)"]),
-        ("12. IS RESULTS", [cands.head(10).to_markdown(index=False) if len(cands) else "(none)"]),
-        ("13. OOS RESULTS", [f"OOS gate applied; THIN_OOS if oos_n<20"]),
-        ("14. WALK-FORWARD RESULTS", [pd.DataFrame(wf).to_markdown(index=False) if len(wf) else "(insufficient folds)"]),
-        ("15. ROBUSTNESS", ["time/CE-PE/strike/perturb/best-removal/concentration/dependence in candidates.csv"]),
-        ("16. MULTIPLE-TESTING", [f"BH-adjusted; {json.dumps(counts)}"]),
-        ("17. TOP SURVIVING PATTERNS", [cands[cands['final_status'].isin(['OOS_SURVIVED','PAPER_CANDIDATE'])].head(10).to_markdown(index=False) if len(cands) else "NO_ROBUST_DISCOVERY"]),
-        ("18. OPTION-NATIVE BACKTEST", ["RESEARCH_PRICE_MODEL only; fingerprint-verified; run only on survivors"]),
-        ("19. PAPER ELIGIBILITY", [paper_gate(cands)]),
-        ("20. FAILURE REASONS", ["train/OOS disagreement; THIN_OOS; concentration>0.5; perm fail; see failure_reason col"]),
+        ("1. DATASET STRUCTURE", [f"layout={meta.get('data_format')}",
+                                  f"underlying={md.get('underlying')}",
+                                  f"contracts={md.get('n_contracts')} types={md.get('option_types')} "
+                                  f"strikes={md.get('n_strikes')} expiries={md.get('expiries')}"] ),
+        ("2. DATA HEALTH", [f"status={health.get('status')}", f"rows={health.get('rows')}",
+                            f"timestamps={health.get('timestamps')} days={health.get('unique_days')} "
+                            f"{health.get('date_start')}..{health.get('date_end')}",
+                            f"missing={health.get('missing_interval_count')} "
+                            f"dup={health.get('duplicate_timestamp_count')} "
+                            f"volcov={health.get('volume_coverage')}"]),
+        ("3. DISCOVERED CHAIN DIMENSIONS", [json.dumps({k: md.get(k) for k in
+            ("n_contracts", "n_strikes", "n_option_types", "n_expiries",
+             "synchronized_snapshots", "complete_snapshots", "completeness")})]),
+        ("4. AVAILABLE DISCOVERY MODULES", [", ".join(
+            f"{k}={v}" for k, v in (meta.get("modules") or {}).items()) or "(none)"]),
+        ("5. SKIPPED/UNAVAILABLE MODULES", [json.dumps(meta.get("modules_unavailable") or {}) or "(none)"]),
+        ("6. DISCOVERY SEARCH SPACE", [json.dumps(counts)]),
+        ("7. EVENTS DISCOVERED", [f"{len(cands)} candidates across families: " +
+                                  (", ".join(f"{k}={v}" for k, v in
+                                   cands['discovery_family'].value_counts().items()) if len(cands) else "none")]),
+        ("8. RELATIONSHIPS DISCOVERED", [f"{len(ll)} lead/lag pair-tests; "
+                                         f"type/strike/breadth columns in candidates.csv"]),
+        ("9. FORWARD-RETURN RESULTS (DISCOVERY, label-based)",
+         [cands[["candidate", "discovery_family", "FWD_expectancy",
+                 "FWD_OOS_expectancy", "perm_p", "final_status"]].head(15).to_markdown(index=False)
+          if len(cands) else "(none)"]),
+        ("10. TRADING CANDIDATES (path-exit, secondary)",
+         [cands[["candidate", "events", "IS_expectancy", "IS_TRADE_SHARPE",
+                 "exit_cap_dominated"]].head(10).to_markdown(index=False) if len(cands) else "(none)"]),
+        ("11. OOS RESULTS", [f"OOS gate: THIN_OOS if oos_n<20; "
+                             f"{len(oos_ok)} positive-OOS-label candidates; "
+                             f"{len(disc)} DISCOVERY-or-better"]),
+        ("12. WALK-FORWARD RESULTS", [pd.DataFrame(wf).to_markdown(index=False) if len(wf) else "(insufficient folds)"]),
+        ("13. ROBUSTNESS RESULTS", ["time/type/strike/perturb/best-removal/concentration in candidates.csv"]),
+        ("14. MULTIPLE-TESTING RESULTS", [f"BH-adjusted perm p; {json.dumps(counts)}"]),
+        ("15. PAPER ELIGIBILITY", [paper_gate(cands)]),
+        ("16. RESULT STRATA", [
+            f"DISCOVERY RESULT: {len(cands)} candidates measured",
+            f"VALIDATED RESULT: {len(disc)} surviving discovery gates",
+            f"OOS RESULT: {len(oos_ok)} positive-OOS-label",
+            f"PAPER-ELIGIBLE RESULT: 0 (short-sample gate)"]),
     ]
     for title, body in secs:
         A(f"## {title}")
@@ -87,9 +109,24 @@ def write_report(outdir, meta, health, contracts_txt, expiry_txt, cands, ll, sta
     A(f"METRIC_DEFINITION_AUDIT={'PASS' if metric_audit else 'FAIL'}")
     with open(os.path.join(outdir, "report.md"), "w") as f:
         f.write("\n".join(L))
-    html = ["<html><body><h1>Discovery Dashboard</h1>",
-            cands.head(20).to_html(index=False) if len(cands) else "<p>NO_ROBUST_DISCOVERY</p>",
-            "<h2>Lead/Lag</h2>", ll.head(20).to_html(index=False) if len(ll) else "<p>(none)</p>",
+    # dynamic dashboard: sections render from discovered metadata; unsupported
+    # modules render as NOT_APPLICABLE instead of fixed strike/contract names
+    html = ["<html><head><title>OPTION NATIVE DISCOVERY</title></head><body>",
+            "<h1>OPTION NATIVE DISCOVERY</h1>",
+            f"<p>run {meta.get('run_id')} | contracts={md.get('n_contracts')} "
+            f"types={md.get('option_types')} expiries={md.get('expiries')}</p>",
+            "<h2>DATA HEALTH</h2>", f"<p>{health.get('status')} "
+            f"rows={health.get('rows')} snapshots={md.get('synchronized_snapshots')}</p>",
+            "<h2>CHAIN STRUCTURE</h2>",
+            pd.DataFrame([{"contracts": md.get("n_contracts"), "strikes": md.get("n_strikes"),
+                           "types": md.get("option_types"), "expiries": md.get("expiries")}]).to_html(index=False),
+            "<h2>MODULES</h2>",
+            pd.DataFrame([{"module": k, "status": v}
+                          for k, v in (meta.get("modules") or {}).items()]).to_html(index=False),
+            "<h2>TRADING CANDIDATES</h2>",
+            cands.head(20).to_html(index=False) if len(cands) else "<p>NO_VALIDATED_EDGE</p>",
+            "<h2>LEAD/LAG</h2>", ll.head(20).to_html(index=False) if len(ll) else "<p>NOT_APPLICABLE</p>",
+            "<h2>BASELINE INDICATOR SEARCH (comparison only)</h2><p>Not mixed with option-native discoveries.</p>",
             "</body></html>"]
     with open(os.path.join(outdir, "dashboard.html"), "w") as f:
         f.write("\n".join(html))

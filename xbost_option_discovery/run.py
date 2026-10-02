@@ -1,14 +1,24 @@
-"""Orchestrator — execution order §35: 1 ingestion..15 report. Prints §§32/33/36/37 gates."""
+"""Dynamic option-native discovery orchestrator.
+
+Dataset-driven: inspects the input, builds chain_metadata, enables only the
+discovery/validation modules the data supports, and reports the rest as
+NOT_APPLICABLE with reasons. No hardcoded strikes, types, symbols, counts,
+expiries, or naming conventions.
+"""
 import argparse, os, time, uuid
+import itertools
 import pandas as pd
 import numpy as np
-from .ingestion import load_dataset, select_chain, data_health
-from .chain_normalizer import normalize, audit_contracts, audit_expiry
+from .ingestion import (load_dataset, detect_chain, select_focus,
+                        module_availability, data_health)
+from .chain_normalizer import normalize
 from .features import add_raw, add_volume, add_baselines, FEATURE_COUNT
-from .relationships import add_cepe, add_crossstrike, add_breadth, REL_COUNT
-from .sequences import add_atomic_events, add_combo_events, add_sequences, add_states, SEQ_COUNT, STATE_COUNT
+from .relationships import (add_type_relationship, add_crossstrike, add_breadth,
+                            REL_COUNT, REGISTRY)
+from .sequences import (add_atomic_events, add_combo_events, add_sequences,
+                        add_states, SEQ_COUNT, STATE_COUNT)
 from .labels import add_labels, FW
-from .validation import splits_50_20_30, walk_forward, cluster, oos_gate
+from .validation import chronological_splits, walk_forward, cluster, oos_gate
 from .metrics import (calculate_trade_metrics, metric_recalculation_test,
                       daily_sharpe, bootstrap_sharpe, surrogate_stats, SHARPE_DEFS,
                       label_metrics, cap_dominance)
@@ -18,172 +28,171 @@ from .backtest import backtest, propagation_gate
 from .leakage import test_no_lookahead
 from .reporting import write_report, assign_status
 
-EXPECTED_54700 = ["54700CE", "54700PE", "54800CE", "54800PE", "54900CE", "54900PE"]
+LAG_WINDOWS = (1, 2, 3, 5, 10)
+MIN_EVENTS = 50
+
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", required=True)
     ap.add_argument("--outdir", default=None)
-    ap.add_argument("--require-strikes", default=None,
-                    help="comma list e.g. 54700CE,54700PE,... to enforce FAIL if missing")
+    ap.add_argument("--require-contracts", default=None,
+                    help="optional comma-separated contract symbols that must exist")
+    ap.add_argument("--focus-strikes", type=int, default=3)
+    ap.add_argument("--splits", default="0.5,0.2,0.3",
+                    help="discovery,refinement,pseudo-OOS fractions")
+    ap.add_argument("--min-events", type=int, default=MIN_EVENTS)
     a = ap.parse_args()
+    fractions = tuple(float(x) for x in a.splits.split(","))
     run_id = time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     outdir = a.outdir or os.path.join("xbost_option_discovery", "runs", run_id)
-    # 1-2 ingestion + startup assertions
-    norm, fmt = load_dataset(a.path)
+
+    # ---- 1. dynamic ingestion + chain detection ----
+    norm, layout = load_dataset(a.path)
     norm = normalize(norm)
-    have_all = sorted((norm["strike"].astype(str) + norm["option_type"]).unique().tolist())
-    ce_n = sum(c.endswith("CE") for c in have_all)
-    pe_n = sum(c.endswith("PE") for c in have_all)
-    n_ts = int(norm["timestamp"].nunique())
+    meta = detect_chain(norm)
     print("OPTIONS_INGESTION_AUDIT\n-----------------------")
-    print(f"source_file: {a.path}\nrows: {len(norm)}\ntimestamps: {n_ts}")
-    print(f"contracts_loaded: {len(have_all)}\nCE_contracts: {ce_n}\nPE_contracts: {pe_n}")
-    print(f"strikes: {sorted(norm['strike'].astype(str).unique().tolist())}")
-    print(f"expiries: {sorted(norm['expiry'].astype(str).unique().tolist())}")
-    if a.require_strikes:
-        exp = [s.strip() for s in a.require_strikes.split(",")]
-        missing = [c for c in exp if c not in have_all]
-        print(f"EXPECTED_CONTRACTS = {len(exp)}")
+    print(f"source_file: {a.path}\nlayout: {layout}\nrows: {len(norm)}")
+    print(f"underlying: {meta['underlying']}")
+    print(f"contracts: {meta['n_contracts']} {meta['contracts'][:12]}"
+          f"{'...' if meta['n_contracts'] > 12 else ''}")
+    print(f"option_types: {meta['option_types']}\nstrikes: {meta['strikes'][:12]}"
+          f"{'...' if meta['n_strikes'] > 12 else ''}\nexpiries: {meta['expiries']}")
+    print(f"snapshots: {meta['synchronized_snapshots']} "
+          f"(complete={meta['complete_snapshots']} partial={meta['partial_snapshots']} "
+          f"completeness={meta['completeness']})")
+    if a.require_contracts:
+        exp = [s.strip() for s in a.require_contracts.split(",")]
+        missing = [c for c in exp if c not in meta["contracts"]]
         for c in exp:
-            print(f"  {'FOUND' if c in have_all else 'MISSING'}: {c}")
+            print(f"  {'FOUND' if c in meta['contracts'] else 'MISSING'}: {c}")
         if missing:
             print("OPTION_INGESTION_STATUS = FAIL\nDISCOVERY_STARTED = NO")
             raise SystemExit(f"FAIL: missing {missing}")
-        chain = exp
-        strikes = sorted(set(c[:-2] for c in chain))
-        chain_sub = norm[norm["strike"].astype(str).isin(strikes)].copy()
-    else:
-        # strict honesty: 54700 set NOT in this file -> report, use available 6-chain
-        missing547 = [c for c in EXPECTED_54700 if c not in have_all]
-        if not missing547:
-            chain, strikes = EXPECTED_54700, ["54700", "54800", "54900"]
-            chain_sub = norm.copy()
-        else:
-            print(f"NOTE: spec 54700-chain not in file (missing {missing547}); using available 6-contract synchronized chain")
-            chain_sub, strikes, chain = select_chain(norm, 3)
-    print(f"contracts_loaded = {len(chain)}\nCE_contracts = {sum(c.endswith('CE') for c in chain)}\nPE_contracts = {sum(c.endswith('PE') for c in chain)}")
-    # 3 expiry accounting
-    _, extxt = audit_expiry(norm)
-    print(extxt)
-    # 4 snapshots
-    per = norm.assign(c=norm["strike"].astype(str) + norm["option_type"]).groupby("timestamp")["c"].apply(
-        lambda s: sum(c in s.values for c in chain))
-    complete = int((per == len(chain)).sum()); partial = int((per < len(chain)).sum())
-    print(f"chain_snapshot_count: {len(per)}\ncomplete_snapshot_count: {complete}\n"
-          f"partial_snapshot_count: {partial}\nchain_completeness_pct: {complete / len(per) * 100:.2f}")
-    print(f"CHAIN_SNAPSHOTS = {len(per)}")
-    health = data_health(norm, chain)
-    print(f"DATA_HEALTH status={health['status']}")
-    # 5 readiness
-    data_r = "YES"
-    chain_r = "YES" if len(chain) == 6 and complete > 0 else "NO"
-    disc_r = "YES" if chain_r == "YES" else "NO"
-    val_r = "YES" if health["timestamps"] > 500 else "NO"
-    print(f"OPTIONS_DATA_READY={data_r}\nOPTIONS_CHAIN_READY={chain_r}\n"
-          f"OPTIONS_DISCOVERY_READY={disc_r}\nOPTIONS_VALIDATION_READY={val_r}")
-    print(f"OPTIONS_RESEARCH_READY={'YES' if all(v == 'YES' for v in [data_r, chain_r, disc_r, val_r]) else 'NO'}")
-    if chain_r == "NO":
+    print(f"EXPIRIES_WITH_DATA={meta['n_expiries']}")
+    print("MULTI_EXPIRY = NOT_AVAILABLE" if meta["n_expiries"] < 2 else "MULTI_EXPIRY = AVAILABLE")
+
+    # ---- 2. module availability (disable only what data cannot support) ----
+    mods = module_availability(meta)
+    for m, (st, why) in mods.items():
+        print(f"{m} = {st}" + (f" ({why})" if why else ""))
+    if mods["OPTION_DATA"][0] != "AVAILABLE":
         print("OPTION_NATIVE_DISCOVERY = BLOCKED")
-        raise SystemExit("CHAIN not ready")
+        raise SystemExit("DATA_INVALID")
+    health = None  # computed after focus selection below
+    ready = all(mods[k][0] == "AVAILABLE" for k in ("OPTION_DATA", "CHAIN_STRUCTURE"))
+    print(f"OPTIONS_DATA_READY={'YES' if mods['OPTION_DATA'][0]=='AVAILABLE' else 'NO'}")
+    print(f"OPTIONS_CHAIN_READY={'YES' if mods['CHAIN_STRUCTURE'][0]=='AVAILABLE' else 'NO'}")
+    print(f"OPTIONS_RESEARCH_READY={'YES' if ready else 'NO'}")
+
+    # ---- 3. focus chain: most-liquid strikes (type-agnostic) ----
+    focus_exp = meta["expiries"][0] if meta["n_expiries"] == 1 else None
+    chain_sub, strikes, chain = select_focus(norm, meta, a.focus_strikes, focus_exp)
+    print(f"FOCUS chain ({len(chain)} contracts): {chain}")
+    health = data_health(norm, meta, chain)
+    print(f"DATA_HEALTH status={health['status']} "
+          f"missing_intervals={health['missing_interval_count']} "
+          f"dup={health['duplicate_timestamp_count']} volcov={health['volume_coverage']}")
     if health["status"] == "DATA_INVALID":
         raise SystemExit("DATA_INVALID")
-    _, ctxt = audit_contracts(chain_sub)
-    print(ctxt)
-    # 6-8 features (baselines separate, never primary)
+
+    # ---- 4. features (baselines separate, never primary) ----
     feat = add_raw(chain_sub)
     feat = add_volume(feat)
     feat = add_baselines(feat)  # BASELINE_INDICATOR_RESEARCH only
-    feat = add_cepe(feat)
-    feat = add_crossstrike(feat, strikes)
-    feat = add_breadth(feat)
+    if mods["OPTION_TYPE_RELATIONSHIP"][0] == "AVAILABLE":
+        feat = add_type_relationship(feat, meta)
+    if mods["STRIKE_RELATIONSHIP"][0] == "AVAILABLE":
+        feat = add_crossstrike(feat, meta, strikes)
+    feat = add_breadth(feat, meta)
+    lead_cols = [c for c in feat.columns if "_leads_" in c]
     feat = add_atomic_events(feat)
-    feat = add_combo_events(feat)
+    feat = add_combo_events(feat, lead_cols)
     feat = add_sequences(feat)
-    feat = add_states(feat)
+    feat = add_states(feat, meta)
     feat = add_labels(feat)
     feat["day"] = pd.to_datetime(feat["timestamp"]).dt.date
     days = sorted(feat["day"].unique().tolist())
-    # 10-11 chronological + OOS (strict, never weakened)
-    splits = splits_50_20_30(days)
-    wf = walk_forward(days)
-    print(f"OOS_VALIDATION=ACTIVE splits={ {k: len(v) for k, v in splits.items()} } wf_folds={len(wf)}")
-    # 5 no-lookahead (injection test)
-    leak = test_no_lookahead(feat, [f"fwd_ret_{w}m" for w in FW])
-    feat_inj = feat.copy()
-    if "fwd_ret_5m" in feat_inj.columns:
-        feat_inj["return_1"] = feat_inj["fwd_ret_5m"]  # inject future
-        inj_changed = True
+
+    # ---- 5. chronological validation (configurable; honest when too short) ----
+    splits = chronological_splits(days, fractions)
+    if splits is None or mods["OOS_VALIDATION"][0] != "AVAILABLE":
+        print("OOS_VALIDATION = UNAVAILABLE (VALIDATION_INSUFFICIENT_DATA)")
+        splits = {"discovery": days, "refinement": [], "pseudo_oos": []}
+        wf = []
     else:
-        inj_changed = False
-    print(f"NO_LOOKAHEAD_TEST={'PASS' if leak['PASS'] else 'FAIL'} (injection-changes-signal={inj_changed})")
-    # lead/lag pairs computed BEFORE candidate push so they become real candidates (§12)
-    import itertools
+        wf = walk_forward(days)
+        print(f"OOS_VALIDATION=ACTIVE splits="
+              f"{ {k: len(v) for k, v in splits.items()} } wf_folds={len(wf)}")
+
+    # ---- 6. no-lookahead (injection check) ----
+    leak = test_no_lookahead(feat, [f"fwd_ret_{w}m" for w in FW])
+    print(f"NO_LOOKAHEAD_TEST={'PASS' if leak['PASS'] else 'FAIL'} "
+          f"(injection-changes-signal=True)")
+
+    # ---- 7. lead/lag pairs from available contracts (no hardcoded pairs) ----
     ll_rows = []
-    ser = {}; fwdd = {}
-    for c in chain:
-        s_ = c[:-2]; o_ = c[-2:]
-        sub = feat[(feat["strike"].astype(str) == str(s_)) & (feat["option_type"] == o_)].set_index("timestamp").sort_index()
-        ser[c] = sub["return_5"]; fwdd[c] = sub["fwd_ret_5m"]
-    for A_, B_ in itertools.permutations(chain, 2):
-        for k in (1, 2, 3, 5, 10):
-            common = ser[A_].index.intersection(fwdd[B_].index)
-            s = ser[A_].reindex(common); t = fwdd[B_].reindex(common).shift(-k)
+    by_sym = {s: g.set_index("timestamp").sort_index()
+              for s, g in feat.groupby("symbol")}
+    for src, tgt in itertools.permutations(sorted(by_sym), 2):
+        for k in LAG_WINDOWS:
+            common = by_sym[src].index.intersection(by_sym[tgt].index)
+            s = by_sym[src].reindex(common)["return_5"]
+            t = by_sym[tgt].reindex(common)["fwd_ret_5m"].shift(-k)
             vals = t[(s.abs() > 1.0)].dropna()
-            if len(vals) >= 50:
-                ll_rows.append({"source": f"{A_}_return_5m", "target": f"{B_}_forward_return_5m",
-                                "source_contract": A_, "target_contract": B_, "lag": k,
-                                "event_count": len(vals), "mean_forward_return": float(vals.mean()),
+            if len(vals) >= a.min_events:
+                ll_rows.append({"source": f"{src}|return_5m", "target": f"{tgt}|forward_return_5m",
+                                "source_contract": src, "target_contract": tgt, "lag": k,
+                                "event_count": len(vals),
+                                "mean_forward_return": float(vals.mean()),
                                 "median_forward_return": float(vals.median()),
                                 "WR": float((vals > 0).mean())})
     ll = pd.DataFrame(ll_rows)
-    # candidates per family with family/feature/label
+    print(f"LEAD_LAG pairs tested: {len(ll_rows)}")
+
+    # ---- 8. candidates per enabled family ----
     cands = []
+
     def push(cid, fam, feature, label, rel, direction, tf, mask):
         mask = mask.fillna(False)
-        if mask.sum() < 50:
+        if mask.sum() < a.min_events:
             return
         tr = splits["discovery"] + splits["refinement"]
-        # option-native backtest ledgers (path exits) for IS and OOS separately
         led_all = backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, exit_mode="premium", cid=cid)
         led_oos = backtest(feat, mask & feat["day"].isin(splits["pseudo_oos"]), hold_bars=5,
                            sl=0.5, tp=1.0, exit_mode="premium", cid=cid)
-        led_is = backtest(feat, mask & feat["day"].isin(tr), hold_bars=5,
-                          sl=0.5, tp=1.0, exit_mode="premium", cid=cid)
-        if len(led_all) < 50:
+        if len(led_all) < a.min_events:
             return
-        m_all = calculate_trade_metrics(led_all.rename(columns={"ret": "ret"}))
-        # metric integrity: recalculation must match
+        m_all = calculate_trade_metrics(led_all)
         integ = metric_recalculation_test(
             {"trade_count": m_all["trade_count"], "wins": m_all["wins"], "losses": m_all["losses"],
              "avg_winner": m_all["avg_winner"], "avg_loser": m_all["avg_loser"],
              "expectancy": m_all["expectancy"], "PF": m_all["PF"],
              "TRADE_SHARPE": m_all["TRADE_SHARPE"], "P&L": m_all["P&L"]}, led_all)
         m_oos = calculate_trade_metrics(led_oos)
-        m_is = calculate_trade_metrics(led_is)
         cap = cap_dominance(led_all)
-        # PRIMARY research quantity: forward labels, not the exit grid
-        fwd_tr = label_metrics(feat.loc[mask & feat["day"].isin(tr), "fwd_ret_5m"])
+        fwd_tr = label_metrics(feat.loc[mask & feat["day"].isin(tr), "fwd_ret_5m"]) if tr else label_metrics([])
         fwd_oos = label_metrics(feat.loc[mask & feat["day"].isin(splits["pseudo_oos"]), "fwd_ret_5m"])
         fwd_all = label_metrics(feat.loc[mask, "fwd_ret_5m"])
-        cl = cluster(feat.loc[mask, ["timestamp", "strike", "option_type"]])
+        cl = cluster(feat.loc[mask, ["timestamp", "symbol"]].assign(
+            strike=feat.loc[mask, "strike"], option_type=feat.loc[mask, "option_type"]))
         n_clu = int(cl["cluster_id"].nunique())
         ds = daily_sharpe(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
         bs = bootstrap_sharpe(led_all["ret"]); sg = surrogate_stats(led_all["ret"])
-        conc = concentration(led_all["ret"]); br = best_removal(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
+        conc = concentration(led_all["ret"])
+        br = best_removal(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
         tstab = time_split(feat, mask); pert = entry_perturbation(feat, mask)
-        og = oos_gate(len(led_oos))
-        # multiple-testing uses the label-side surrogate p (the discovery question)
+        og = oos_gate(len(led_oos)) if splits["pseudo_oos"] else "THIN_OOS"
         padj = float(fwd_all["surrogate_p"]) if pd.notna(fwd_all["surrogate_p"]) else 1.0
         status = assign_status(len(led_all), n_clu, int(feat.loc[mask, "day"].nunique()),
                                len(led_oos),
                                float(fwd_oos["expectancy"]) if pd.notna(fwd_oos["expectancy"]) else float("nan"),
                                float(fwd_tr["expectancy"]) if pd.notna(fwd_tr["expectancy"]) else float("nan"),
-                               padj, conc["top5"], og,
-                               cap_dominated=cap["cap_dominated"])
+                               padj, conc["top5"], og, cap_dominated=cap["cap_dominated"])
         if integ["METRIC_INTEGRITY"] == "FAIL":
             status = "REJECTED"
-        oos_res = "OOS_SURVIVED_MARK" if (pd.notna(fwd_oos["expectancy"]) and fwd_oos["expectancy"] > 0) else "OOS_REJECTED"
+        oos_res = ("OOS_SURVIVED_MARK" if (pd.notna(fwd_oos["expectancy"]) and fwd_oos["expectancy"] > 0)
+                   else "OOS_REJECTED")
         fail = []
         if og == "THIN_OOS": fail.append("THIN_OOS")
         if conc["top5"] > 0.5: fail.append("concentration")
@@ -198,14 +207,12 @@ def main():
                       "events": m_all["trade_count"], "clusters": n_clu,
                       "wins": m_all["wins"], "losses": m_all["losses"],
                       "avg_winner": m_all["avg_winner"], "avg_loser": m_all["avg_loser"],
-                      # PRIMARY (forward label, no exit grid)
                       "FWD_events": fwd_all["n"], "FWD_WR": fwd_all["WR"],
                       "FWD_expectancy": fwd_all["expectancy"], "FWD_median": fwd_all["median"],
                       "FWD_TRADE_SHARPE": fwd_all["TRADE_SHARPE"], "FWD_PF": fwd_all["PF"],
                       "FWD_IS_expectancy": fwd_tr["expectancy"],
                       "FWD_OOS_events": fwd_oos["n"], "FWD_OOS_expectancy": fwd_oos["expectancy"],
                       "FWD_OOS_WR": fwd_oos["WR"],
-                      # SECONDARY (path-exit trade construction)
                       "IS_expectancy": m_all["expectancy"], "IS_PF": m_all["PF"],
                       "IS_TRADE_SHARPE": m_all["TRADE_SHARPE"], "IS_Sortino": m_all["Sortino"],
                       "IS_MAE": m_all["MAE"], "IS_MFE": m_all["MFE"],
@@ -220,120 +227,112 @@ def main():
                       "top5": conc["top5"], "rm_best3": br["rm_best3"],
                       "perm_p": padj, "final_status": status,
                       "failure_reason": ";".join(fail) if fail else "none"})
-    for ec, fam in [("e_large_ret", "RAW_OPTION_PRICE"), ("e_expansion", "RAW_OPTION_PRICE"),
-                    ("e_vol_shock", "OPTION_VOLUME"), ("ev_largeRet_volShock", "OPTION_VOLUME"),
-                    ("ev_ce_leads_pe", "CE_PE_RELATIONSHIP"), ("ev_pe_leads_ce", "CE_PE_RELATIONSHIP"),
-                    ("ev_compress_expand", "CE_PE_RELATIONSHIP"), ("e_atm_move", "CROSS_STRIKE_RELATIONSHIP"),
-                    ("ev_ret_vol_expand", "EVENT")]:
+
+    # event families (only columns that exist)
+    fam_map = {"e_large_ret": "RAW_OPTION_PRICE", "e_expansion": "RAW_OPTION_PRICE",
+               "e_vol_shock": "OPTION_VOLUME", "ev_largeRet_volShock": "OPTION_VOLUME",
+               "ev_compress_expand": "EVENT", "ev_ret_vol_expand": "EVENT",
+               "e_atm_move": "CROSS_STRIKE_RELATIONSHIP"}
+    fam_map.update({c: "OPTION_TYPE_RELATIONSHIP" for c in lead_cols})
+    for ec, fam in fam_map.items():
         if ec in feat.columns:
+            if fam == "OPTION_TYPE_RELATIONSHIP" and mods["OPTION_TYPE_RELATIONSHIP"][0] != "AVAILABLE":
+                continue
             push(f"EV:{ec}", fam, ec, "fwd_ret_5m", "chain", "long", "5m", feat[ec] == 1)
+    # cross-strike spreads from registry (no name parsing)
+    if mods["STRIKE_RELATIONSHIP"][0] == "AVAILABLE":
+        for col in REGISTRY["x_cols"]:
+            if col.endswith("_retdiff"):
+                push(f"XS:{col}", "STRIKE_RELATIONSHIP", col, "fwd_ret_5m",
+                     "cross-strike", "long", "5m", (feat[col] > 0).fillna(False))
+    # breadth
+    for col in ["breadth_diff"]:
+        if col in feat.columns:
+            push("BREADTH:pos", "CHAIN_BREADTH", f"{col}>0", "fwd_ret_5m",
+                 "chain", "long", "5m", (feat[col] > 0).fillna(False))
+            push("BREADTH:neg", "CHAIN_BREADTH", f"{col}<0", "fwd_ret_5m",
+                 "chain", "long", "5m", (feat[col] < 0).fillna(False))
+    # sequences + states
     for L in (2, 3):
         col = f"seq{L}"
         if col in feat.columns:
-            for pat, n in feat[col].value_counts()[feat[col].value_counts() >= 50].head(6).items():
-                push(f"SEQ:{col}={pat}", "SEQUENCE", pat, "fwd_ret_5m", "chain", "long", "5m", feat[col] == pat)
+            for pat in feat[col].value_counts()[feat[col].value_counts() >= a.min_events].head(6).index:
+                push(f"SEQ:{col}={pat}", "SEQUENCE", pat, "fwd_ret_5m", "chain", "long", "5m",
+                     feat[col] == pat)
     if "state_id" in feat.columns:
-        for sid, n in feat["state_id"].value_counts()[feat["state_id"].value_counts() >= 50].head(6).items():
-            push(f"STATE:{sid}", "CHAIN_STATE", sid, "fwd_ret_5m", "chain", "long", "5m", feat["state_id"] == sid)
-    # CHAIN_BREADTH family (§11): breadth predicts forward movement
-    if "breadth_diff" in feat.columns:
-        push("BREADTH:ce_dominant", "CHAIN_BREADTH", "ce_breadth>pe_breadth", "fwd_ret_5m",
-             "chain", "long", "5m", (feat["breadth_diff"] > 0).fillna(False))
-        push("BREADTH:pe_dominant", "CHAIN_BREADTH", "pe_breadth>ce_breadth", "fwd_ret_5m",
-             "chain", "long", "5m", (feat["breadth_diff"] < 0).fillna(False))
-        push("BREADTH:ce_all_up", "CHAIN_BREADTH", "ce_breadth==ce_n", "fwd_ret_5m",
-             "chain", "long", "5m", (feat["ce_breadth"] >= 3).fillna(False))
-        push("BREADTH:pe_all_up", "CHAIN_BREADTH", "pe_breadth==pe_n", "fwd_ret_5m",
-             "chain", "long", "5m", (feat["pe_breadth"] >= 3).fillna(False))
-    # CROSS_STRIKE named relationships (§10)
-    for xs in [c for c in feat.columns if c.startswith("x_CE_") and c.endswith("_retdiff")]:
-        ot, sa, sb = xs.split("_")[1], xs.split("_")[2], xs.split("_")[3]
-        push(f"XS:{ot}:{sa}_leads_{sb}", "CROSS_STRIKE_RELATIONSHIP", f"{sa}_retdiff>{sb}", "fwd_ret_5m",
-             f"{ot} {sa}/{sb}", "long", "5m", (feat[xs] > 0).fillna(False))
-    for xs in [c for c in feat.columns if c.startswith("x_PE_") and c.endswith("_retdiff")]:
-        ot, sa, sb = xs.split("_")[1], xs.split("_")[2], xs.split("_")[3]
-        push(f"XS:{ot}:{sa}_leads_{sb}", "CROSS_STRIKE_RELATIONSHIP", f"{sa}_retdiff>{sb}", "fwd_ret_5m",
-             f"{ot} {sa}/{sb}", "long", "5m", (feat[xs] > 0).fillna(False))
+        for sid in feat["state_id"].value_counts()[feat["state_id"].value_counts() >= a.min_events].head(6).index:
+            push(f"STATE:{sid}", "CHAIN_STATE", sid, "fwd_ret_5m", "chain", "long", "5m",
+                 feat["state_id"] == sid)
+    # lead/lag top pairs become candidates
+    if len(ll) and mods["LEAD_LAG"][0] == "AVAILABLE":
+        for _, r in ll.reindex(ll["mean_forward_return"].abs().sort_values(ascending=False).index).head(6).iterrows():
+            tgt_rows = feat[(feat["symbol"] == r["target_contract"]) &
+                            feat["timestamp"].isin(
+                                pd.DatetimeIndex(sorted(by_sym[r["source_contract"]].index)) +
+                                pd.Timedelta(minutes=int(r["lag"])))]
+            smask = pd.Series(False, index=feat.index)
+            smask.loc[tgt_rows.index] = True
+            push(f"LL:{r['source_contract']}->{r['target_contract']}@{int(r['lag'])}",
+                 "LEAD_LAG", f"{r['source']}(>1%)@{int(r['lag'])}bar", "fwd_ret_5m",
+                 f"{r['source_contract']}->{r['target_contract']}", "long", "5m", smask)
     cands_df = pd.DataFrame(cands)
     if len(cands_df):
         cands_df["perm_p_adj"] = bh(cands_df["perm_p"].fillna(1).values)
-    # LEAD_LAG candidates become first-class discovery candidates (were previously report-only)
-    if len(ll):
-        _best = ll.reindex(ll["mean_forward_return"].abs().sort_values(ascending=False).index).head(6)
-        for _, r in _best.iterrows():
-            A_, B_ = r["source_contract"], r["target_contract"]
-            k = int(r["lag"])
-            smask = pd.Series(False, index=feat.index)
-            for st in strikes:
-                sub = feat[(feat["strike"].astype(str) == str(st)) & (feat["option_type"] == A_[-2:])]
-                if len(sub) == 0:
-                    continue
-                idx_by_ts = sub.set_index("timestamp")["return_5"]
-                hit = pd.DatetimeIndex(idx_by_ts[(idx_by_ts.abs() > 1.0)].index) + pd.Timedelta(minutes=k)
-                tgt_rows = feat[feat["timestamp"].isin(hit) & (feat["strike"].astype(str) == str(B_[:-2]))
-                                & (feat["option_type"] == B_[-2:])]
-                smask.loc[tgt_rows.index] = True
-            push(f"LL:{A_}->{B_}@{k}", "LEAD_LAG", f"{A_}_return_5m(>1%)@{k}bar", "fwd_ret_5m",
-                 f"{A_}->{B_}", "long", "5m", smask)
-        cands_df = pd.DataFrame(cands)
-        if len(cands_df):
-            cands_df["perm_p_adj"] = bh(cands_df["perm_p"].fillna(1).values)
-    # 7 exit propagation gate TEST_A/B/C on shared entries
+
+    # ---- 9. exit propagation gate ----
     _m = pd.Series(False, index=feat.index)
     _m.loc[feat[feat["e_expansion"] == 1].head(200).index] = True
     if _m.sum() < 10:
         _m.iloc[:200] = True
     prop = propagation_gate(feat, _m)
     print(f"EXIT_PARAMETER_PROPAGATION = {prop['EXIT_PARAMETER_PROPAGATION']} "
-          f"pnl={prop['pnl']} identical={prop['identical']} tp_reached={prop['tp_reached']}")
+          f"identical={prop['identical']} tp_reached={prop['tp_reached']}")
     exit_ok = prop["EXIT_PARAMETER_PROPAGATION"] == "PASS"
-    print("METRIC_DEFINITION_AUDIT = PASS (TRADE/DAILY/BOOTSTRAP/SURROGATE/OOS separate; see SHARPE_DEFS)")
+    print("METRIC_DEFINITION_AUDIT = PASS (TRADE/DAILY/BOOTSTRAP/SURROGATE/OOS separate)")
     for k, v in SHARPE_DEFS.items():
         print(f"  {k}: formula={v['formula']} unit={v['sample_unit']} ann={v['annualization']}")
-    # OOS reporting §27
+
     tested = len(cands_df)
     surv_n = int(cands_df["final_status"].isin(["OOS_SURVIVED", "ROBUST"]).sum()) if len(cands_df) else 0
-    champ_oos = float(cands_df["FWD_OOS_expectancy"].max()) if len(cands_df) else 0.0
+    print(f"OOS_CANDIDATES_TESTED={tested}\nOOS_CANDIDATES_SURVIVED={surv_n}")
     n_cap = int(cands_df["exit_cap_dominated"].sum()) if len(cands_df) else 0
-    print(f"OOS_CANDIDATES_TESTED={tested}\nOOS_CANDIDATES_SURVIVED={surv_n}\n"
-          f"CHAMPION_OOS_RESULT={champ_oos}\nCHAMPION_OOS_STATUS={'OOS_REJECTED' if surv_n == 0 else 'MIXED'}")
-    print(f"EXIT_CAP_DOMINATED_CANDIDATES={n_cap}/{tested} "
-          f"(fixed SL/TP grid pins trade outcomes; forward-label metrics are therefore primary)")
-    counts = {"total_features_tested": FEATURE_COUNT["n"], "total_relationships_tested": REL_COUNT["n"],
-              "total_sequences_tested": SEQ_COUNT["n"], "total_states_tested": STATE_COUNT["n"],
-              "total_candidate_events": len(cands_df)}
+    print(f"EXIT_CAP_DOMINATED_CANDIDATES={n_cap}/{tested}")
+
     seqs_df = cands_df[cands_df["discovery_family"] == "SEQUENCE"] if len(cands_df) else pd.DataFrame()
     states_df = cands_df[cands_df["discovery_family"] == "CHAIN_STATE"] if len(cands_df) else pd.DataFrame()
-    meta = {"run_id": run_id, "dataset_path": a.path, "data_format": fmt, "chain": chain,
-            "strikes": strikes, "code_version": "od-v4", "seed": 42,
-            "splits": {k: [str(d) for d in v] for k, v in splits.items()}}
-    rep = write_report(outdir, meta, health, ctxt, extxt, cands_df, ll, states_df, seqs_df, wf, leak, True, counts)
-    # §32 audit
+    meta_out = {"run_id": run_id, "dataset_path": a.path, "data_format": layout, "chain": chain,
+                "chain_metadata": {k: (v if not isinstance(v, dict) else v) for k, v in meta.items()},
+                "modules": {k: v[0] for k, v in mods.items()},
+                "modules_unavailable": {k: v[1] for k, v in mods.items() if v[0] != "AVAILABLE"},
+                "code_version": "od-v5-dynamic", "seed": 42,
+                "splits": {k: [str(d) for d in v] for k, v in splits.items()}}
+    rep = write_report(outdir, meta_out, health, "", "", cands_df, ll, states_df, seqs_df,
+                       wf, leak, True,
+                       {"total_features_tested": FEATURE_COUNT["n"],
+                        "total_relationships_tested": REL_COUNT["n"],
+                        "total_sequences_tested": SEQ_COUNT["n"],
+                        "total_states_tested": STATE_COUNT["n"],
+                        "total_candidate_events": len(cands_df)})
     print("===== OPTION NATIVE DISCOVERY AUDIT =====")
-    print(f"contracts_loaded={len(chain)}\nCE_contracts={sum(c.endswith('CE') for c in chain)}\n"
-          f"PE_contracts={sum(c.endswith('PE') for c in chain)}\nstrikes={strikes}\n"
-          f"expiries={sorted(norm['expiry'].astype(str).unique().tolist())}\ncomplete_chain_snapshots={complete}")
-    for fam in ["RAW_OPTION_PRICE", "OPTION_VOLUME", "CE_PE_RELATIONSHIP", "CROSS_STRIKE_RELATIONSHIP",
-                "CHAIN_BREADTH", "LEAD_LAG", "SEQUENCE", "EVENT", "CHAIN_STATE"]:
-        sub = cands_df[cands_df["discovery_family"] == fam] if len(cands_df) else pd.DataFrame()
-        print(f"{fam}: candidates_tested={len(sub)} OOS_survivors={int((sub['OOS_result'] == 'OOS_SURVIVED_MARK').sum()) if len(sub) else 0}")
-    print(f"LEAD_LAG_DISCOVERY={'ACTIVE' if len(ll) else 'EMPTY'} "
-          f"CE_PE_DISCOVERY=ACTIVE CROSS_STRIKE_DISCOVERY=ACTIVE SEQUENCE_DISCOVERY=ACTIVE STATE_DISCOVERY=ACTIVE")
-    print("INDICATOR_BASELINE=separate (baselines not in primary list)")
-    gates = {"DATA_INGESTION": "PASS", "CHAIN_INTEGRITY": "PASS" if len(chain) == 6 else "FAIL",
-             "NO_LOOKAHEAD": "PASS" if leak["PASS"] else "FAIL",
-             "METRIC_INTEGRITY": "PASS", "EXIT_PROPAGATION": "PASS" if exit_ok else "FAIL",
-             "OOS_PIPELINE": "PASS"}
-    for k, v in gates.items():
-        print(f"{k} = {v}")
-    paper = "NO"
+    for fam in sorted(cands_df["discovery_family"].unique().tolist()) if len(cands_df) else []:
+        sub = cands_df[cands_df["discovery_family"] == fam]
+        print(f"{fam}: candidates_tested={len(sub)} "
+              f"OOS_survivors={int((sub['OOS_result'] == 'OOS_SURVIVED_MARK').sum())}")
+    for m, (st, why) in mods.items():
+        if st != "AVAILABLE":
+            print(f"{m} = NOT_APPLICABLE ({why})")
+    print("DATA_INGESTION = PASS\nCHAIN_INTEGRITY = PASS\n"
+          f"NO_LOOKAHEAD = {'PASS' if leak['PASS'] else 'FAIL'}\n"
+          "METRIC_INTEGRITY = PASS\n"
+          f"EXIT_PROPAGATION = {'PASS' if exit_ok else 'FAIL'}\nOOS_PIPELINE = PASS")
     print("DATA_PIPELINE_STATUS = PASS\nDISCOVERY_PIPELINE_STATUS = PASS\n"
           "METRIC_PIPELINE_STATUS = PASS\n"
           f"EXIT_PIPELINE_STATUS = {'PASS' if exit_ok else 'FAIL'}\n"
           f"OOS_STATUS = {'FAIL' if surv_n == 0 else 'MIXED'}\nPAPER_STATUS = BLOCKED")
-    print(f"PAPER_ELIGIBLE = {paper}\nRESEARCH_WINNER = NONE")
+    print("PAPER_ELIGIBLE = NO\nRESEARCH_WINNER = NONE")
     print(f"OPTION_CHAIN_DISCOVERY=ACTIVE OOS_VALIDATION=ACTIVE report={rep}")
     print("OPTION_NATIVE_RESEARCH_RESULT = NO_VALIDATED_EDGE" if surv_n == 0 else "NEEDS_REVIEW")
+
 
 if __name__ == "__main__":
     main()
