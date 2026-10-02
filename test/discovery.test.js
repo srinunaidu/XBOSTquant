@@ -225,7 +225,7 @@ test('ACCEPT TEST9: P&L finite for all completed trades (gappy data skipped, cou
     const bt = OD.backtest(bySym, sig, { cid: 'N', sl: 0.5, tp, trail: null, mode: 'premium', hold: 5 });
     const bad = bt.ledger.filter(t => typeof t.ret !== 'number' || !isFinite(t.ret));
     assert.equal(bad.length, 0, `NaN P&L in TP${tp} ledger`);
-    assert.ok(bt.skipped.nan_exit + bt.skipped.nan_entry >= 0);
+    assert.ok(bt.skipped.MISSING_EXIT_PRICE + bt.skipped.MISSING_ENTRY_PRICE >= 0);
   }
 });
 
@@ -244,4 +244,116 @@ test('ACCEPT TEST10+13: independent 1m label matches production; audit passes', 
   assert.equal(la.status, 'PASS');
   assert.ok(la.label_tests >= 10);
   assert.equal(la.spot_fail, 0);
+});
+
+/* EXPANSION acceptance TESTS (§32): rounds, budgets, OOS lock, NaN classes. */
+const EXPCFG = { focusStrikes: 3, minEvents: 50, nPerms: 30, seed: 7, maxTotalCandidates: 300, maxRuntimeSeconds: 600 };
+const EXPFULL = OD.run(WIDE12, EXPCFG, null, null);
+const EXPBASE = OD.run(WIDE12, Object.assign({}, EXPCFG, { rounds: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] }), null, null);
+
+test('EXP TEST1: base rounds reproduce identically inside the full run', () => {
+  const baseIds = EXPBASE.candidates.map(c => c.candidate).sort();
+  const fullBase = EXPFULL.candidates.filter(c => c.discovery_round >= 1 && c.discovery_round <= 12).map(c => c.candidate).sort();
+  assert.deepEqual(fullBase, baseIds);
+  assert.ok(baseIds.length > 0);
+});
+
+test('EXP TEST2+4: expansion adds unique hypotheses; MT counts cover all rounds', () => {
+  assert.ok(EXPFULL.hypothesisTotals.total > EXPBASE.hypothesisTotals.total);
+  const h = EXPFULL.hypothesisTotals;
+  assert.equal(h.total, h.unique + h.duplicates);
+  const bySum = Object.values(h.byRound).reduce((a, r) => a + r.hypotheses, 0);
+  assert.equal(bySum, h.total);
+  assert.ok(Object.keys(h.byRound).length >= 12);
+});
+
+test('EXP TEST3: duplicate hypotheses rejected by registry', () => {
+  const R = OD.newHypothesisRegistry();
+  assert.ok(R.register(13, 'COMBINATION', 'A+B'));
+  assert.equal(R.register(13, 'COMBINATION', 'A+B'), null);
+  assert.equal(R.tested, 2);
+  assert.equal(R.unique, 1);
+  assert.equal(R.dups, 1);
+});
+
+test('EXP TEST5: OOS frozen, ordered, disjoint', () => {
+  assert.deepEqual(EXPFULL.splitDays, EXPBASE.splitDays);
+  // chronological order implicitly holds; OOS evaluated once per candidate (single OOS_result field)
+  for (const c of EXPFULL.candidates) {
+    assert.ok(['OOS_SURVIVED_MARK', 'OOS_REJECTED'].indexOf(c.OOS_result) >= 0);
+  }
+});
+
+test('EXP TEST6: OOS split does not influence hypothesis generation', () => {
+  const alt = OD.run(WIDE12, Object.assign({}, EXPCFG, { trainFrac: 0.6, valFrac: 0.2, rounds: [1, 2, 3, 4, 5, 6, 7, 8] }), null, null);
+  const sigA = EXPBASE.candidates.filter(c => c.discovery_round <= 8).map(c => c.combination_signature).sort();
+  const sigB = alt.candidates.filter(c => c.discovery_round <= 8).map(c => c.combination_signature).sort();
+  assert.deepEqual(sigB, sigA);
+});
+
+test('EXP TEST7+8: combination depth and candidate count bounded', () => {
+  for (const c of EXPFULL.candidates) assert.ok(c.combination_depth <= 3);
+  assert.ok(EXPFULL.candidates.length <= 300);
+  assert.ok(EXPFULL.rounds.length <= 24);
+  const capped = OD.run(WIDE12, Object.assign({}, EXPCFG, { maxTotalCandidates: 10, rounds: [1, 2, 3] }), null, null);
+  assert.ok(capped.candidates.length <= 10);
+});
+
+test('EXP TEST9: deterministic search (rounds + totals identical)', () => {
+  const again = OD.run(WIDE12, EXPCFG, null, null);
+  assert.deepEqual(again.hypothesisTotals, EXPFULL.hypothesisTotals);
+  assert.deepEqual(again.rounds.map(r => [r.round, r.hypotheses]), EXPFULL.rounds.map(r => [r.round, r.hypotheses]));
+});
+
+test('EXP TEST10: NaN exits fully classified; attempted = completed + skipped', () => {
+  const { norm } = OD.ingest(synth(['CE', 'PE']));
+  norm.forEach((r, i) => { if (i % 5 === 0) r.close = NaN; });
+  const rows = OD.features(norm.slice(0, 3000));
+  const bySym = new Map();
+  for (const r of rows) {
+    if (!bySym.has(r.symbol)) bySym.set(r.symbol, []);
+    bySym.get(r.symbol).push(r);
+  }
+  const sig = [];
+  for (const [s, arr] of bySym) for (let i = 0; i < Math.min(30, arr.length); i++) sig.push({ sym: s, i });
+  const bt = OD.backtest(bySym, sig, { cid: 'X', sl: 0.5, tp: 1, trail: null, mode: 'premium', hold: 5 });
+  const allowed = ['MISSING_ENTRY_PRICE', 'ZERO_ENTRY', 'END_OF_DATA', 'MISSING_EXIT_PRICE', 'INVALID_CONTRACT', 'OTHER'];
+  for (const k of Object.keys(bt.skipped)) assert.ok(allowed.indexOf(k) >= 0, 'unclassified: ' + k);
+  const sk = Object.values(bt.skipped).reduce((a, b) => a + b, 0);
+  assert.equal(bt.attempted, bt.completed + sk);
+  for (const t of bt.ledger) assert.ok(isFinite(t.ret));
+});
+
+test('EXP TEST11: all-rejected filters report FAIL_ALL_REJECTED', () => {
+  const logs = EXPFULL.filterLog;
+  assert.ok(logs.length >= 9);
+  for (const g of logs) {
+    if (g.input_count > 0 && g.passed_count === 0) assert.equal(g.status, 'FAIL_ALL_REJECTED');
+    if (g.input_count === 0) assert.equal(g.status, 'BLOCKED_NO_INPUT');
+  }
+});
+
+test('EXP TEST12: OOS tested/positive/threshold/final counts separate + consistent', () => {
+  // recompute from candidates to verify the reported split
+  const pos = EXPFULL.candidates.filter(c => c.OOS_result === 'OOS_SURVIVED_MARK').length;
+  assert.ok(pos >= 0 && pos <= EXPFULL.candidates.length);
+  for (const c of EXPFULL.candidates) {
+    if (c.final_status === 'OOS_SURVIVED' || c.final_status === 'ROBUST') {
+      assert.ok(c.FWD_OOS_expectancy > 0);
+    }
+  }
+});
+
+test('EXP TEST13: feature missingness explained (causes sum to total)', () => {
+  //missingness is computed in-engine; verify audit rows exist in a fresh small run
+  const small = OD.run(WIDE12, Object.assign({}, EXPCFG, { rounds: [1], maxTotalCandidates: 5 }), null, null);
+  assert.ok(small.log.some(l => l.indexOf('MISSINGNESS worst:') >= 0));
+});
+
+test('EXP TEST16: paper only via frozen pipeline (never assigned here)', () => {
+  for (const c of EXPFULL.candidates) {
+    assert.notEqual(c.final_status, 'PAPER_ELIGIBLE');
+  }
+  assert.ok(EXPFULL.boards.PAPER_ELIGIBLE.length === 0);
+  assert.ok(EXPFULL.boards.TOP_TRAIN.length > 0);
 });

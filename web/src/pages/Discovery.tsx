@@ -9,12 +9,14 @@ import { useEffect, useRef, useState } from 'react';
 type Cfg = {
   focusStrikes: number; minEvents: number; trainFrac: number; valFrac: number;
   seed: number; nPerms: number; sl: number; tp: number; hold: number;
-  rankingObjective: string;
+  rankingObjective: string; maxRounds: number; maxTotalCandidates: number;
+  maxRuntimeSeconds: number; maxPairCombinations: number;
 };
 
 const DEFAULT_CFG: Cfg = {
   focusStrikes: 3, minEvents: 50, trainFrac: 0.5, valFrac: 0.2,
   seed: 42, nPerms: 200, sl: 0.5, tp: 1.0, hold: 5, rankingObjective: 'composite',
+  maxRounds: 24, maxTotalCandidates: 500, maxRuntimeSeconds: 600, maxPairCombinations: 120,
 };
 
 const TABLE_COLS: { key: string; label: string; num: boolean }[] = [
@@ -76,6 +78,14 @@ function buildReport(res: any): string {
   L.push('## FILTER PIPELINE');
   for (const f of res.filterLog || []) L.push(`- ${f.filter}: in=${f.input_count} passed=${f.passed_count} rejected=${f.rejected_count} (${f.rejection_reason})`);
   L.push('');
+  if (res.rounds) {
+    L.push('## SEARCH REPORT (ROUNDS)');
+    for (const r of res.rounds) L.push(`- ROUND ${r.round} ${r.name}: hypotheses=${r.hypotheses} dups=${r.dups} candidates_total=${r.candidates}`);
+    if (res.hypothesisTotals) L.push(`TOTAL UNIQUE HYPOTHESES: tested=${res.hypothesisTotals.total} unique=${res.hypothesisTotals.unique} duplicates=${res.hypothesisTotals.duplicates}`);
+    if (res.oosCounts) L.push(`OOS: tested=${res.oosCounts.OOS_TESTED} positive=${res.oosCounts.OOS_POSITIVE} threshold=${res.oosCounts.OOS_THRESHOLD_PASS} final=${res.oosCounts.OOS_FINAL_SURVIVOR}`);
+    if (res.boards) for (const [k, v] of Object.entries(res.boards)) L.push(`BOARD ${k}: ${Array.isArray(v) ? v.slice(0, 10).join(', ') : v}`);
+    L.push('');
+  }
   L.push('## CANDIDATES');
   for (const c of res.candidates || []) {
     L.push(`- ${c.candidate} [${c.discovery_family}] events=${c.events} clusters=${c.clusters} ` +
@@ -188,11 +198,14 @@ export default function Discovery() {
         focusStrikes: cfg.focusStrikes, minEvents: cfg.minEvents,
         trainFrac: cfg.trainFrac, valFrac: 1 - cfg.trainFrac - 0.3,
         seed: cfg.seed, nPerms: cfg.nPerms, sl: cfg.sl, tp: cfg.tp, hold: cfg.hold,
-        rankingObjective: cfg.rankingObjective,
+        rankingObjective: cfg.rankingObjective, maxRounds: cfg.maxRounds,
+        maxTotalCandidates: cfg.maxTotalCandidates, maxRuntimeSeconds: cfg.maxRuntimeSeconds,
+        maxPairCombinations: cfg.maxPairCombinations,
       },
     });
     pushLog(`run started: focusStrikes=${cfg.focusStrikes} minEvents=${cfg.minEvents} ` +
-      `train=${cfg.trainFrac} sl=${cfg.sl} tp=${cfg.tp} hold=${cfg.hold} seed=${cfg.seed} perms=${cfg.nPerms}`);
+      `train=${cfg.trainFrac} sl=${cfg.sl} tp=${cfg.tp} hold=${cfg.hold} seed=${cfg.seed} perms=${cfg.nPerms} ` +
+      `rounds≤${cfg.maxRounds} candidates≤${cfg.maxTotalCandidates} time≤${cfg.maxRuntimeSeconds}s`);
   };
 
   const stop = () => {
@@ -270,7 +283,9 @@ export default function Discovery() {
               ['focusStrikes', 'Focus strikes', 'int'], ['minEvents', 'Min events', 'int'],
               ['trainFrac', 'Train frac', 'float'], ['nPerms', 'Permutations', 'int'],
               ['seed', 'Seed', 'int'], ['sl', 'Exit SL %', 'float'], ['tp', 'Exit TP %', 'float'],
-              ['hold', 'Max hold (bars)', 'int'],
+              ['hold', 'Max hold (bars)', 'int'], ['maxRounds', 'Max rounds', 'int'],
+              ['maxTotalCandidates', 'Max candidates', 'int'], ['maxRuntimeSeconds', 'Max run (s)', 'int'],
+              ['maxPairCombinations', 'Max pairs', 'int'],
             ] as const).map(([k, label]) => (
               <label key={k} className="bg-[#111] border border-zinc-800 rounded px-2 py-1.5 flex flex-col gap-1">
                 <span className="text-zinc-500">{label}</span>
@@ -376,6 +391,44 @@ export default function Discovery() {
                   <div key={i} className="flex gap-2 flex-wrap"><span className="text-zinc-500 w-44">{f.filter}</span><span>in={f.input_count}</span><span className="text-emerald-300">passed={f.passed_count}</span><span className="text-red-300">rejected={f.rejected_count}</span><span className="text-zinc-500">{f.rejection_reason}</span></div>
                 ))}
               </div>
+            </section>
+
+            <section className="card p-4">
+              <div className="lbl mb-2">SEARCH REPORT — ROUNDS · HYPOTHESES · BOARDS</div>
+              {res.hypothesisTotals && (
+                <div className="text-[11px] num text-zinc-400 mb-2">
+                  hypotheses tested={res.hypothesisTotals.total} · unique={res.hypothesisTotals.unique} · duplicates={res.hypothesisTotals.duplicates}
+                  {res.oosCounts && (<span> · OOS tested={res.oosCounts.OOS_TESTED} positive={res.oosCounts.OOS_POSITIVE} threshold={res.oosCounts.OOS_THRESHOLD_PASS} final={res.oosCounts.OOS_FINAL_SURVIVOR}</span>)}
+                  {res.finalStatus && (<span> · FINAL_STATUS={res.finalStatus}</span>)}
+                </div>
+              )}
+              {res.rounds && res.rounds.length > 0 && (
+                <div className="overflow-x-auto mb-2">
+                  <table className="w-full text-[11px] num">
+                    <thead><tr className="text-zinc-500 text-left border-b border-zinc-800">
+                      {['round', 'name', 'hypotheses', 'dups', 'candidates'].map(k => <th key={k} className="px-2 py-1">{k}</th>)}
+                    </tr></thead>
+                    <tbody>{res.rounds.map((r: any, i: number) => (
+                      <tr key={i} className="border-b border-zinc-900"><td className="px-2 py-1">{r.round}</td><td className="px-2 py-1">{r.name}</td><td className="px-2 py-1 text-right">{r.hypotheses}</td><td className="px-2 py-1 text-right">{r.dups}</td><td className="px-2 py-1 text-right">{r.candidates}</td></tr>
+                    ))}</tbody>
+                  </table>
+                </div>
+              )}
+              {res.boards && (
+                <div className="grid grid-cols-2 md:grid-cols-4 gap-2 text-[11px] num">
+                  {Object.entries(res.boards).map(([k, v]: [string, any]) => (
+                    <div key={k} className="bg-[#111] border border-zinc-800 rounded p-2">
+                      <div className="text-zinc-500">{k} ({Array.isArray(v) ? v.length : 0})</div>
+                      <div className="text-zinc-300 truncate">{Array.isArray(v) ? v.slice(0, 3).join(', ') : ''}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+              {res.limitations && (
+                <div className="text-[11px] text-zinc-500 num mt-2">
+                  EXPIRY_GENERALIZATION={res.limitations.EXPIRY_GENERALIZATION} · EXECUTION_GENERALIZATION={res.limitations.EXECUTION_GENERALIZATION} · UNDERLYING_METADATA={res.limitations.UNDERLYING_METADATA}
+                </div>
+              )}
             </section>
           </>
         )}
