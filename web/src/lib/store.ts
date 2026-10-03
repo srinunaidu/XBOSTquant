@@ -81,6 +81,15 @@ type State = {
   bayesRefine: boolean;
   paperThreshold: number;
   lastPaper: { eligible: boolean; reasons: string[] } | null;
+  // ---- trials-aware inference (multiple-testing correction) ----
+  dsrThreshold: number;        // deflated-Sharpe gate for the VALIDATED board (default 0.95)
+  leadsN: number;              // LEADS pool size (top by composite, validated or not)
+  effectiveNSample: number;    // max signal series rebuilt for effectiveN (bounded)
+  effectiveNBarSubsample: number; // max bars retained per series for effectiveN
+  leads: BoardRow[];
+  validatedBoard: BoardRow[];
+  paperBoard: BoardRow[];
+  inference: any | null;
   runId: string;
   lastAudit: any | null;
   lastAllRows: any[];
@@ -97,7 +106,7 @@ type State = {
   sampleT: { ins: number; rank: number };
   paperMinTrades: number;
   detail: Detail;
-  view: 'all' | 'best' | 'cmp' | 'res';
+  view: 'all' | 'best' | 'cmp' | 'res' | 'leads' | 'validated';
   researchObj: string;
   boardFilter: string;
   run: RunState;
@@ -165,6 +174,14 @@ export const useStore = create<State>((set) => ({
   bayesRefine: true,
   paperThreshold: 9.5,
   lastPaper: null,
+  dsrThreshold: 0.95,
+  leadsN: 200,
+  effectiveNSample: 3000,
+  effectiveNBarSubsample: 2000,
+  leads: [],
+  validatedBoard: [],
+  paperBoard: [],
+  inference: null,
   runId: '',
   lastAudit: null,
   lastAllRows: [],

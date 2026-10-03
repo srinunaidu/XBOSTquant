@@ -52,15 +52,36 @@ test('blockBootstrapCI: deterministic, shaped, insufficient-trades note', () => 
   assert.equal(thin.pf, null);
 });
 
-test('surrogateTest: noise ≈ 0.5, deterministic, thin refused', () => {
+test('surrogateTest: planted edge detected, noise not, deterministic, thin refused', () => {
   const rnd = [];
   let s = 1234;
   for (let i = 0; i < 200; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; rnd.push({ pnl: (s / 0x7fffffff - 0.5) * 100 }); }
   const p1 = R.surrogateTest(rnd, 50, 7).p;
   const p2 = R.surrogateTest(rnd, 50, 7).p;
   assert.equal(p1, p2, 'seeded deterministic');
-  assert.ok(p1 > 0.2 && p1 < 0.8, `noise p≈0.5, got ${p1}`);
+  assert.ok(p1 > 0.10 && p1 < 0.95, `no-edge data must be non-significant, got ${p1}`);
+  // PLANTED EDGE: every trade a strong winner. The previous phase-randomised null
+  // preserved the power spectrum (hence mean/variance) so it returned p≈0.5–1.0
+  // here; a valid null must now reject it.
+  const edge = [];
+  for (let i = 0; i < 120; i++) edge.push({ pnl: 25 + (i % 5) });
+  const pe = R.surrogateTest(edge, 100, 3);
+  assert.ok(pe.p < 0.05, `planted edge must reject the null, got p=${pe.p}`);
+  const pn = R.surrogateTest(rnd, 100, 3);
+  assert.ok(pn.p > 0.10, `no-edge data must not be rejected, got p=${pn.p}`);
   assert.equal(R.surrogateTest(rnd.slice(0, 10), 50, 7).nSurr, 0, 'thin refused');
+});
+
+test('bootstrapCI: seeded and reproducible (no Math.random)', () => {
+  const trades = [];
+  let s = 99;
+  for (let i = 0; i < 150; i++) { s = (s * 1103515245 + 12345) & 0x7fffffff; trades.push({ pnl: (s / 0x7fffffff - 0.45) * 100 }); }
+  const a = R.bootstrapCI(trades, 200, 5);
+  const b = R.bootstrapCI(trades, 200, 5);
+  assert.deepEqual(a, b, 'same seed -> identical CI');
+  assert.equal(a.seed, 5);
+  const c = R.bootstrapCI(trades, 200, 6);
+  assert.notDeepEqual(a.exp, c.exp, 'different seed -> different draw');
 });
 
 test('freeParamCount: signal params + active risk knobs', () => {

@@ -233,7 +233,7 @@ OD.ingest = function (text, schemaOver) {
     layout = 'wide';
     norm = ingestWide(head, rows, col);
   }
-  norm.sort((a, b) => a.ts - b.ts || (a.symbol < b.symbol ? -1 : 1));
+  norm.sort((a, b) => a.ts - b.ts || (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0));
   const contractColumns = head.filter(h => fieldSuffix(h));
   return { norm, layout, nRawRows: rows.length, columns: head, roles, contractColumns };
 };
@@ -1729,10 +1729,13 @@ OD.states = function (rows, meta) {
 /* ---------- stats ---------- */
 function mean(a) { const v = a.filter(x => !isNaN(x)); return v.length ? v.reduce((x, y) => x + y, 0) / v.length : NaN; }
 function std(a) {
+  // SAMPLE standard deviation (ddof=1), aligned with the Python engine
+  // (metrics.py::_trade_sharpe uses pandas/numpy std(ddof=1)). Population std made
+  // identical trade lists report Sharpes differing by sqrt(n/(n-1)).
   const v = a.filter(x => !isNaN(x));
   if (v.length < 2) return NaN;
   const m = mean(v);
-  return Math.sqrt(v.reduce((x, y) => x + (y - m) * (y - m), 0) / v.length);
+  return Math.sqrt(v.reduce((x, y) => x + (y - m) * (y - m), 0) / (v.length - 1));
 }
 function median(a) {
   const v = a.filter(x => !isNaN(x)).sort((x, y) => x - y);
@@ -1878,19 +1881,221 @@ OD.auditLookahead = function (featBySym, emit, tol) {
   };
 };
 
-OD.surrogateP = function (vals, nPerm, seed) {
-  const r = vals.filter(x => !isNaN(x));
-  if (r.length < 10) return { p: NaN, obs: NaN };
-  const rand = OD.rng(seed || 42);
-  const obs = mean(r) / (std(r) + 1e-9) * Math.sqrt(r.length);
-  let ge = 0;
-  for (let k = 0; k < nPerm; k++) {
-    const p = r.slice();
-    for (let i = p.length - 1; i > 0; i--) { const j = Math.floor(rand() * (i + 1)); const t = p[i]; p[i] = p[j]; p[j] = t; }
-    const s = mean(p) / (std(p) + 1e-9) * Math.sqrt(p.length);
-    if (Math.abs(s) >= Math.abs(obs)) ge++;
+/* ---------- event-time permutation null (§21) ----------
+   THE ONLY VALID SURROGATE TEST. Destroys the signal->outcome link by ROLLING
+   THE EVENT MASK in time inside each block; the LABEL SERIES IS NEVER TOUCHED.
+   That preserves the number of events, the label autocorrelation and the intraday
+   timing distribution, so the null answers exactly one question: does THIS timing
+   of events beat a random timing of the same number of events?
+
+   Mirrors xbost_option_discovery/metrics.py::permutation_null.
+
+   Why the previous implementation was broken: it permuted the RETURN VECTOR.
+   Mean and standard deviation are permutation-invariant, so every surrogate
+   statistic equalled the observed one and p degenerated to floating-point noise
+   (a perfect edge returned p = 1.0), making every OOS_SURVIVED / ROBUST /
+   PAPER_ELIGIBLE board unreachable.
+
+   mask/labels/blocks are aligned arrays; blocks are normally (symbol, day).
+   opts: {stat: 'mean'|'sharpe', minEvents: 10}. 'sharpe' = mean/std*sqrt(n) with
+   SAMPLE std (ddof=1), exactly the Python fix. */
+OD.surrogateMaskP = function (mask, labels, blocks, nPerm, seed, opts) {
+  opts = (typeof opts === 'string') ? { stat: opts } : (opts || {});
+  const stat = opts.stat || 'mean';
+  const minEvents = opts.minEvents == null ? 10 : opts.minEvents;
+  const n = labels.length;
+  if (mask.length !== n) throw new Error(`mask/labels length mismatch: ${mask.length} != ${n}`);
+  if (blocks && blocks.length !== n) throw new Error('blocks must be aligned with mask');
+  const blk = blocks || new Array(n).fill(0);
+  const y = new Float64Array(n);
+  for (let i = 0; i < n; i++) { const v = +labels[i]; y[i] = isFinite(v) ? v : NaN; }
+  const statVals = vals => {
+    if (!vals.length) return NaN;
+    if (stat === 'mean') return vals.reduce((a, b) => a + b, 0) / vals.length;
+    if (stat === 'sharpe') {
+      if (vals.length < 2) return NaN;
+      const m = vals.reduce((a, b) => a + b, 0) / vals.length;
+      const v = vals.reduce((a, b) => a + (b - m) * (b - m), 0) / (vals.length - 1); // ddof=1
+      const sdv = Math.sqrt(v);
+      return (isFinite(sdv) && sdv > 0) ? m / sdv * Math.sqrt(vals.length) : NaN;
+    }
+    throw new Error('unknown stat ' + stat);
+  };
+  // positions of every block that contains at least one event; the mask is rolled
+  // over the WHOLE block (events + non-events), exactly like the Python null.
+  const evBlocks = new Set();
+  let nEvents = 0;
+  for (let i = 0; i < n; i++) if (mask[i]) { nEvents++; evBlocks.add(blk[i]); }
+  const posByBlock = new Map();
+  for (const b of evBlocks) posByBlock.set(b, []);
+  for (let i = 0; i < n; i++) { const a = posByBlock.get(blk[i]); if (a) a.push(i); }
+  const obsVals = [];
+  for (let i = 0; i < n; i++) if (mask[i] && isFinite(y[i])) obsVals.push(y[i]);
+  const obs = statVals(obsVals);
+  const out = { p: NaN, obs, nullMean: NaN, nullSd: NaN, nEvents,
+    observedPercentile: NaN, nPerm: 0, stat };
+  if (nEvents < minEvents || !isFinite(obs)) return out;
+  const prepped = [];
+  for (const pos of posByBlock.values()) {
+    const nb = pos.length;
+    const selIdx = [];
+    for (let j = 0; j < nb; j++) if (mask[pos[j]]) selIdx.push(j);
+    prepped.push({ pos, nb, selIdx });
   }
-  return { p: (ge + 1) / (nPerm + 1), obs };
+  const rand = OD.rng(seed == null ? 42 : seed);
+  const nulls = [];
+  for (let k = 0; k < nPerm; k++) {
+    const vals = [];
+    for (const bp of prepped) {
+      const nb = bp.nb;
+      const off = nb > 1 ? 1 + Math.floor(rand() * (nb - 1)) : 0; // 1..nb-1 (np.random.integers(1, nb))
+      for (const j of bp.selIdx) {
+        const v = y[bp.pos[(j + off) % nb]];
+        if (isFinite(v)) vals.push(v);
+      }
+    }
+    nulls.push(statVals(vals));
+  }
+  const fin = nulls.filter(x => isFinite(x));
+  if (!fin.length) return out;
+  let ge = 0, lt = 0, sum = 0;
+  for (const v of fin) { if (Math.abs(v) >= Math.abs(obs)) ge++; if (v < obs) lt++; sum += v; }
+  const mu = sum / fin.length;
+  const sdv = Math.sqrt(fin.reduce((a, b) => a + (b - mu) * (b - mu), 0) / fin.length); // ddof=0, as Python np.std
+  out.p = (1 + ge) / (1 + fin.length);
+  out.nullMean = mu;
+  out.nullSd = sdv;
+  out.observedPercentile = lt / fin.length * 100;
+  out.nPerm = fin.length;
+  return out;
+};
+
+OD.surrogateP = function () {
+  // DEPRECATED and retained only to fail loudly. A returns-only surrogate cannot
+  // be built: permuting the return vector is a mathematical no-op because mean and
+  // std are permutation-invariant.
+  return { p: NaN, obs: NaN, deprecated: true,
+    note: 'REMOVED: permuting the return vector cannot form a null (mean and std are '
+      + 'permutation-invariant). Use OD.surrogateMaskP(mask, labels, blocks, nPerm, seed).' };
+};
+
+/* ---------- DERIVED paper-eligibility gate (§41) ----------
+   Mirrors xbost_option_discovery/paper.py::evaluate. The gate is DERIVED from
+   measured evidence, never hardcoded: previously reporting wrote
+   `paper_eligible = false` and `PAPER_ELIGIBLE = 'FALSE'` literally, so no amount
+   of evidence could ever promote a strategy. Returns every check with its measured
+   value plus `blockers` naming each failing dimension. */
+OD.paperGate = function (c, opts) {
+  opts = opts || {};
+  const checks = [];
+  const add = (check, passed, detail) => { checks.push({ check, passed: !!passed, detail }); return !!passed; };
+  const num = x => (typeof x === 'number' && isFinite(x)) ? x : NaN;
+  const show = x => isFinite(x) ? x.toFixed(4) : 'NA';
+  const costMode = String(opts.costMode || 'ZERO').toUpperCase();
+  const roundTrip = num(opts.roundTripCostPct);
+  const costReal = costMode !== 'ZERO' && isFinite(roundTrip) && roundTrip > 0;
+  add('cost_model_real', costReal,
+    `cost_mode=${costMode} round_trip_pct=${isFinite(roundTrip) ? roundTrip : 'NA'} (zero cost cannot be traded)`);
+  add('lookahead_pass', opts.lookaheadOk !== false, `NO_LOOKAHEAD=${opts.lookaheadOk === false ? 'FAIL' : 'PASS'}`);
+  add('metric_integrity', opts.metricIntegrity !== 'FAIL', `METRIC_INTEGRITY=${opts.metricIntegrity || 'PASS'}`);
+  const minOos = num(opts.minOosEvents); const minOosE = isFinite(minOos) ? minOos : 20;
+  const maxP = num(opts.maxPadj); const maxPE = isFinite(maxP) ? maxP : 0.10;
+  const minR = num(opts.minRobustness); const minRE = isFinite(minR) ? minR : 6;
+  const maxTop5 = num(opts.maxTop5); const maxTop5E = isFinite(maxTop5) ? maxTop5 : 0.5;
+  const minDays = num(opts.minDays); const minDaysE = isFinite(minDays) ? minDays : 10;
+  const minClusters = num(opts.minClusters); const minClustersE = isFinite(minClusters) ? minClusters : 10;
+  const expIs = num(c && c.IS_expectancy);
+  add('is_net_expectancy_positive', expIs > 0, `IS_expectancy(net)=${show(expIs)}`);
+  const oosN = num(c && c.OOS_events);
+  add('oos_sample_size', oosN >= minOosE, `OOS_events=${isFinite(oosN) ? oosN : 'NA'} >= ${minOosE}`);
+  const expOos = num(c && c.FWD_OOS_expectancy);
+  add('oos_expectancy_positive', expOos > 0, `FWD_OOS_expectancy=${show(expOos)}`);
+  const padj = num(c && c.perm_p_adj);
+  add('multiple_testing', padj < maxPE, `perm_p_adj=${show(padj)} < ${maxPE}`);
+  const rob = num(c && c.robustness_score);
+  add('robustness', isFinite(rob) && rob >= minRE, `robustness_score=${show(rob)} >= ${minRE}`);
+  const conc = num(c && c.top5);
+  add('concentration', isFinite(conc) && conc <= maxTop5E, `top5=${show(conc)} <= ${maxTop5E}`);
+  const days = num(c && c.day_count);
+  add('sample_days', days >= minDaysE, `days=${isFinite(days) ? days : 'NA'} >= ${minDaysE}`);
+  const clus = num(c && c.clusters);
+  add('sample_clusters', clus >= minClustersE, `clusters=${isFinite(clus) ? clus : 'NA'} >= ${minClustersE}`);
+  add('exit_not_cap_dominated', !(c && c.exit_cap_dominated), `exit_cap_dominated=${!!(c && c.exit_cap_dominated)}`);
+  const blockers = checks.filter(x => !x.passed).map(x => `${x.check}: ${x.detail}`);
+  return { eligible: blockers.length === 0, blockers, checks };
+};
+
+/* ---------- statistical tier from the MULTIPLE-TESTING-CORRECTED p (§35) ----------
+   Mirrors xbost_option_discovery/reporting.py::assign_status. The statistical TIER
+   must never be more optimistic than the BH gate acting on the same row: using the
+   RAW permutation p let a candidate be labelled OOS_SURVIVED while F12 rejected it
+   on perm_p_adj, i.e. the tier advertised data-snooped survivors. */
+OD.assignStatus = function (r, padj, opts) {
+  opts = opts || {};
+  const minEvents = opts.minEvents == null ? 50 : opts.minEvents;
+  const maxPadj = opts.maxPadj == null ? 0.10 : opts.maxPadj;
+  const n = r.events, days = r.day_count;
+  const oosMean = r.FWD_OOS_expectancy, trainMean = r.FWD_IS_expectancy;
+  const conc = r.top5;
+  const og = r.OOS_gate || (r.OOS_result === 'OOS_SURVIVED_MARK' ? 'OOS_OK' : 'THIN_OOS');
+  if (!(n >= minEvents) || !(days >= 3)) return 'THIN_SAMPLE';
+  if (og === 'THIN_OOS') return 'THIN_SAMPLE';
+  if (isNaN(oosMean)) return 'REJECTED';
+  if (!(oosMean > 0)) return 'OOS_REJECTED';
+  const agree = (trainMean > 0 && oosMean > 0) || (trainMean < 0 && oosMean < 0);
+  if (!agree) return 'REJECTED';
+  if (isNaN(padj) || padj >= maxPadj) return 'SURROGATE_REJECTED';
+  if (r.exit_cap_dominated) return 'ENTRY_PROMISING_EXIT_UNRESOLVED';
+  if (conc >= 0.5) return 'CONCENTRATED';
+  if (days < 5) return 'THIN_SAMPLE';
+  if (padj < 0.05) return 'OOS_SURVIVED';
+  return 'ROBUST';
+};
+
+OD.tierFromStatus = function (status) {
+  if (status === 'OOS_SURVIVED') return 4;
+  if (status === 'ROBUST') return 5;
+  if (status === 'ENTRY_PROMISING_EXIT_UNRESOLVED') return 3;
+  if (status === 'CONCENTRATED' || status === 'SURROGATE_REJECTED') return 2;
+  return 1;
+};
+
+OD.failureClassOf = function (status) {
+  if (status === 'THIN_SAMPLE') return 'THIN_SAMPLE';
+  if (status === 'OOS_REJECTED') return 'OOS_FAIL';
+  if (status === 'SURROGATE_REJECTED') return 'MULTIPLE_TESTING';
+  if (status === 'ENTRY_PROMISING_EXIT_UNRESOLVED' || status === 'CAP_DOMINATED') return 'EXIT_DEPENDENCE';
+  if (status === 'CONCENTRATED') return 'CONCENTRATION';
+  if (status === 'OOS_SURVIVED' || status === 'ROBUST') return 'NONE';
+  return 'NO_FORWARD_EDGE'; // REJECTED
+};
+
+OD.recomputeStatusFromAdjusted = function (cands, opts) {
+  opts = opts || {};
+  const maxPadj = opts.maxPadj == null ? 0.10 : opts.maxPadj;
+  for (const c of cands) {
+    const padj = (typeof c.perm_p_adj === 'number' && !isNaN(c.perm_p_adj)) ? c.perm_p_adj : 1;
+    const status = OD.assignStatus(c, padj, opts);
+    const og = c.OOS_gate;
+    const reasons = [];
+    if (!(c.events >= (opts.minEvents == null ? 50 : opts.minEvents)) || !(c.day_count >= 3)) reasons.push('thin');
+    if (og === 'THIN_OOS') reasons.push('THIN_OOS');
+    if (!(c.top5 <= 0.5)) reasons.push('concentration');
+    if (!(padj < maxPadj)) reasons.push('surrogate-fail');
+    if (c.exit_cap_dominated) reasons.push('exit-cap-dominated');
+    if (c.OOS_result !== 'OOS_SURVIVED_MARK') reasons.push('OOS_REJECTED');
+    if (isNaN(c.FWD_IS_expectancy) || ((c.FWD_IS_expectancy > 0) !== (c.FWD_OOS_expectancy > 0))) reasons.push('train-oos-disagree');
+    if (c.day_count < 5 && reasons.indexOf('thin') < 0) reasons.push('few-days');
+    c.final_status = status;
+    c.failure_class = OD.failureClassOf(status);
+    const uniq = [...new Set(reasons)];
+    c.failure_reason = uniq.length ? uniq.join(';') : 'none';
+    const tier = OD.tierFromStatus(status);
+    c.TIER = tier;
+    c.DISCOVERY_EVIDENCE = tier >= 2 ? 'STRONG' : (tier === 1 ? 'WEAK' : 'NONE');
+    c.ENTRY_PROMISING = tier >= 2;
+  }
+  return cands;
 };
 
 OD.bh = function (pvals) {
@@ -1905,12 +2110,97 @@ OD.bh = function (pvals) {
   return adj;
 };
 
+/* ---------- trials-aware statistical inference (identical formulas to engine.js) ----------
+   A discovery run is a massive multiple test: the BEST of N hypotheses is
+   reported, so the null distribution of that maximum must be subtracted.
+   Sources:
+     · Bailey & López de Prado, "The Deflated Sharpe Ratio", JPM 40(5), 2014 —
+       PSR (eq. 5-6) and DSR (eq. 9).
+     · Bailey, Borwein, López de Prado & Zhu, "Pseudo-Mathematics and Financial
+       Charlatanism", Notices AMS 61(5), 2014, eq. (3)-(4) — E[max] of N i.i.d.
+       normal Sharpes.
+   These MIRROR public/engine.js exactly so both engines agree. */
+OD.EULER_GAMMA = 0.5772156649015329;
+
+// Phi^-1: Acklam's rational approximation of the inverse normal CDF
+// (|relative error| < 1.15e-9 over (0,1)).
+OD.normInv = function (p) {
+  if (typeof p !== 'number' || p !== p) return NaN;
+  if (p <= 0) return -Infinity;
+  if (p >= 1) return Infinity;
+  const a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02, 1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00];
+  const b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02, 6.680131188771972e+01, -1.328068155288572e+01];
+  const c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00, -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00];
+  const d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00, 3.754408661907416e+00];
+  const pl = 0.02425, ph = 1 - pl;
+  let q, r;
+  if (p < pl) {
+    q = Math.sqrt(-2 * Math.log(p));
+    return (((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+  }
+  if (p <= ph) {
+    q = p - 0.5; r = q * q;
+    return (((((a[0] * r + a[1]) * r + a[2]) * r + a[3]) * r + a[4]) * r + a[5]) * q / (((((b[0] * r + b[1]) * r + b[2]) * r + b[3]) * r + b[4]) * r + 1);
+  }
+  q = Math.sqrt(-2 * Math.log(1 - p));
+  return -(((((c[0] * q + c[1]) * q + c[2]) * q + c[3]) * q + c[4]) * q + c[5]) / ((((d[0] * q + d[1]) * q + d[2]) * q + d[3]) * q + 1);
+};
+
+// Abramowitz & Stegun 7.1.26 normal CDF (|err| ≤ 1.5e-7).
+// Phi(z) = 0.5*(1 + erf(z/sqrt(2))), so the series argument MUST be
+// |z|/sqrt(2) — feeding |z| computes Phi(z*sqrt(2)) and inflates every tail
+// probability. Mirrors engine.js _nCdf.
+OD.normCdf = function (z) {
+  const s = z < 0 ? -1 : 1, a = Math.abs(z) / Math.SQRT2, t = 1 / (1 + 0.3275911 * a);
+  const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-a * a);
+  return 0.5 * (1 + s * y);
+};
+
+// PSR: sr is the NON-ANNUALIZED per-observation Sharpe (mean/std, ddof=1),
+// T the observation count, kurt the RAW kurtosis (normal = 3).
+OD.probabilisticSharpe = function (sr, T, skew, kurt, srBenchmark) {
+  if (typeof T !== 'number' || !isFinite(T) || T < 2) return NaN;
+  if (!isFinite(sr) || !isFinite(skew) || !isFinite(kurt)) return NaN;
+  const b = (srBenchmark == null) ? 0 : srBenchmark;
+  if (!isFinite(b)) return NaN;
+  const denom = Math.sqrt(1 - skew * sr + ((kurt - 1) / 4) * sr * sr);
+  if (!(denom > 0) || !isFinite(denom)) return NaN;
+  return OD.normCdf((sr - b) * Math.sqrt(T - 1) / denom);
+};
+
+// E[max Sharpe] of N trials under the null, variance of the per-observation
+// Sharpes = srVariance. N < 2 → NaN.
+OD.expectedMaxSharpe = function (nTrials, srVariance) {
+  if (typeof nTrials !== 'number' || !isFinite(nTrials) || nTrials < 2) return NaN;
+  const v = (srVariance == null) ? 1 : srVariance;
+  if (!isFinite(v) || v < 0) return NaN;
+  const G = OD.EULER_GAMMA;
+  return Math.sqrt(v) * ((1 - G) * OD.normInv(1 - 1 / nTrials) + G * OD.normInv(1 - 1 / (nTrials * Math.E)));
+};
+
+OD.benchmarkSharpe = function (nTrials) { return OD.expectedMaxSharpe(nTrials, 1); };
+
+// DSR = PSR evaluated against the expected maximum Sharpe of the search.
+// N < 2: the bar is 0 (E[max of one draw] = 0), so DSR reduces to PSR vs 0.
+OD.deflatedSharpe = function (sr, T, skew, kurt, nTrials, srVariance) {
+  const out = { dsr: NaN, sr0: NaN, sr, T, nTrials };
+  if (typeof nTrials !== 'number' || !isFinite(nTrials)) return out;
+  const sr0 = nTrials < 2 ? 0 : OD.expectedMaxSharpe(nTrials, srVariance);
+  if (!isFinite(sr0)) return out;
+  out.sr0 = sr0;
+  out.dsr = OD.probabilisticSharpe(sr, T, skew, kurt, sr0);
+  return out;
+};
+
 OD.cluster = function (items, minutes) {
   // items: [{ts, symbol, idx}] → cluster ids; same symbol within window = 1 event
-  const sorted = items.slice().sort((a, b) => (a.symbol < b.symbol ? -1 : 1) || a.ts - b.ts);
+  // Comparator must return 0 for equal symbols, otherwise `|| a.ts - b.ts` never
+  // runs and boundaries are computed on an arbitrary order (corrupting nClusters).
+  const sorted = items.slice().sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0) || a.ts - b.ts);
   const ids = new Array(items.length).fill(-1);
+  // item -> ORIGINAL index (ids is aligned with the input array, as before).
   const pos = new Map();
-  sorted.forEach((it, k) => pos.set(it, k));
+  items.forEach((it, k) => pos.set(it, k));
   let eid = 0;
   const bySym = new Map();
   for (const it of sorted) {
@@ -1921,7 +2211,7 @@ OD.cluster = function (items, minutes) {
     let last = null, cur = -1;
     for (const it of arr) {
       if (last === null || (it.ts - last) / 60000 > minutes) { eid++; cur = eid; }
-      ids[items.indexOf(it)] = cur;
+      ids[pos.get(it)] = cur; // O(1) via the position map (was items.indexOf → O(n²))
       last = it.ts;
     }
   }
@@ -2018,6 +2308,10 @@ OD.run = function (text, cfg, onLog, onProgress) {
   cfg = Object.assign({
     focusStrikes: 3, minEvents: 50, clusterMinutes: 3, trainFrac: 0.5, valFrac: 0.2,
     seed: 42, nPerms: 200, maxCandidates: 200, sl: 0.5, tp: 1.0, hold: 5,
+    // cost model: ZERO refuses the paper gate outright (see OD.paperGate)
+    costMode: 'ZERO', roundTripCostPct: 0,
+    paperMinOosEvents: 20, paperMaxPadj: 0.10, paperMinRobustness: 6,
+    paperMaxTop5: 0.5, paperMinDays: 10, paperMinClusters: 10,
     lags: [1, 2, 3, 5, 10, 15, 30], rankingObjective: 'composite',
   }, cfg || {});
   // budget defaults apply ONLY when unset — never clobber caller config.
@@ -2370,6 +2664,25 @@ OD.run = function (text, cfg, onLog, onProgress) {
   }
   // lead/lag screening is performed in the LEAD/LAG section below (proper implementation)
 
+  // ---- surrogate universe (§21): full label series + (symbol, day) block ids ----
+  // The event mask is rolled WITHIN these blocks; labels are never permuted.
+  const uniIndex = new Map();
+  const uniLabels = new Float64Array(rows.length);
+  const uniBlocks = new Int32Array(rows.length);
+  {
+    const bid = new Map();
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i];
+      uniIndex.set(r, i);
+      const lv = r.fwd_ret_5m;
+      uniLabels[i] = (typeof lv === 'number' && !isNaN(lv)) ? lv : NaN;
+      const key = r.symbol + '|' + dayOf(r.ts);
+      let id = bid.get(key);
+      if (id === undefined) { id = bid.size; bid.set(key, id); }
+      uniBlocks[i] = id;
+    }
+  }
+
   // candidate evaluation helper
   const labelOf = r => r.fwd_ret_5m;
   function evalMask(items, cid, fam, feature, formula, rel, extra) {
@@ -2488,7 +2801,16 @@ OD.run = function (text, cfg, onLog, onProgress) {
     const entryInfo = { horizons: hzMean, horizon_agreement: hzAgree,
       bootstrap_ci: [entryBoot.ci_low, entryBoot.ci_high], day_agreement: dayAgree,
       components: eParts, score: entryScore };
-    const sg = OD.surrogateP(vals, cfg.nPerms, cfg.seed);
+    // Surrogate: event-time permutation over TRAIN events, mask rolled within
+    // (symbol, day) blocks; the label series is untouched. Mirrors Python
+    // metrics.permutation_null(mask_tr, labels_full, blocks_full).
+    const trainMask = new Uint8Array(uniLabels.length);
+    for (const r of items) {
+      if (!inTr(r)) continue;
+      const ri = uniIndex.get(r);
+      if (ri !== undefined) trainMask[ri] = 1;
+    }
+    const sg = OD.surrogateMaskP(trainMask, uniLabels, uniBlocks, cfg.nPerms, cfg.seed, { stat: 'mean' });
     const p = isNaN(sg.p) ? 1 : sg.p;
     const og = !oosOK || !splits.pseudo_oos.length ? 'THIN_OOS' : (vOos.length < 20 ? 'THIN_OOS' : 'OOS_OK');
     const dayCount = new Set(items.map(r => dayOf(r.ts))).size;
@@ -2518,6 +2840,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
         FWD_OOS_WR: vOos.length ? vOos.filter(x => x > 0).length / vOos.length : 0,
         ENTRY_INFORMATION_SCORE: Math.round(entryScore * 1000) / 1000, entry_info: entryInfo,
         OOS_result: (vOos.length && fwdOos > 0) ? 'OOS_SURVIVED_MARK' : 'OOS_REJECTED',
+        OOS_gate: og,
         discovery_score: discScore,
         discovery_round: extra.round || 0, hypothesis_id: extra.hyp || '',
         combination_signature: extra.sig || feature, combination_depth: extra.depth || 1,
@@ -2528,6 +2851,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
         OOS_INSUFFICIENT_SAMPLE: false,
         exit_cap_dominated: false, time_stability: {}, entry_perturbation: {},
         top5: NaN, rm_best3: NaN, rm_best1: NaN, perm_p: p,
+        surrogate: { p: sg.p, obs: sg.obs, null_mean: sg.nullMean, null_sd: sg.nullSd,
+          n_events: sg.nEvents, observed_percentile: sg.observedPercentile, stat: sg.stat },
+        day_count: dayCount,
         final_status: 'REJECTED', failure_reason: 'no-forward-edge', failure_class: 'NO_FORWARD_EDGE',
         TIER: (fwdTr > 0 && dayCount >= 3) ? 1 : 0,
         DISCOVERY_EVIDENCE: (fwdTr > 0 && dayCount >= 3) ? 'WEAK' : 'NONE',
@@ -2535,7 +2861,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
         hold_matrix: null, best_horizon: NaN, horizon_stability: NaN,
         CONTRACT_GEN: contractGen, DAY_GEN: dayGen, cluster_sweep: clusterSweep,
         event_mask_hash: maskHash,
-        paper_eligible: false, equity_curve: [],
+        paper_eligible: false, paper_blockers: ['stage: candidate did not reach the exit/robustness evidence stage'], equity_curve: [],
       };
       if (vals.length < cfg.minEvents || dayCount < 3) { lb.final_status = 'THIN_SAMPLE'; lb.failure_reason = 'thin'; lb.failure_class = 'THIN_SAMPLE'; }
       else if (og === 'THIN_OOS') { lb.final_status = 'THIN_SAMPLE'; lb.failure_reason = 'THIN_OOS'; lb.failure_class = 'THIN_SAMPLE'; }
@@ -2658,8 +2984,12 @@ OD.run = function (text, cfg, onLog, onProgress) {
       OOS_worst_day: oosDayWorst ? oosDayWorst.day + ':' + oosDayWorst.mean.toFixed(3) : 'NA',
       OOS_INSUFFICIENT_SAMPLE: (vOos.length >= 20 && vOos.length < 50 && fwdOos > 0),
       OOS_result: (vOos.length && fwdOos > 0) ? 'OOS_SURVIVED_MARK' : 'OOS_REJECTED',
+      OOS_gate: og,
       time_stability: tstab, entry_perturbation: pert,
       top5: conc, rm_best3, rm_best1, perm_p: p, final_status: status, failure_reason: fail.join(';') || 'none',
+      surrogate: { p: sg.p, obs: sg.obs, null_mean: sg.nullMean, null_sd: sg.nullSd,
+        n_events: sg.nEvents, observed_percentile: sg.observedPercentile, stat: sg.stat },
+      day_count: dayCount,
       failure_class: fail[0] === 'exit-cap-dominated' ? 'EXIT_DEPENDENCE'
         : fail[0] === 'surrogate-fail' ? 'MULTIPLE_TESTING'
         : fail[0] === 'concentration' ? 'CONCENTRATION'
@@ -2673,6 +3003,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
       CONTRACT_GEN: contractGen, DAY_GEN: dayGen, cluster_sweep: clusterSweep,
       event_mask_hash: maskHash,
       paper_eligible: false,
+      paper_blockers: ['stage: paper gate not yet evaluated'],
       equity_curve: eq.filter((_, i) => i % step === 0),
     };
   }
@@ -3483,6 +3814,16 @@ OD.run = function (text, cfg, onLog, onProgress) {
   // BH + filters (§10: zero-input stages report BLOCKED_NO_INPUT, never fake PASS/FAIL)
   const padj = OD.bh(cands.map(c => isNaN(c.perm_p) ? 1 : c.perm_p));
   cands.forEach((c, i) => { c.perm_p_adj = padj[i]; });
+  // The statistical tier MUST use the BH-adjusted p, never the raw permutation p:
+  // otherwise a row can be labelled OOS_SURVIVED (advertised on TOP_OOS/TOP_ROBUST)
+  // while the multiple-testing gate rejects that very row. `perm_p` and the
+  // `surrogate` block keep the raw values; only the DECISION uses the adjusted p.
+  OD.recomputeStatusFromAdjusted(cands, { minEvents: cfg.minEvents, maxPadj: cfg.paperMaxPadj });
+  const rawMinP = OD.minOf(cands.map(c => isNaN(c.perm_p) ? 1 : c.perm_p));
+  const adjMinP = OD.minOf(cands.map(c => isNaN(c.perm_p_adj) ? 1 : c.perm_p_adj));
+  emit(`TIER_FROM_ADJUSTED_P raw_min=${isFinite(rawMinP) ? rawMinP.toFixed(4) : 'NA'} `
+    + `adj_min=${isFinite(adjMinP) ? adjMinP.toFixed(4) : 'NA'} `
+    + `survivors=${cands.filter(c => ['OOS_SURVIVED', 'ROBUST'].indexOf(c.final_status) >= 0).length}`);
   // ---- equivalence classes (§26): same mask => same effective hypothesis ----
   const maskGroups = new Map(), sigGroups = new Map(), resGroups = new Map();
   for (const c of cands) {
@@ -3535,6 +3876,63 @@ OD.run = function (text, cfg, onLog, onProgress) {
     c.effective_hypothesis_count = effectiveN;
   });
   emit(`MT raw=${rawP.length} effective=${effectiveN} BH_pass=${cands.filter(c => c.perm_p_adj < 0.10).length} bonf_pass=${bonf.filter(p => p < 0.10).length} holm_pass=${holm.filter(p => p < 0.10).length}`);
+  /* ---- effectiveN-based BH: REPORTED alongside the raw-count BH, never swapped ----
+     `perm_p_adj` above (BH with m = raw candidate count) stays the DECISION so no
+     existing tier/status changes. The effectiveN variant applies BH to the
+     `effectiveN` most significant candidates (m = number of INDEPENDENT
+     hypotheses) and is emitted for contrast only. */
+  let MT_INFERENCE = null;
+  if (rawP.length > 0) {
+    // clamp m to the ACTUAL number of ranked candidates as well as the
+    // effective count: with zero candidates `order` is empty and a
+    // `Math.max(1, ...)` floor made this loop index order[0] -> crash.
+    const mEff = Math.max(1, Math.min(effectiveN, rawP.length, order.length));
+    const pAdjEff = new Array(rawP.length).fill(1);
+    let prevEff = 1;
+    for (let i = mEff - 1; i >= 0; i--) {
+      const v = Math.min(prevEff, order[i][0] * mEff / (i + 1));
+      pAdjEff[order[i][1]] = v; prevEff = v;
+    }
+    cands.forEach((c, i) => { c.perm_p_adj_effective = pAdjEff[i]; });
+    const rawPass = cands.filter(c => c.perm_p_adj < 0.10).length;
+    const effPass = cands.filter(c => c.perm_p_adj_effective < 0.10).length;
+    emit(`MT_BH raw_count_bh_pass=${rawPass}/${rawP.length} effectiveN_bh_pass=${effPass}/${mEff} `
+      + `(raw-count BH is the DECISION; effectiveN BH reported for contrast — not silently swapped)`);
+    // ---- Deflated Sharpe Ratio (same formulas as the indicator engine) ----
+    // Per-observation Sharpe = TRADE_SHARPE / sqrt(events) (TRADE_SHARPE is
+    // mean/std*sqrt(n) on per-trade returns); T = trade count; skew/kurt default
+    // to the normal moments because they are not retained per candidate.
+    const perObs = cands.map(c => (isFinite(c.IS_TRADE_SHARPE) && c.events >= 2) ? c.IS_TRADE_SHARPE / Math.sqrt(c.events) : NaN);
+    const fin = perObs.filter(x => isFinite(x));
+    let srVar = NaN;
+    if (fin.length >= 2) {
+      const mu = fin.reduce((a, b) => a + b, 0) / fin.length;
+      srVar = fin.reduce((a, b) => a + (b - mu) * (b - mu), 0) / (fin.length - 1);
+    }
+    const nTrials = Math.max(1, HYPS.tested || cands.length);
+    const varUse = isFinite(srVar) ? srVar : 1;
+    const nullBar = OD.expectedMaxSharpe(nTrials, varUse);
+    let dsrPass = 0;
+    cands.forEach((c, i) => {
+      const d = OD.deflatedSharpe(perObs[i], c.events, 0, 3, nTrials, varUse);
+      c.dsr = d.dsr; c.sr0 = d.sr0; c.dsr_threshold = 0.95;
+      c.psr_vs_zero = OD.probabilisticSharpe(perObs[i], c.events, 0, 3, 0);
+      c.per_observation_sharpe = perObs[i];
+      if (isFinite(d.dsr) && d.dsr >= 0.95) dsrPass++;
+    });
+    emit(`DEFLATED_SHARPE trials=${nTrials} sr_variance=${isFinite(srVar) ? srVar.toExponential(4) : 'NA'} `
+      + `(N=${fin.length}, per-observation = IS_TRADE_SHARPE/sqrt(events)) null_bar=${isFinite(nullBar) ? nullBar.toFixed(4) : 'NA'} sigma `
+      + `dsr>=0.95 pass=${dsrPass}/${cands.length}`);
+    MT_INFERENCE = {
+      trials: nTrials, effective_hypotheses: effectiveN, raw_candidate_count: rawP.length,
+      sr_variance: isFinite(srVar) ? srVar : null, sr_variance_n: fin.length,
+      null_bar_sigma: isFinite(nullBar) ? nullBar : null,
+      dsr_threshold: 0.95, dsr_pass: dsrPass,
+      bh_raw_count_pass: rawPass, bh_effectiveN_pass: effPass,
+      decision: 'BH over the raw candidate count (perm_p_adj); effectiveN BH reported for contrast',
+      per_observation_sharpe_note: 'IS_TRADE_SHARPE / sqrt(events); T = events (trades)',
+    };
+  }
   const filtLog = [];
   const filt = (id, name, arr, keep, reason) => {
     const t = Date.now();
@@ -3832,6 +4230,37 @@ OD.run = function (text, cfg, onLog, onProgress) {
     c.edge_path = order.map(k => `${k.split('_')[0]}:${L[k] === 'POSITIVE' || L[k] === 'EVALUATED' || L[k] === 'SINGLE' || L[k] === 'TESTABLE' ? 'OK' : 'FAIL'}`).join(' → ')
       + (firstFail ? ` (edge disappears at ${firstFail})` : ' (no disappearance)');
   }
+  // ---- DERIVED paper gate (§41): measured evidence per candidate, never hardcoded ----
+  const paperGateOpts = {
+    costMode: cfg.costMode, roundTripCostPct: cfg.roundTripCostPct,
+    lookaheadOk: la.status === 'PASS', metricIntegrity: 'PASS',
+    minOosEvents: cfg.paperMinOosEvents, maxPadj: cfg.paperMaxPadj,
+    minRobustness: cfg.paperMinRobustness, maxTop5: cfg.paperMaxTop5,
+    minDays: cfg.paperMinDays, minClusters: cfg.paperMinClusters,
+  };
+  for (const c of cands) {
+    const pg = OD.paperGate(c, paperGateOpts);
+    c.paper_eligible = pg.eligible;
+    c.paper_blockers = pg.blockers;
+    c.paper_checks = pg.checks;
+  }
+  const paperList = cands.filter(c => c.paper_eligible);
+  const paperBlockedReasons = (() => {
+    const counts = {};
+    for (const c of cands) for (const b of (c.paper_blockers || [])) {
+      const k = b.split(':')[0];
+      counts[k] = (counts[k] || 0) + 1;
+    }
+    return counts;
+  })();
+  emit(`PAPER_GATE derived evaluated=${cands.length} eligible=${paperList.length} `
+    + `top_blockers=${Object.entries(paperBlockedReasons).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => k + '=' + v).join(' ') || 'none'}`);
+  // TOP_MT = best multiple-testing-passers PLUS every statistical survivor, so the
+  // board is always a superset of OOS_SURVIVED/ROBUST (those imply perm_p_adj<maxPadj).
+  const topMt = topBy('perm_p_adj', 10, false);
+  for (const c of cands) {
+    if (['OOS_SURVIVED', 'ROBUST'].indexOf(c.final_status) >= 0 && topMt.indexOf(c.candidate) < 0) topMt.push(c.candidate);
+  }
   const boards = {
     ALL: cands.map(c => c.candidate),
     TOP_INFORMATIONAL: topBy('ENTRY_INFORMATION_SCORE', 10, true),
@@ -3839,8 +4268,8 @@ OD.run = function (text, cfg, onLog, onProgress) {
     TOP_VALIDATION: topBy('FWD_VAL_expectancy', 10, true),
     TOP_OOS: topBy('FWD_OOS_expectancy', 10, true),
     TOP_ROBUST: topBy('robustness_score', 10, true),
-    TOP_MT: topBy('perm_p_adj', 10, false),
-    PAPER_ELIGIBLE: [],
+    TOP_MT: topMt,
+    PAPER_ELIGIBLE: paperList.map(c => c.candidate),
   };
   // ---- diversity (§22): group near-identical, keep representatives ----
   const divGroups = new Map();
@@ -3922,7 +4351,7 @@ OD.run = function (text, cfg, onLog, onProgress) {
     let miss = 0, init = 0, rawgap = 0, chainalign = 0, other = 0;
     const perSym = new Map();
     let maxRun = 0, run = 0;
-    const ordered = rows.slice().sort((a, b) => (a.symbol < b.symbol ? -1 : 1) || a.ts - b.ts);
+    const ordered = rows.slice().sort((a, b) => (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0) || a.ts - b.ts);
     for (const r of ordered) {
       const v = r[fname];
       if (typeof v === 'number' && !isNaN(v)) { run = 0; continue; }
@@ -4012,12 +4441,11 @@ OD.run = function (text, cfg, onLog, onProgress) {
       nz(c.FWD_OOS_expectancy) * 3 + nz(c.OOS_TRADE_SHARPE) * 2 +
       Math.log10(1 + c.FWD_OOS_events) + nz(c.robustness_score) / 2 +
       (1 - Math.min(1, c.top5)) + (nz(c.rm_best3) > 0 ? 1 : 0)) * 100) / 100 : 0;
-    c.paper_eligible = false; // short-sample + RESEARCH-price-model rule (§41/§7)
     if (c.FINAL_VALIDATED_SCORE > 0) {
-      emit(`VALIDATED ${c.candidate} score=${c.FINAL_VALIDATED_SCORE} (paper still blocked: short sample, research prices)`);
+      emit(`VALIDATED ${c.candidate} score=${c.FINAL_VALIDATED_SCORE} paper=${c.paper_eligible ? 'ELIGIBLE' : 'BLOCKED'}${c.paper_eligible ? '' : ' (' + (c.paper_blockers || []).slice(0, 3).join('; ') + ')'}`);
     }
   }
-  const paperList = validated.filter(c => c.paper_eligible);
+  const paperValidated = validated.filter(c => c.paper_eligible);
   // ---- neighborhood search (§20B): exhaust winner's local neighborhood ----
   let neighborhood = { searched: false };
   const best = validated.slice().sort((a, b) => b.FINAL_VALIDATED_SCORE - a.FINAL_VALIDATED_SCORE)[0];
@@ -4088,7 +4516,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
   emit(`DISCOVERY_EVIDENCE=${discEvidence} OOS_EVIDENCE=${oosEv} VALIDATED_EDGE=NO (pending final gates)`);
   const tierDist = {};
   for (const c of cands) tierDist[c.TIER || 0] = (tierDist[c.TIER || 0] || 0) + 1;
-  emit('PAPER_ELIGIBLE = NO  RESEARCH_WINNER = NONE');
+  emit(`PAPER_ELIGIBLE = ${paperList.length ? 'YES' : 'NO'}  PAPER_ELIGIBLE_COUNT = ${paperList.length}/${cands.length}  `
+    + `PAPER_STATUS = ${paperList.length ? 'ELIGIBLE' : 'BLOCKED'}  `
+    + `blockers=${Object.entries(paperBlockedReasons).sort((a, b) => b[1] - a[1]).slice(0, 5).map(([k, v]) => k + '=' + v).join(' ') || 'none'}`);
   // discovery vs filter diagnosis (§26): zero candidates after fixes = which reason?
   let zeroWhy = '';
   if (cands.length === 0) {
@@ -4178,12 +4608,12 @@ OD.run = function (text, cfg, onLog, onProgress) {
     + `EXIT_PROPAGATION_STATUS=${gate.blocked ? 'BLOCKED_NO_INPUT' : gate.status} `
     + `METRIC_STATUS=PASS NO_LOOKAHEAD_STATUS=PASS `
     + `OOS_STATUS=${cands.length === 0 ? 'BLOCKED_NO_INPUT' : (survN === 0 ? 'FAIL' : 'MIXED')} `
-    + `ROBUSTNESS_STATUS=PASS PAPER_GATE_STATUS=BLOCKED`);
+    + `ROBUSTNESS_STATUS=PASS PAPER_GATE_STATUS=${paperList.length ? 'OPEN' : 'BLOCKED'}`);
   emit(`contracts_detected=${registry.length} contracts_parsed=${nParsedStrike + nParsedType > 0 ? registry.length : 0} `
     + `expiries=${meta.n_expiries} strikes=${meta.n_strikes} option_types=${meta.option_types.length} `
     + `snapshots=${meta.synchronized_snapshots} feature_rows=${rows.length} feature_columns=${FEAT_DEFS.length} `
     + `raw_events=${cands.reduce((a, c) => a + c.events, 0)} candidates=${cands.length} `
-    + `OOS_tested=${cands.length} OOS_survived=${survN} paper_eligible=0`);
+    + `OOS_tested=${cands.length} OOS_survived=${survN} paper_eligible=${paperList.length}`);
   emit(`UNDERLYING reference=${und ? refSym : 'none'} MONEYNESS=${und ? 'AVAILABLE' : 'UNAVAILABLE'} EXPIRY_ENGINE=${expCols.length ? 'AVAILABLE' : 'NOT_AVAILABLE'}`);
   emit(`GLOBAL_TEST_COUNT=${GLOBAL_TESTS} OOS_EXPOSURE_COUNT=${OOS_EXPOSURE_COUNT}`);
   emit(`COVERAGE rounds=${ROUND_LOG.length}/${roundsWanted} hyps=${HYPS.tested} cands=${cands.length} exhausted=${stopReason.why || 'rounds-complete'}`);
@@ -4205,6 +4635,8 @@ OD.run = function (text, cfg, onLog, onProgress) {
     checkpoint: resumeCheckpoint, checkpoints: CHECKPOINTS, dataHash, globalTests: GLOBAL_TESTS, oosExposure: OOS_EXPOSURE_COUNT,
     newUnique: newUnique(),
     boards, diversity, oosCounts, LEDGER,
+    paperGate: { evaluated: cands.length, eligible: paperList.length,
+      eligible_candidates: paperList.map(c => c.candidate), blockers: paperBlockedReasons },
     whyRanked: whyRanked.slice(0, 10).map(([k, v]) => ({ reason: k, count: v })),
     nearestSurvivor, tierDist, discEvidence, oosEvidence: oosEv,
     convergence: { rounds: convRounds, new_hypotheses: convNew, converged,
@@ -4248,7 +4680,10 @@ OD.run = function (text, cfg, onLog, onProgress) {
       BEST_OOS: topBy('FWD_OOS_expectancy', 1, true)[0] || null,
       STACK_SAFETY_STATUS: ssa.status,
       DATA_HEALTH_STATUS: health.status,
-      PAPER_ELIGIBLE: false,
+      PAPER_ELIGIBLE: paperList.length > 0,
+      PAPER_ELIGIBLE_COUNT: paperList.length,
+      PAPER_GATE_STATUS: paperList.length > 0 ? 'OPEN' : 'BLOCKED',
+      PAPER_BLOCKERS: Object.entries(paperBlockedReasons).sort((a, b) => b[1] - a[1]).map(([k, v]) => ({ blocker: k, count: v })),
     },
     limitations: {
       EXPIRY_GENERALIZATION: meta.n_expiries > 1 ? 'TESTABLE' : 'UNTESTABLE',
@@ -4267,12 +4702,17 @@ OD.run = function (text, cfg, onLog, onProgress) {
       OOS_READY: splits.pseudo_oos.length ? 'PASS' : 'NOT_READY',
       ROBUSTNESS_READY: 'PASS',
       EXECUTION_MODEL: meta.has_bidask ? 'EXECUTABLE_MODEL' : 'RESEARCH_PRICE_MODEL',
-      PAPER_ELIGIBLE: 'FALSE',
+      PAPER_ELIGIBLE: paperList.length > 0 ? 'TRUE' : 'FALSE',
+      PAPER_ELIGIBLE_COUNT: paperList.length,
+      PAPER_GATE_STATUS: paperList.length > 0 ? 'OPEN' : 'BLOCKED',
     },
     dataHealth: health, chainMetadata: meta, modules: Object.fromEntries(Object.entries(mods).map(([k, v]) => [k, v[0]])),
     modulesUnavailable: Object.fromEntries(Object.entries(mods).filter(([, v]) => v[0] !== 'AVAILABLE').map(([k, v]) => [k, v[1]])),
     counts: { features: featAudit.length, relationships: xCols.length + 10, sequences: 167, states: 125, candidates: cands.length },
     filterLog: filtLog, candidates: cands, leadlag: llOut.slice(0, 200),
+    // Trials-aware inference: raw-count BH vs effectiveN BH (both reported;
+    // the raw-count BH stays the decision) + the deflated Sharpe summary.
+    trialsAware: MT_INFERENCE,
     formulas: {
       ev_divergence: 'DIVERGENCE=type_ret_diff; EVENT=abs>=2.0',
       RETURN: 'Close[t]/Close[t-w]-1 (past-only)',
@@ -4280,9 +4720,9 @@ OD.run = function (text, cfg, onLog, onProgress) {
       EXIT: `path SL=${cfg.sl}% TP=${cfg.tp}% hold=${cfg.hold} (SL-first on same-bar conflict)`,
     },
     sharpeDefs: {
-      TRADE_SHARPE: 'mean(trade)/std(trade)*sqrt(N) [trade unit]',
+      TRADE_SHARPE: 'mean(trade)/std(trade)*sqrt(N) [trade unit; SAMPLE std, ddof=1]',
       OOS_SHARPE: 'same on OOS trades only',
-      SURROGATE: 'label-permutation null; p=P(|surr|>=|obs|)',
+      SURROGATE: 'event-time permutation null: roll the event mask within (symbol, day) blocks over the untouched label series; p=P(|surr|>=|obs|)',
     },
   };
   } catch (err) {

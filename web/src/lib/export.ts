@@ -39,11 +39,25 @@ function dl(name: string, text: string) {
 export function exportBoard() {
   const st = useStore.getState();
   if (!st.board.length) { st.set({ alert: 'Nothing to export — run a grid search first.' }); return; }
-  let s = 'rank,timeframe,indicator,params,exit,carry,sl_pct,tp_pct,net_pnl,win_rate,trades,trades_per_day,profit_factor,max_dd,sharpe,sortino,expectancy,oos_net,oos_wr,oos_n,survived,oos_sharpe,oos_degr\n';
+  let s = 'rank,timeframe,indicator,params,exit,carry,sl_pct,tp_pct,net_pnl,win_rate,trades,trades_per_day,profit_factor,max_dd,sharpe,sortino,expectancy,oos_net,oos_wr,oos_n,survived,oos_sharpe,oos_degr,dsr,sr0,effective_n,validated,not_validated,fold_wins,fold_win_rate\n';
   st.board.forEach((r, i) => {
-    s += `${i + 1},${r.timeframe}m,${r.indicator},"${fmtParams(r.params)}",${r.exit || 'fixed'},${r.carry ? 1 : 0},${(r.slPct || 0).toFixed(3)},${(r.tpPct || 0).toFixed(3)},${r.m.netPnL.toFixed(2)},${r.m.winRate.toFixed(2)},${r.m.totalTrades},${(r.m.tradesPerDay || 0).toFixed(3)},${r.m.profitFactor.toFixed(3)},${r.m.maxDD.toFixed(3)},${r.m.sharpe.toFixed(3)},${r.m.sortino.toFixed(3)},${r.m.expectancy.toFixed(2)},${r.oosNet == null ? '' : r.oosNet.toFixed(2)},${r.oosWR == null ? '' : r.oosWR.toFixed(2)},${r.oosN == null ? '' : r.oosN},${r.survived == null ? '' : r.survived ? 1 : 0},${r.oosSharpe == null ? '' : r.oosSharpe.toFixed(3)},${r.oosDegr == null ? '' : r.oosDegr.toFixed(3)}\n`;
+    s += `${i + 1},${r.timeframe}m,${r.indicator},"${fmtParams(r.params)}",${r.exit || 'fixed'},${r.carry ? 1 : 0},${(r.slPct || 0).toFixed(3)},${(r.tpPct || 0).toFixed(3)},${r.m.netPnL.toFixed(2)},${r.m.winRate.toFixed(2)},${r.m.totalTrades},${(r.m.tradesPerDay || 0).toFixed(3)},${r.m.profitFactor.toFixed(3)},${r.m.maxDD.toFixed(3)},${r.m.sharpe.toFixed(3)},${r.m.sortino.toFixed(3)},${r.m.expectancy.toFixed(2)},${r.oosNet == null ? '' : r.oosNet.toFixed(2)},${r.oosWR == null ? '' : r.oosWR.toFixed(2)},${r.oosN == null ? '' : r.oosN},${r.survived == null ? '' : r.survived ? 1 : 0},${r.oosSharpe == null ? '' : r.oosSharpe.toFixed(3)},${r.oosDegr == null ? '' : r.oosDegr.toFixed(3)},${isFinite(r.dsr as number) ? (r.dsr as number).toFixed(5) : ''},${isFinite(r.sr0 as number) ? (r.sr0 as number).toFixed(4) : ''},${r.effectiveN == null ? '' : r.effectiveN},${r.validated == null ? '' : r.validated ? 1 : 0},"${(r.notValidated || []).join('; ')}",${r.foldWins == null ? '' : r.foldWins},${r.foldWinRate == null ? '' : r.foldWinRate.toFixed(3)}\n`;
   });
   dl('xbost_leaderboard.csv', s);
+}
+
+// LEADS pool: the full ranked discovery pool (validated AND unvalidated), so
+// the operator can audit every lead with its DSR and the exact reason it is
+// not validated.
+export function exportLeads() {
+  const st = useStore.getState();
+  const rows = st.leads || [];
+  if (!rows.length) { st.set({ alert: 'No LEADS pool — run a grid search first.' }); return; }
+  let s = 'rank,timeframe,indicator,params,exit,carry,sl_pct,tp_pct,trades,net_pnl,win_rate,profit_factor,max_dd,sharpe,composite,dsr,sr0,effective_n,survived,validated,not_validated\n';
+  rows.forEach((r, i) => {
+    s += `${i + 1},${r.timeframe}m,${r.indicator},"${fmtParams(r.params)}",${r.exit || 'fixed'},${r.carry ? 1 : 0},${(r.slPct || 0).toFixed(3)},${(r.tpPct || 0).toFixed(3)},${r.m.totalTrades},${r.m.netPnL.toFixed(2)},${r.m.winRate.toFixed(2)},${r.m.profitFactor.toFixed(3)},${r.m.maxDD.toFixed(3)},${r.m.sharpe.toFixed(3)},${(r.compositeScore || {}).composite ?? ''},${isFinite(r.dsr as number) ? (r.dsr as number).toFixed(5) : ''},${isFinite(r.sr0 as number) ? (r.sr0 as number).toFixed(4) : ''},${r.effectiveN == null ? '' : r.effectiveN},${r.survived == null ? '' : r.survived ? 1 : 0},${r.validated ? 1 : 0},"${(r.notValidated || []).join('; ')}"\n`;
+  });
+  dl('xbost_leads.csv', s);
 }
 
 export function exportTrades() {

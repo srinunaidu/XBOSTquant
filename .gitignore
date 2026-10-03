@@ -14,3 +14,7 @@ web/public/discovery-worker.js
 web/public/sample-banknifty-options.csv
 web/public/discovery-bundle.json
 Data test/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.pytest_tmp/

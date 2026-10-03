@@ -885,7 +885,7 @@ function runValidation(){
     const s1=E.buildSignals(d1m,{indicator:'EMA',params:{period:21}});
     const be=E.backtest(d1m,s1.pos,Object.assign({},eff,{exit:'breakeven',sessionMask:m1}));
     const at=E.backtest(d1m,s1.pos,Object.assign({},eff,{exit:'atr',sessionMask:m1}));
-    const hasBE=be.trades.some(t=>t.reason==='BE'), hasATR=at.trades.some(t=>t.reason==='ATR');
+    const hasBE=be.trades.some(t=>String(t.reason).replace(/_GAP$/,'')==='BE'), hasATR=at.trades.some(t=>String(t.reason).replace(/_GAP$/,'')==='ATR');
     if(be.trades.length+at.trades.length<10){
       out.push(`SKIP L5 legs need ≥10 trades, file gave ${be.trades.length+at.trades.length} — upload more sessions for a conclusive check`);skip++;
     } else ok('L5 breakeven + chandelier legs fire live',hasBE&&hasATR,`BE=${hasBE} ATR=${hasATR}`);

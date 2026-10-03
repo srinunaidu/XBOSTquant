@@ -74,13 +74,14 @@ def add_states(df, meta=None, type_diff_col="type_ret_diff", buckets=None):
                   if t0 else ["t1_dom", "t1_weak", "balanced", "t0_weak", "t0_dom"])
         df["b_type_dom"] = pd.cut(diff.fillna(0),
                                   bins=[-np.inf, -1, -0.2, 0.2, 1, np.inf], labels=labels)
-    def qbin(s):
-        try:
-            return pd.qcut(s, 5, labels=["vlow", "low", "mid", "high", "vhigh"], duplicates="drop")
-        except Exception:
-            return pd.cut(s, 5)
+    # CAUSAL regime bins: trailing percentile rank, never full-sample
+    # quantiles (qcut on the full sample leaks future information into
+    # past regime labels).
+    from .features import rolling_percentile
     df["b_vol_regime"] = df.groupby("symbol")["range_expansion"].transform(
-        lambda s: qbin(s.fillna(1)))
+        lambda s: pd.cut(rolling_percentile(s, 120, 30),
+                         bins=[-0.1, 20, 40, 60, 80, 100.1],
+                         labels=["vlow", "low", "mid", "high", "vhigh"]))
     df["b_vol"] = df.groupby("symbol")["volume_percentile"].transform(
         lambda s: pd.cut(s.fillna(50), bins=[-1, 25, 50, 75, 95, 101],
                          labels=["low_vol", "midlow", "midhigh", "high_vol", "shock"]))

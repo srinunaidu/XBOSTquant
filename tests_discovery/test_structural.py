@@ -55,7 +55,20 @@ def test_exit_propagation():
     m.iloc[0] = True
     bt = backtest(f, m, sl=1.5, tp=2.5, exit_mode="premium", cid="T")
     assert bt["CONFIG_FINGERPRINT"].str.contains("sl=1.5").all()
-    assert fingerprint("T", 1.5, 2.5, None, "premium") in bt["CONFIG_FINGERPRINT"].values
+    # CONFIG_FINGERPRINT is the IMMUTABLE config identity and is now STRICTLY
+    # richer than the base `fingerprint()` (it also pins trail kind/cfg and the
+    # stop/target type). So the base identity must be a PREFIX of every ledger
+    # row, one fingerprint per run, and a config change must change it.
+    _base = fingerprint("T", 1.5, 2.5, None, "premium")
+    _fp = bt["CONFIG_FINGERPRINT"]
+    assert _fp.nunique() == 1, _fp.unique().tolist()
+    assert _fp.str.startswith(_base).all(), _fp.iloc[0]
+    for _k in ("trail_kind=", "trail_cfg=", "stop_type=", "target_type="):
+        assert _k in _fp.iloc[0], f"fingerprint missing identity field {_k}"
+    _bt2 = backtest(f, m, sl=1.5, tp=2.5, exit_mode="premium", cid="T",
+                    target_type="ATR_MULT")
+    assert _bt2["CONFIG_FINGERPRINT"].iloc[0] != _fp.iloc[0], \
+        "config identity must change when stop/target config changes"
     assert set(["entry_time", "exit_time", "entry_price", "exit_price", "exit_reason",
                 "sl_config", "tp_config", "initial_sl", "initial_tp"]).issubset(bt.columns)
     _m = pd.Series(False, index=f.index)

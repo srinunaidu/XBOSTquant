@@ -227,20 +227,23 @@ function distributionQuality(trades){
   const mu=mean(pnls), med=median(pnls), s=sd(pnls,mu);
   return {mean:mu,median:med,sd:s,skewness:skewness(pnls,mu,s),kurtosis:kurtosis(pnls,mu,s),p5:percentile(pnls,0.05),p25:percentile(pnls,0.25),p50:percentile(pnls,0.50),p75:percentile(pnls,0.75),p95:percentile(pnls,0.95),p1:percentile(pnls,0.01),p10:percentile(pnls,0.10),p90:percentile(pnls,0.90),p99:percentile(pnls,0.99), parameters_locked:true, reoptimized:false};
 }
-function bootstrapCI(trades, iters){
+function bootstrapCI(trades, iters, seed){
   iters=iters||1000;
   const cap=capTrades(trades.map(t=>t.pnl));
   const pnls=cap.arr;
   if(!pnls.length) return {exp:{median:0,p5:0,p95:0}, sharpe:{median:0,p5:0,p95:0}, wr:{median:0,p5:0,p95:0}, capped:false, parameters_locked:true, reoptimized:false};
+  // SEEDED rng: Math.random() made bootstrap CIs non-reproducible and contradicted
+  // the deterministic _rng used by every other MC evidence in this file.
+  const rnd=_rng(seed==null?4242:seed);
   const exps=[], shs=[], wrs=[];
   for(let k=0;k<iters;k++){
-    const samp=[]; for(let i=0;i<pnls.length;i++) samp.push(pnls[Math.floor(Math.random()*pnls.length)]);
+    const samp=[]; for(let i=0;i<pnls.length;i++) samp.push(pnls[Math.floor(rnd()*pnls.length)]);
     const mu=mean(samp), pf=(()=>{let gp=0,gl=0;for(const p of samp) if(p>0) gp+=p; else gl+=-p; return gl>0?gp/gl:0;})();
     const rets=samp.map(p=>p/1000), s=sd(rets,mean(rets))||1e-9;
     exps.push(mu); shs.push(mu/1000/s*Math.sqrt(252)); wrs.push(samp.filter(p=>p>0).length/samp.length*100);
     void pf;
   }
-  return {exp:{median:median(exps),p5:percentile(exps,0.05),p95:percentile(exps,0.95)}, sharpe:{median:median(shs),p5:percentile(shs,0.05),p95:percentile(shs,0.95)}, wr:{median:median(wrs),p5:percentile(wrs,0.05),p95:percentile(wrs,0.95)}, capped:cap.capped, parameters_locked:true, reoptimized:false};
+  return {exp:{median:median(exps),p5:percentile(exps,0.05),p95:percentile(exps,0.95)}, sharpe:{median:median(shs),p5:percentile(shs,0.05),p95:percentile(shs,0.95)}, wr:{median:median(wrs),p5:percentile(wrs,0.05),p95:percentile(wrs,0.95)}, capped:cap.capped, seed:seed==null?4242:seed, parameters_locked:true, reoptimized:false};
 }
 function deflatedSharpe(observedSharpe, n, totalCombos){
   const trials=Math.max(1,totalCombos);
@@ -320,7 +323,7 @@ async function robustnessFor(d, candidate, baseOpts, datasets, totalCombos, rank
   const removalRegime=regimeRemoval(d,candidate.indicator,candidate.params,eff);
   let cross=null; if(datasets&&datasets.length>1){ const other=datasets.find(x=>x.d!==d); if(other) cross=crossMarketTransfer(d,other.d,candidate.indicator,candidate.params,eff,candidate.symbol||'A',other.symbol||'B'); }
   const walkForward={survived: rank&&rank<=25?1:0};
-  const bootstrap=bootstrapCI(trades, 1000);
+  const bootstrap=bootstrapCI(trades, 1000, (rank||1)*7919+13);
   const deflated=deflatedSharpe(baseline.sharpe, trades.length, totalCombos);
   const leakage=leakageAudit(d);
   const sampleGate=sampleSizeGate(trades.length);
@@ -448,29 +451,22 @@ function _ifft(re, im){
   const n=re.length;
   for(let i=0;i<n;i++){re[i]/=n;im[i]/=n;}
 }
-function _phaseRandomize(pnls, rnd){
-  const n0=pnls.length;
-  let n=1;while(n<n0)n<<=1;
-  const re=new Float64Array(n), im=new Float64Array(n);
-  const mu=mean(pnls);
-  for(let i=0;i<n0;i++)re[i]=pnls[i]-mu;
-  _fft(re,im);
-  // Randomize phases, preserve magnitudes; keep DC + Nyquist fixed.
-  for(let k=1;k<n/2;k++){
-    const mag=Math.sqrt(re[k]*re[k]+im[k]*im[k]);
-    const ph=rnd()*2*Math.PI;
-    re[k]=mag*Math.cos(ph);im[k]=mag*Math.sin(ph);
-    re[n-k]=re[k];im[n-k]=-im[k];
-  }
-  _ifft(re,im);
-  const out=new Array(n0);
-  for(let i=0;i<n0;i++)out[i]=re[i]+mu;
+function _signFlipSurrogate(pnls, rnd){
+  // Randomization null: trade returns are symmetric about zero. Flipping signs
+  // changes BOTH the mean and the sd, so — unlike permuting the same values, or
+  // phase-randomizing them (which preserves the power spectrum and hence mean and
+  // variance) — the statistic is NOT invariant under the null.
+  const out=new Array(pnls.length);
+  for(let i=0;i<pnls.length;i++)out[i]=rnd()<0.5?-pnls[i]:pnls[i];
   return out;
 }
 function surrogateTest(trades, nSurr, seed){
-  // Phase-randomized surrogates preserve the return spectrum/autocorrelation
-  // but destroy time-structure edge. p = fraction of surrogates with Sharpe
-  // ≥ observed. Real edge ⇒ p < 0.01; noise ⇒ p ≈ 0.5.
+  // Sign-flip randomization surrogate. p = (1 + #{|surrSharpe| >= |obsSharpe|})/(1+nSurr).
+  // The previous version phase-randomized the PnL vector: that preserves the power
+  // spectrum, hence mean and variance, and Sharpe is order-invariant, so p came out
+  // ≈ 0.5–1.0 regardless of edge. A returns-only surrogate cannot be an event-time
+  // permutation (no mask/labels here); the discovery engine uses the true
+  // event-time null (OD.surrogateMaskP) wherever mask + labels + blocks exist.
   nSurr=Math.max(20,Math.round(nSurr||100));
   const cap=capTrades((trades||[]).map(t=>t.pnl));
   const pnls=cap.arr;
@@ -481,11 +477,12 @@ function surrogateTest(trades, nSurr, seed){
   const rnd=_rng(seed==null?777:seed);
   let beat=0;
   for(let s=0;s<nSurr;s++){
-    const surr=_phaseRandomize(pnls,rnd);
+    const surr=_signFlipSurrogate(pnls,rnd);
     const m2=mean(surr), sd2=sd(surr,m2)||1e-9;
-    if(m2/sd2*Math.sqrt(252)>=obs)beat++;
+    if(Math.abs(m2/sd2*Math.sqrt(252))>=Math.abs(obs))beat++;
   }
-  return {p:+(beat/nSurr).toFixed(4), nSurr, observedSharpe:+obs.toFixed(3), skipped:false, capped:cap.capped, parameters_locked:true, reoptimized:false};
+  return {p:+((1+beat)/(1+nSurr)).toFixed(4), nSurr, observedSharpe:+obs.toFixed(3), skipped:false,
+    method:'sign-flip randomization', capped:cap.capped, parameters_locked:true, reoptimized:false};
 }
 function freeParamCount(candidate){
   // Total free parameters: numeric signal params + active risk/exit knobs.

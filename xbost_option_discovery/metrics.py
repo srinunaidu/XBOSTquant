@@ -9,6 +9,73 @@ NA = float("nan")
 def _fmt(x):
     return "NA" if x is None or (isinstance(x, float) and np.isnan(x)) else round(float(x), 6)
 
+def _perm_stat(v, kind):
+    v = np.asarray(v, dtype=float)
+    v = v[np.isfinite(v)]
+    if len(v) == 0:
+        return NA
+    if kind == "mean":
+        return float(v.mean())
+    if kind == "sharpe":
+        sd = v.std(ddof=1) if len(v) > 1 else np.nan
+        return float(v.mean() / sd * np.sqrt(len(v))) if np.isfinite(sd) and sd > 0 else NA
+    raise ValueError(f"unknown stat {kind!r}")
+
+
+def permutation_null(mask, labels, blocks=None, n_perm=200, seed=42, stat="mean",
+                     min_events=10):
+    """Event-time permutation null for a signal mask. THIS IS THE VALID
+    surrogate test: the signal->outcome link is destroyed by ROLLING THE
+    EVENT MASK in time inside each block; the label series is never touched.
+    Preserves event counts, label autocorrelation and intraday timing, so the
+    null answers exactly: does THIS event timing beat random timing?
+
+    (Permuting the return vector is a mathematical no-op — mean and std are
+    permutation-invariant — so the old returns-only surrogate degenerated to
+    noise. Use this instead.)
+
+    mask/labels: aligned arrays (labels is the full forward-return series).
+    blocks: group key per row, normally (symbol, day) - events roll WITHIN a
+    block so daily counts and session shape stay fixed.
+    """
+    m = np.asarray(mask, dtype=bool).ravel()
+    y = pd.to_numeric(pd.Series(np.asarray(labels).ravel()), errors="coerce").to_numpy(dtype=float)
+    n = len(y)
+    if len(m) != n:
+        raise ValueError(f"mask/labels length mismatch: {len(m)} != {n}")
+    if blocks is None:
+        blocks = np.zeros(n, dtype=int)
+    blocks = np.asarray(blocks).ravel()
+    if len(blocks) != n:
+        raise ValueError("blocks must be aligned with mask")
+    n_ev = int(m.sum())
+    obs = _perm_stat(y[m], stat)
+    out = {"observed": obs, "p_value": NA, "null_mean": NA, "null_sd": NA,
+           "observed_percentile": NA, "n_perm": 0, "n_events": n_ev, "stat": stat}
+    if n_ev < min_events or not np.isfinite(obs):
+        return out
+    pos_by_block = {b: np.flatnonzero(blocks == b) for b in pd.unique(blocks)}
+    pos_by_block = {b: p for b, p in pos_by_block.items() if m[p].any()}
+    if not pos_by_block:
+        return out
+    rng = np.random.default_rng(seed)
+    null = np.empty(n_perm, dtype=float)
+    for k in range(n_perm):
+        pm = np.zeros(n, dtype=bool)
+        for pos in pos_by_block.values():
+            nb = len(pos)
+            sel = m[pos]
+            pm[pos] = np.roll(sel, int(rng.integers(1, nb))) if nb > 1 else sel
+        null[k] = _perm_stat(y[pm], stat)
+    fin = null[np.isfinite(null)]
+    if len(fin) == 0:
+        return out
+    p = float((np.sum(np.abs(fin) >= abs(obs)) + 1) / (len(fin) + 1))
+    out.update({"p_value": p, "null_mean": float(fin.mean()), "null_sd": float(fin.std()),
+                "observed_percentile": float((fin < obs).mean() * 100), "n_perm": int(len(fin))})
+    return out
+    return "NA" if x is None or (isinstance(x, float) and np.isnan(x)) else round(float(x), 6)
+
 SHARPE_DEFS = {
     "TRADE_SHARPE": {"formula": "mean(trade_rets)/std(trade_rets)*sqrt(N_trades)",
                      "sample_unit": "trade", "annualization": "none (trade-count scaled)",
@@ -47,10 +114,11 @@ def calculate_trade_metrics(trades: pd.DataFrame) -> dict:
     pf = float(pos.sum() / -neg.sum()) if len(neg) and neg.sum() != 0 else (float("inf") if len(pos) else NA)
     payoff = float(avg_w / abs(avg_l)) if pd.notna(avg_w) and pd.notna(avg_l) and avg_l != 0 else NA
     ts = float(r.mean() / r.std() * np.sqrt(n)) if n >= 2 and r.std() not in (0, None) and not np.isnan(r.std()) else NA
-    dn = r[r < 0].std()
-    sort = float(r.mean() / dn * np.sqrt(n)) if n >= 2 and pd.notna(dn) and dn not in (0,) else NA
-    eq = r.cumsum()
-    mdd = float((eq - eq.cummax()).min()) if n else NA
+    dd = r[r < 0]
+    downside = float(np.sqrt((np.minimum(r, 0) ** 2).mean())) if n else NA
+    sort = float(r.mean() / downside * np.sqrt(n)) if n >= 2 and pd.notna(downside) and downside not in (0,) else NA
+    eq = (1 + r / 100).cumprod()
+    mdd = float(((eq - eq.cummax()) / eq.cummax() * 100).min()) if n else NA
     mae = float(pd.to_numeric(trades["mae"], errors="coerce").mean()) if "mae" in trades else NA
     mfe = float(pd.to_numeric(trades["mfe"], errors="coerce").mean()) if "mfe" in trades else NA
     if "mae" in trades and pd.to_numeric(trades["mae"], errors="coerce").isna().all():
@@ -87,10 +155,14 @@ def metric_recalculation_test(reported: dict, trades: pd.DataFrame, tol=1e-6) ->
     return {"METRIC_INTEGRITY": "PASS" if ok else "FAIL", "differences": diffs,
             "recalculated": {k: _fmt(v) for k, v in re.items()}}
 
-def label_metrics(vals) -> dict:
+def label_metrics(vals, surrogate_p=None) -> dict:
     """Discovery-question metrics on FORWARD LABELS (no exit grid).
     This is the primary research quantity: does the observable state at t predict
-    forward option-premium behaviour? Path-exit P&L is secondary trade construction."""
+    forward option-premium behaviour? Path-exit P&L is secondary trade construction.
+
+    surrogate_p must come from permutation_null(mask, labels, blocks) — a
+    returns-only p cannot be formed (permuting returns is a no-op), so no p
+    is derived internally; pass it explicitly or leave NA."""
     r = pd.Series(list(vals), dtype="float64").dropna()
     n = int(len(r))
     if n == 0:
@@ -99,10 +171,14 @@ def label_metrics(vals) -> dict:
     pos = r[r > 0]; neg = r[r < 0]
     pf = float(pos.sum() / -neg.sum()) if len(neg) and neg.sum() != 0 else NA
     ts = float(r.mean() / r.std() * np.sqrt(n)) if n >= 2 and r.std() not in (0, None) and not np.isnan(r.std()) else NA
-    sg = surrogate_stats(r)
+    sp = NA
+    try:
+        sp = float(surrogate_p) if surrogate_p is not None and surrogate_p == surrogate_p else NA
+    except (TypeError, ValueError):
+        sp = NA
     return {"n": n, "WR": float((r > 0).mean()), "expectancy": float(r.mean()),
             "median": float(r.median()), "TRADE_SHARPE": ts, "PF": pf,
-            "surrogate_p": float(sg["p_value"]) if pd.notna(sg["p_value"]) else NA}
+            "surrogate_p": sp}
 
 def cap_dominance(ledger) -> dict:
     """Detect knife-edge exit-grid dominance (§25). If winners/losers are pinned to the
@@ -129,7 +205,8 @@ def daily_sharpe(rets, days):
 
 def bootstrap_sharpe(rets, n_boot=500, seed=42):
     rng = np.random.default_rng(seed)
-    r = pd.Series(list(rets)).dropna().values
+    r = pd.to_numeric(pd.Series(list(rets)), errors="coerce").dropna().values
+    r = r[np.isfinite(r)]
     if len(r) < 10:
         return {"BOOTSTRAP_SHARPE": NA, "bootstrap_ci": ("NA", "NA"), "_def": SHARPE_DEFS["BOOTSTRAP_SHARPE"]}
     boots = []
@@ -177,16 +254,15 @@ def expectancy_ci(rets, n_boot=500, seed=42):
 
 
 def surrogate_stats(rets, n_perm=200, seed=42):
-    rng = np.random.default_rng(seed)
-    r = pd.Series(list(rets)).dropna().values
-    if len(r) < 10:
-        return {"SURROGATE_SHARPE": NA, "p_value": NA, "observed_percentile": NA,
-                "_def": SHARPE_DEFS["SURROGATE_SHARPE"]}
-    obs = float(np.mean(r) / (np.std(r) + 1e-9) * np.sqrt(len(r)))
-    surr = np.array([float(np.mean(p) / (np.std(p) + 1e-9) * np.sqrt(len(p)))
-                     for p in (rng.permutation(r) for _ in range(n_perm))])
-    p = float((np.sum(np.abs(surr) >= abs(obs)) + 1) / (n_perm + 1))
-    return {"SURROGATE_SHARPE": obs, "surrogate_mean": float(surr.mean()),
-            "surrogate_sd": float(surr.std()), "observed_percentile": float((surr < obs).mean() * 100),
-            "p_value": p, "_def": SHARPE_DEFS["SURROGATE_SHARPE"],
-            "note": "differs from TRADE_SHARPE because it is the null distribution under label permutation; high raw + p~0.9 means effect is not distinguishable from noise"}
+    """DEPRECATED and retained only to fail loudly.
+
+    A returns-only surrogate cannot be built: without the signal there is
+    no null to permute, and permuting the returns is a mathematical no-op
+    (mean and std are permutation-invariant, so p degenerated to noise).
+    Use permutation_null(mask, labels, blocks) instead.
+    """
+    return {"SURROGATE_SHARPE": NA, "p_value": NA, "observed_percentile": NA,
+            "n_perm": 0, "_def": SHARPE_DEFS["SURROGATE_SHARPE"],
+            "deprecated": True,
+            "note": ("REMOVED: permuting the return vector cannot form a null. "
+                     "Use metrics.permutation_null(mask, labels, blocks).")}

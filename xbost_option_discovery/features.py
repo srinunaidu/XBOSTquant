@@ -7,6 +7,40 @@ FEATURE_COUNT = {"n": 0}
 def _bump(n=1):
     FEATURE_COUNT["n"] += n
 
+
+def session_keys(df):
+    """Grouping key for rolling windows: (symbol, session date). Rolling
+    windows and shifts reset at session boundaries so windows never span
+    overnight gaps."""
+    return [df["symbol"].astype(str),
+            pd.to_datetime(df["timestamp"]).dt.normalize()]
+
+
+def rolling_percentile(x, window, min_periods=None):
+    """Percentile rank of the CURRENT value inside the trailing `window`
+    bars, INCLUSIVE of the current bar. Strictly causal (bars <= t only).
+
+    Replaces `s.shift(1).rolling(H).apply(lambda w: (w <= w.iloc[-1]))`,
+    which dropped the current bar from its own reference window (describing
+    bar t-1, not t) and ran Python-level .apply per row."""
+    s = pd.to_numeric(pd.Series(x), errors="coerce")
+    v = s.to_numpy(dtype=float)
+    n = len(v)
+    out = np.full(n, np.nan)
+    if n and window >= 1:
+        w = min(int(window), n)
+        mp = int(min_periods) if min_periods else max(2, w // 4)
+        from numpy.lib.stride_tricks import sliding_window_view
+        sw = sliding_window_view(v, w)
+        last = sw[:, -1]
+        fin = np.isfinite(sw).sum(axis=1)
+        with np.errstate(invalid="ignore"):
+            cnt = np.sum(sw <= last[:, None], axis=1)
+        ok = np.isfinite(last) & (fin >= mp)
+        out[w - 1:] = np.where(ok, cnt / np.maximum(fin, 1) * 100.0, np.nan)
+        out[:w - 1] = np.nan
+    return pd.Series(out, index=s.index)
+
 def add_raw(df, H=120):
     df = df.sort_values(["symbol", "timestamp"]).copy()
     g = df.groupby("symbol", group_keys=False)

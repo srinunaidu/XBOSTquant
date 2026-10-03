@@ -16,6 +16,9 @@ class DiscoverySettings:
     option_types: list = field(default_factory=list)
     # timeframe (§6)
     timeframe: str = "RAW"          # RAW or e.g. 5m
+    align_grid: bool = False       # session-grid alignment (available, opt-in)
+    grid_freq: str = "1min"
+    min_joint_snapshots: int = 200  # honest synchronization gate threshold
     # liquidity/quality filters
     min_price: float = 0.0
     max_price: float = 1e12
@@ -28,14 +31,33 @@ class DiscoverySettings:
     divergence_threshold: float = 2.0
     min_events: int = 50
     cluster_minutes: int = 3
+    surrogate_perms: int = 200
     max_sequence_length: int = 3
     focus_strikes: int = 3
     lag_windows: tuple = (1, 2, 3, 5, 10)
+    allow_short: bool = False       # short-premium variants (opt-in)
     # validation (§24)
     train_frac: float = 0.5
     validation_frac: float = 0.2
     oos_frac: float = 0.3
+    embargo_days: int = 0         # serial-correlation guard (0 = off)
     min_oos_events: int = 20
+    paper_min_oos_events: int = 20
+    cv_folds: int = 0               # purged K-fold OOS (0 = single split)
+    dsr_threshold: float = 0.95
+    min_fold_win_rate: float = 0.6
+    corr_threshold: float = 0.99
+    use_effective_n: bool = True
+    hierarchical_fdr_alpha: float = 0.10
+    # execution economics (RESEARCH_PRICE_MODEL default: costs informational)
+    cost_mode: str = "ZERO"        # ZERO | REALISTIC
+    cost_preset: str = "BANKNIFTY_OPT"
+    lot_size: int = 15
+    slippage_bps: float = 5.0
+    brokerage_per_order: float = 20.0
+    capital: float = 500000.0
+    entry_fill: str = "close"       # close | next_open
+    eod_square_off: bool = False
     # search controller (§4/§5/§44/§45): HARD SAFETY LIMITS, not stop targets
     maxRounds: int = 24
     maxTotalCandidates: int = 500

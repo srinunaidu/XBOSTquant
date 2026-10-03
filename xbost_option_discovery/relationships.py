@@ -58,8 +58,9 @@ def add_crossstrike(df, meta, strikes):
     """Per-option-type, per-expiry strike spreads for every discovered option type."""
     df = df.copy()
     REGISTRY["x_cols"] = []
-    ts = df["timestamp"]
+    REGISTRY["x_failures"] = []
     strikes = [str(s) for s in strikes]
+    new_cols = {}
     for exp, gexp in df.groupby(df["expiry"].astype(str)):
         tag = "" if len(meta["expiries"]) <= 1 else f"_{exp}"
         for otype in meta["option_types"]:
@@ -70,36 +71,59 @@ def add_crossstrike(df, meta, strikes):
                           ("volume", "volspread"), ("range", "rngspread")]:
                 try:
                     wp = sub.pivot_table(index="timestamp", columns="strike", values=f, aggfunc="first")
-                    for i in range(len(strikes)):
-                        for j in range(i + 1, len(strikes)):
-                            sa, sb = str(strikes[i]), str(strikes[j])
-                            if sa in wp.columns and sb in wp.columns:
-                                col = f"x_{otype}_{sa}_{sb}_{fn}{tag}"
-                                df[col] = ts.map(wp[sa] - wp[sb])
-                                REGISTRY["x_cols"].append(col)
-                                REL_COUNT["n"] += 1
-                except Exception:
+                except Exception as ex:
+                    REGISTRY["x_failures"].append(f"{otype}{tag}:{fn}:{type(ex).__name__}")
                     continue
+                for i in range(len(strikes)):
+                    for j in range(i + 1, len(strikes)):
+                        sa, sb = str(strikes[i]), str(strikes[j])
+                        if sa in wp.columns and sb in wp.columns:
+                            col = f"x_{otype}_{sa}_{sb}_{fn}{tag}"
+                            spread = wp[sa] - wp[sb]
+                            # Assign ONLY to this (expiry, option-type) group:
+                            # writing ts.map(spread) across the frame would smear
+                            # expiry A's spread onto expiry B rows.
+                            vals = pd.Series(np.nan, index=df.index, dtype="float64")
+                            vals.loc[gexp.index] = pd.Index(
+                                gexp["timestamp"]).map(spread).to_numpy()
+                            new_cols[col] = vals
+                            REGISTRY["x_cols"].append(col)
+                            REL_COUNT["n"] += 1
+    # concat ONCE: assigning each spread column individually fragments the
+    # frame (DataFrame is highly fragmented) and dominated pipeline runtime.
+    if new_cols:
+        df = pd.concat([df, pd.DataFrame(new_cols, index=df.index)], axis=1)
     return df
 
 
 def add_breadth(df, meta):
-    """Breadth over every discovered option type (no fixed CE/PE assumption)."""
+    """Breadth over every discovered option type (no fixed CE/PE assumption).
+
+    Breadth is a PERCENTAGE of contracts present at that timestamp (raw
+    counts kept as *_breadth / breadth_diff_count for audit); count
+    denominators change through the session, so count-diffs are not
+    comparable across timestamps."""
     df = df.copy()
     REGISTRY["breadth_cols"] = []
+    otypes = list(meta["option_types"])
 
     def _b(g):
         out = {}
-        for ot in meta["option_types"]:
-            s = g[g["option_type"] == ot]
-            out[f"{ot}_basket_ret"] = s["return_5"].mean()
-            out[f"{ot}_breadth"] = (s["return_5"] > 0).sum()
-            out[f"{ot}_vol_breadth"] = (s["volume_percentile"] > 70).sum() if "volume_percentile" in s else 0
-        if len(meta["option_types"]) >= 2:
-            o0, o1 = meta["option_types"][0], meta["option_types"][1]
-            out["breadth_diff"] = out.get(f"{o0}_breadth", 0) - out.get(f"{o1}_breadth", 0)
+        for ot in otypes:
+            r = g.loc[g["option_type"] == ot, "return_5"].dropna()
+            out[f"{ot}_n"] = int(len(r))
+            out[f"{ot}_basket_ret"] = float(r.mean()) if len(r) else np.nan
+            out[f"{ot}_breadth"] = int((r > 0).sum())
+            out[f"{ot}_breadth_pct"] = float((r > 0).mean() * 100.0) if len(r) else np.nan
+            out[f"{ot}_vol_breadth"] = int((g.loc[g["option_type"] == ot, "volume_percentile"] > 70).sum()) if "volume_percentile" in g else 0
+        if len(otypes) >= 2:
+            o0, o1 = otypes[0], otypes[1]
+            b0, b1 = out.get(f"{o0}_breadth_pct"), out.get(f"{o1}_breadth_pct")
+            out["breadth_diff"] = (b0 - b1) if (pd.notna(b0) and pd.notna(b1)) else np.nan
+            out["breadth_diff_count"] = out.get(f"{o0}_breadth", 0) - out.get(f"{o1}_breadth", 0)
         else:
-            out["breadth_diff"] = 0
+            out["breadth_diff"] = np.nan
+            out["breadth_diff_count"] = 0
         return pd.Series(out)
 
     b = df.groupby("timestamp").apply(_b, include_groups=False)

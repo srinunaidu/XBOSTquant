@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { useStore } from '../lib/store';
 import { logout } from '../lib/api';
 import { runGrid, stopRun } from '../lib/runner';
-import { exportBoard, exportTrades } from '../lib/export';
+import { exportBoard, exportLeads, exportTrades } from '../lib/export';
 
 function useHashRoute() {
   const [r, setR] = useState(() => location.hash.replace(/^#\/?/, ''));
@@ -45,6 +45,7 @@ export default function Header() {
         </span>
         <button className="btn-ghost btn-xs" onClick={() => exportTrades()}>⬇ Trades CSV</button>
         <button className="btn-ghost btn-xs" onClick={() => exportBoard()}>⬇ Board CSV</button>
+        <button className="btn-ghost btn-xs" onClick={() => exportLeads()}>⬇ Leads CSV</button>
         {!onHome && (!running
           ? <button className="btn-run" onClick={() => runGrid()}>▶ RUN GRID SEARCH</button>
           : <button className="btn-ghost btn-xs" onClick={() => stopRun()}>■ STOP</button>)}

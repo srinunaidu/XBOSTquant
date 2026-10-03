@@ -43,6 +43,11 @@ function rowToObj(r: BoardRow, ix: number, th: number, cost: number, signalOnly:
     surr, pss,
     paper: gate.eligible ? 'PAPER' : '—',
     paperWhy: gate.eligible ? '' : gate.reasons.join('; '),
+    // Trials-aware inference: deflated Sharpe vs the best-of-N null bar.
+    dsr: (typeof r.dsr === 'number' && isFinite(r.dsr)) ? r.dsr : null,
+    sr0: (typeof r.sr0 === 'number' && isFinite(r.sr0)) ? r.sr0 : null,
+    validated: r.validated ? '✓' : '—',
+    valWhy: r.validated ? '' : (r.notValidated || []).join('; '),
     rawRank: r.rawRank ?? null,
     score: r.compositeScore ? r.compositeScore.composite : null,
     tier: r.compositeScore ? r.compositeScore.tier : '',
@@ -106,12 +111,33 @@ const COLS = [
       : { color: '#5b5b66' }),
   },
   { field: 'rawRank', headerName: 'Raw#', width: 64, type: 'rightAligned' },
+  {
+    field: 'validated', headerName: 'Valid', width: 66,
+    cellStyle: (p: any) => (p.value === '✓'
+      ? { color: '#04120a', background: '#22ff88', fontWeight: 800 }
+      : { color: '#5b5b66' }),
+  },
+  {
+    field: 'dsr', headerName: 'DSR', width: 84, type: 'rightAligned',
+    valueFormatter: (p: any) => (p.value == null ? '' : (+p.value).toFixed(3)),
+    cellStyle: (p: any) => (p.value == null ? {} : { color: p.value >= 0.95 ? '#22ff88' : p.value >= 0.5 ? '#fbbf24' : '#fb4d6d' }),
+  },
+  {
+    field: 'sr0', headerName: 'Bar σ', width: 78, type: 'rightAligned',
+    valueFormatter: (p: any) => (p.value == null ? '' : (+p.value).toFixed(3)),
+  },
+  {
+    field: 'valWhy', headerName: 'Not validated because', minWidth: 220, flex: 2,
+    cellStyle: { color: '#8b8b96' },
+  },
   { field: 'score', headerName: 'Score', width: 78, type: 'rightAligned', valueFormatter: (p: any) => (p.value == null ? '' : (+p.value).toFixed(3)) },
   { field: 'tier', headerName: 'Tier', width: 110 },
 ];
 
 export default function Leaderboard() {
   const board = useStore(s => s.board);
+  const leads = useStore(s => s.leads);
+  const validatedBoard = useStore(s => s.validatedBoard);
   const view = useStore(s => s.view);
   const set = useStore(s => s.set);
   const boardFilter = useStore(s => s.boardFilter);
@@ -123,11 +149,16 @@ export default function Leaderboard() {
 
   const minTrH = useStore(s => s.minTradesBoard);
   const researchObjSel = useStore(s => s.researchObj);
+  const inference = useStore(s => s.inference);
+  const dsrThreshold = useStore(s => s.dsrThreshold);
   const rows = useMemo(() => {
     const q = boardFilter.toLowerCase();
     const minTr = useStore.getState().minTradesBoard || 0;
     let hidden = 0;
-    let list = board.filter(r => {
+    // LEADS / VALIDATED are their own pools (already composite-ranked by the
+    // runner); every other view works on the display board.
+    const src = view === 'leads' ? leads : view === 'validated' ? validatedBoard : board;
+    let list = src.filter(r => {
       if ((r.m?.totalTrades || 0) < minTr) { hidden++; return false; }
       return !q || (r.symbol + ' ' + r.indicator + ' ' + r.timeframe + ' ' + fmtParams(r.params) + ' ' + (r.exit || '') + (r.carry ? ' carry' : '')).toLowerCase().includes(q);
     });
@@ -155,14 +186,14 @@ export default function Leaderboard() {
     }
     return { rows: list.map((r, i) => rowToObj(r, i, paperThreshold ?? 9.5, costNow, signalOnly)), hidden };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [board, view, boardFilter, objective, paperThreshold, costNow, signalOnly, minTrH]);
+  }, [board, leads, validatedBoard, view, boardFilter, objective, paperThreshold, costNow, signalOnly, minTrH]);
 
   return (
     <section className="card p-3">
       <div className="flex flex-wrap items-center gap-2 mb-2">
-        <div className="font-display font-semibold text-[14px] tracking-tight">🏆 Master Leaderboard <span className="text-zinc-500 font-normal text-xs">— {view === 'all' ? '★ composite-ranked final selection (thin rows retained below)' : 'click any row to load it on the charts'}</span></div>
+        <div className="font-display font-semibold text-[14px] tracking-tight">🏆 Master Leaderboard <span className="text-zinc-500 font-normal text-xs">— {view === 'all' ? '★ composite-ranked final selection (thin rows retained below)' : view === 'leads' ? '🎯 ranked discovery pool (validated AND unvalidated — DSR shown)' : view === 'validated' ? '✅ dsr ≥ threshold AND OOS survived' : 'click any row to load it on the charts'}</span></div>
         <div className="flex gap-1 ml-2">
-          {([['all', '📋 All results'], ['best', '🏆 Best per indicator'], ['res', '🔬 Research'], ['cmp', '⚖ Compare exits']] as const).map(([v, l]) => (
+          {([['all', '📋 All results'], ['leads', '🎯 Leads'], ['validated', '✅ Validated'], ['best', '🏆 Best per indicator'], ['res', '🔬 Research'], ['cmp', '⚖ Compare exits']] as const).map(([v, l]) => (
             <button key={v} onClick={() => set({ view: v })}
               className={view === v ? 'btn-run !py-1 !px-2.5 !text-[11px]' : 'btn-ghost btn-xs'}>{l}</button>
           ))}
@@ -180,6 +211,8 @@ export default function Leaderboard() {
           className="ml-auto !text-xs !py-1.5 px-2 w-52" />
       </div>
       {view === 'best' && <div className="text-[11px] text-green-300 num mb-2">★ One champion row per indicator for the current objective — full details in every column.</div>}
+      {view === 'leads' && <div className="text-[11px] text-emerald-300 num mb-2">🎯 Ranked discovery pool (top {inference?.leadsN ?? leads.length}) — INCLUDES rows that fail validation, with the exact reason. DSR = deflated Sharpe after accounting for the {inference?.trialCount ?? '?'} configurations searched; best-of-N null bar = {inference?.benchmark == null ? '?' : (inference.benchmark as number).toFixed(3)}σ, effective hypotheses = {inference?.effectiveN ?? '?'}.</div>}
+      {view === 'validated' && <div className="text-[11px] text-green-300 num mb-2">✅ VALIDATED = dsr ≥ {dsrThreshold ?? 0.95} AND OOS survived ({validatedBoard.length} rows). The naive score/tier gate is EXPLORATORY only and never appears here.</div>}
       {view === 'res' && <WhyNot />}
       {rows.hidden > 0 && view !== 'cmp' && <div className="text-[11px] text-amber-300 num mb-2">⚠ {rows.hidden} thin rows hidden (&lt; {minTrH} trades) — lower the board filter to inspect them.</div>}
       {view === 'cmp' ? (

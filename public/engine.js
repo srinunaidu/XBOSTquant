@@ -1660,8 +1660,8 @@ function validateLayers(d, o){
   if(o.exits){
     const sig=o.exits.sig, bt=o.exits.bt;
     if(bt&&bt.trades.length>=20){
-      const tpN=bt.trades.filter(t=>t.reason==='TP').length;
-      const slN=bt.trades.filter(t=>['SL','BE','ATR','CK','TRAIL'].indexOf(t.reason)>=0).length;
+      const tpN=bt.trades.filter(t=>t.reason==='TP'||t.reason==='TP_GAP').length;
+      const slN=bt.trades.filter(t=>['SL','BE','ATR','CK','TRAIL'].indexOf(String(t.reason).replace(/_GAP$/,''))>=0).length;
       let avgWin=0,nw=0;
       for(const t of bt.trades)if(t.pnl>0){avgWin+=t.pnl;nw++;}
       avgWin=nw?avgWin/nw:0;
@@ -1990,14 +1990,26 @@ function backtest(d, sigPos, opts){
       if(stopHit||flip||flatSignal||lastBar){
         let exitPx=(fillNext&&!stopHit&&!lastBar)?ox:px;
         if(stopHit){
-          if(reason==='SL')exitPx=position===1?entryPx*(1-slPct):entryPx*(1+slPct);
-          else if(reason==='BE')exitPx=position===1?entryPx*(1+beLock):entryPx*(1-beLock);
-          else if(reason==='ATR')exitPx=position===1?(hiEntry-atrMult*atrArr[i]):(loEntry+atrMult*atrArr[i]);
-          else if(reason==='CK')exitPx=position===1?ckArr.longStop[i]:ckArr.shortStop[i];
-          else if(reason==='TP')exitPx=position===1?entryPx*(1+tpPct):entryPx*(1-tpPct);
-          else if(reason==='ATRTP'){const k2=opts.atrTpMult||3, ae2=atrEntryPx>0?atrEntryPx:(atrArr?atrArr[i]:0);exitPx=position===1?entryPx+k2*ae2:entryPx-k2*ae2;}
-          else if(reason==='TIME')exitPx=px; // time stop: known only at bar close
-          else exitPx=position===1?trailPeak*(1-trailPct):trough*(1+trailPct);
+          // Resolve the synthetic level for this exit reason, then GAP-FILL:
+          // the trigger only proves the bar's range TOUCHED the level. If the bar
+          // OPENED beyond it, a resting order cannot fill at the level — a stop
+          // gaps through to the worse open, a target to the better open. Only when
+          // the bar opens INSIDE the level do we fill at the level (correct
+          // intrabar assumption). Reason is suffixed `_GAP` so the ledger shows it.
+          let lvl=NaN, isTarget=false;
+          if(reason==='SL')lvl=position===1?entryPx*(1-slPct):entryPx*(1+slPct);
+          else if(reason==='BE')lvl=position===1?entryPx*(1+beLock):entryPx*(1-beLock);
+          else if(reason==='ATR')lvl=position===1?(hiEntry-atrMult*atrArr[i]):(loEntry+atrMult*atrArr[i]);
+          else if(reason==='CK')lvl=position===1?ckArr.longStop[i]:ckArr.shortStop[i];
+          else if(reason==='TP'){isTarget=true;lvl=position===1?entryPx*(1+tpPct):entryPx*(1-tpPct);}
+          else if(reason==='ATRTP'){isTarget=true;const k2=opts.atrTpMult||3, ae2=atrEntryPx>0?atrEntryPx:(atrArr?atrArr[i]:0);lvl=position===1?entryPx+k2*ae2:entryPx-k2*ae2;}
+          else if(reason==='TIME')lvl=px; // time stop: known only at bar close
+          else lvl=position===1?trailPeak*(1-trailPct):trough*(1+trailPct); // TRAIL
+          exitPx=lvl;
+          if(reason!=='TIME'&&isFinite(lvl)&&isFinite(ox)){
+            const gappedOpen=isTarget?(position===1?ox>lvl:ox<lvl):(position===1?ox<lvl:ox>lvl);
+            if(gappedOpen){exitPx=ox;reason=reason+'_GAP';}
+          }
         }
         const units=qty*lotSize;
         let pnl=(position===1?(exitPx-entryPx):(entryPx-exitPx))*units - costPerTrade;
@@ -2009,7 +2021,7 @@ function backtest(d, sigPos, opts){
         // (no point burning 1M-bar loops for a dead parameter set).
         if(liveEq<=0){ruined=true;for(let j=i;j<n;j++)eqMtm[j]=liveEq;lastExitBar=i;break;}
         // immediate re-entry on flip (mask already enforced via tgt)
-        if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&(!opts.premiumFloor||!(fillPx<opts.premiumFloor))&&!expired){
+        if(!trigOnly&&flip&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&fillPx>0&&(!opts.premiumFloor||!(fillPx<opts.premiumFloor))&&!expired){
           position=tgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=units;barsHeld=0;
           atrEntryPx=(atrArr&&isFinite(atrArr[i]))?atrArr[i]:0;
           hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
@@ -2021,7 +2033,9 @@ function backtest(d, sigPos, opts){
     } else {
       const allowEntry=!trigOnly||(edge&&i>lastExitBar);
       const premOk=!opts.premiumFloor||!(fillPx<opts.premiumFloor); // options: never buy dust (sub-floor premium)
-      if(!noSig&&actTgt!==0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry&&premOk&&!expired){
+      // GUARD: a zero/negative entry price makes pnlPct non-finite and the trade
+      // meaningless (the discovery engine's backtest classifies this as ZERO_ENTRY).
+      if(!noSig&&actTgt!==0&&fillPx>0&&(!useMask||useMask[i])&&(!tmask||tmask[i])&&!ruined&&allowEntry&&premOk&&!expired){
         position=actTgt;entryPx=fillPx;entryIdx=i;trailPeak=fillPx;trough=fillPx;curQty=qty*lotSize;barsHeld=0;
         atrEntryPx=(atrArr&&isFinite(atrArr[i]))?atrArr[i]:0;
         hiEntry=d.h[i];loEntry=d.l[i];beDone=false;trMAE=0;trMFE=0;
@@ -2317,10 +2331,17 @@ function _cholSolve(L,b){
 }
 function _nPdf(z){return Math.exp(-0.5*z*z)/Math.sqrt(2*Math.PI);}
 function _nCdf(z){
-  const s=z<0?-1:1,a=Math.abs(z),t=1/(1+0.3275911*a);
+  // Phi(z) = 0.5*(1 + erf(z/sqrt(2))). The Abramowitz & Stegun 7.1.26 series
+  // below approximates erf(x) (|err| ≤ 1.5e-7), so its argument MUST be
+  // |z|/sqrt(2) — feeding |z| computes Phi(z*sqrt(2)) and inflates every tail
+  // probability (worst exactly where a significance test decides). It also keeps
+  // exp(-a^2) = exp(-z^2/2) consistent with the normal density used by _nPdf.
+  const s=z<0?-1:1,a=Math.abs(z)/Math.SQRT2,t=1/(1+0.3275911*a);
   const y=1-((((1.061405429*t-1.453152027)*t+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-a*a);
   return 0.5*(1+s*y);
 }
+// Phi(z) used by PSR/DSR; exported so tests can pin it against known values.
+function normCdf(z){return _nCdf(z);}
 function bayesianRefine(rows, stepsByInd, nPropose){
   // rows: evaluated BoardRows with .m.sharpe. Returns NEW cfg objects
   // (caller must testCfg them). Rows with <10 trades are ignored.
@@ -2761,6 +2782,210 @@ function sharpeReliability(n){
   if(n>=10)return 'MEDIUM';
   return 'LOW';
 }
+// ---------- Trials-aware statistical inference (multiple-testing correction) ----------
+// A grid search is a MASSIVE multiple test: we report the BEST of N trials, so
+// the null distribution of that maximum must be subtracted before any row can
+// be called validated. Formulas mirror the Python package xbost_option_discovery
+// exactly, from:
+//   · Bailey & López de Prado, "The Deflated Sharpe Ratio: Correcting for
+//     Selection Bias, Backtest Overfitting and Non-Normality", J. Portfolio
+//     Management 40(5), 2014 — PSR (eq. 5-6) and DSR (eq. 9).
+//   · Bailey, Borwein, López de Prado & Zhu, "Pseudo-Mathematics and Financial
+//     Charlatanism", Notices of the AMS 61(5), 2014, eq. (3)-(4) — E[max] of N
+//     i.i.d. normal Sharpes.
+// Every function here is pure and deterministic; no dependencies.
+
+const EULER_GAMMA = 0.5772156649015329; // Euler-Mascheroni γ
+
+// Phi^-1: Acklam's rational approximation of the inverse normal CDF
+// (P. Acklam, "An algorithm for computing the inverse normal cumulative
+// distribution function", 2000). |relative error| < 1.15e-9 over (0,1).
+function normInv(p){
+  if(typeof p!=='number'||p!==p)return NaN;
+  if(p<=0)return -Infinity;
+  if(p>=1)return Infinity;
+  const a=[-3.969683028665376e+01,2.209460984245205e+02,-2.759285104469687e+02,1.383577518672690e+02,-3.066479806614716e+01,2.506628277459239e+00];
+  const b=[-5.447609879822406e+01,1.615858368580409e+02,-1.556989798598866e+02,6.680131188771972e+01,-1.328068155288572e+01];
+  const c=[-7.784894002430293e-03,-3.223964580411365e-01,-2.400758277161838e+00,-2.549732539343734e+00,4.374664141464968e+00,2.938163982698783e+00];
+  const d=[7.784695709041462e-03,3.224671290700398e-01,2.445134137142996e+00,3.754408661907416e+00];
+  const pl=0.02425, ph=1-pl;
+  let q, r;
+  if(p<pl){
+    q=Math.sqrt(-2*Math.log(p));
+    return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
+  }
+  if(p<=ph){
+    q=p-0.5; r=q*q;
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q/(((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1);
+  }
+  q=Math.sqrt(-2*Math.log(1-p));
+  return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5])/((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1);
+}
+
+function probabilisticSharpe(sr, T, skew, kurt, srBenchmark){
+  // Probabilistic Sharpe Ratio (Bailey & López de Prado 2014, eq. 5-6).
+  //   denom = sqrt(1 - skew*sr + ((kurt-1)/4) * sr^2)
+  //   PSR   = Phi( (sr - srBenchmark) * sqrt(T-1) / denom )
+  // sr is the NON-ANNUALIZED per-observation Sharpe mean(x)/std(x) with std the
+  // SAMPLE standard deviation (ddof=1); T = number of observations. skew is the
+  // sample skewness and kurt the RAW (non-excess) kurtosis — normal = 3, so
+  // (kurt-1)/4 = 0.5 under normality. Phi uses the Abramowitz-Stegun erf
+  // approximation (_nCdf, |err| < 1.5e-7). Guards: T < 2, non-finite input or
+  // a non-positive denom → NaN.
+  if(typeof T!=='number'||!isFinite(T)||T<2)return NaN;
+  if(!isFinite(sr)||!isFinite(skew)||!isFinite(kurt))return NaN;
+  const b=(srBenchmark==null)?0:srBenchmark;
+  if(!isFinite(b))return NaN;
+  const denom=Math.sqrt(1 - skew*sr + ((kurt-1)/4)*sr*sr);
+  if(!(denom>0)||!isFinite(denom))return NaN;
+  return _nCdf((sr-b)*Math.sqrt(T-1)/denom);
+}
+
+function expectedMaxSharpe(nTrials, srVariance){
+  // Expected MAXIMUM Sharpe of nTrials independent trials under the null (zero
+  // true Sharpe), Bailey/Borwein/López de Prado/Zhu 2014 eq. (3)-(4):
+  //   SR0 = sqrt(srVariance) * ( (1-γ)*PhiInv(1 - 1/N) + γ*PhiInv(1 - 1/(N*e)) )
+  // srVariance is the variance of the PER-OBSERVATION Sharpes of the evaluated
+  // trials (not annualized). N < 2 → NaN (there is no maximum of one draw).
+  if(typeof nTrials!=='number'||!isFinite(nTrials)||nTrials<2)return NaN;
+  const v=(srVariance==null)?1:srVariance;
+  if(!isFinite(v)||v<0)return NaN;
+  return Math.sqrt(v)*((1-EULER_GAMMA)*normInv(1-1/nTrials)+EULER_GAMMA*normInv(1-1/(nTrials*Math.E)));
+}
+
+function benchmarkSharpe(nTrials){
+  // The best-of-N null bar in per-observation sigma units (variance = 1).
+  // This is the number an operator should compare a raw Sharpe against:
+  // 42 trials → ~2.2σ, 335,232 → ~4.7σ.
+  return expectedMaxSharpe(nTrials,1);
+}
+
+function deflatedSharpe(sr, T, skew, kurt, nTrials, srVariance){
+  // Deflated Sharpe Ratio (Bailey & López de Prado 2014, eq. 9): the PSR is
+  // evaluated against the expected maximum Sharpe of the search instead of 0.
+  //   DSR = PSR(sr, T, skew, kurt, SR0),  SR0 = expectedMaxSharpe(N, var)
+  // Degenerate single-trial case (N < 2): the bar is exactly 0 (the expected
+  // maximum of ONE draw from a zero-mean distribution), so DSR reduces to the
+  // PSR vs 0. expectedMaxSharpe itself stays NaN-guarded at N < 2.
+  const out={dsr:NaN, sr0:NaN, sr, T, nTrials};
+  if(typeof nTrials!=='number'||!isFinite(nTrials))return out;
+  const sr0=nTrials<2?0:expectedMaxSharpe(nTrials,srVariance);
+  if(!isFinite(sr0))return out;
+  out.sr0=sr0;
+  out.dsr=probabilisticSharpe(sr,T,skew,kurt,sr0);
+  return out;
+}
+
+function perObservationSharpe(m){
+  // engine.backtest reports the ANNUALIZED Sharpe of the DAILY strategy return
+  // series: mean(dailyRet)/sd(dailyRet) * sqrt(252). PSR/DSR are defined on the
+  // per-observation (here: daily) Sharpe, so divide the sqrt(252) back out.
+  // T for those functions is then the number of DAILY observations (m.days).
+  if(!m||typeof m.sharpe!=='number'||!isFinite(m.sharpe))return NaN;
+  return m.sharpe/Math.sqrt(252);
+}
+
+// ---------- effectiveN: independent hypotheses behind a set of signal series ----------
+// signals: array of position series (values in {-1,0,1}); may be very large.
+// Pipeline: (1) exact dedup by an FNV-1a-32 hash of the sampled series,
+// (2) deterministic sort of the unique representatives, (3) bounded signal
+// sample, (4) greedy |corr| >= corrThreshold clustering against the existing
+// cluster representatives using a bar subsample, and (5) scaling back up:
+//   effectiveN = round(population * clusters / sampled)
+// Cost is bounded by maxBars × maxSignals; when either sample is used the
+// result is an ESTIMATOR, not an exact count (method says which).
+const EFFECTIVE_N_DEF={corrThreshold:0.99,barSubsample:2000,signalSample:3000,coarseBars:128};
+function _sigMinLen(signals){
+  let n=Infinity;
+  for(let i=0;i<signals.length;i++){
+    const s=signals[i]; if(!s)continue;
+    const L=s.length|0; if(L<n)n=L;
+  }
+  return isFinite(n)?n:0;
+}
+function _barIndexList(nBars,maxBars){
+  const stride=Math.max(1,Math.ceil(nBars/Math.max(1,maxBars)));
+  const idx=[];
+  for(let i=0;i<nBars;i+=stride)idx.push(i);
+  return idx;
+}
+function _fnv1aSampled(sig,idx){
+  // FNV-1a-32 over the sampled values (same constants as fnv1a; values are
+  // shifted to 0..2 so a −1 never collides with a 0 byte).
+  let h=0x811c9dc5;
+  for(let k=0;k<idx.length;k++){h^=(((sig[idx[k]]|0)+1)&0xff);h=Math.imul(h,0x01000193);}
+  return h>>>0;
+}
+function _unitCentered(sig,idx){
+  // Centered, L2-normalized sample: correlation == dot product of two of these.
+  // Zero-variance series return flat=true (correlation undefined).
+  const n=idx.length,out=new Float64Array(n);
+  if(n<2)return {v:out,flat:true};
+  let m=0;
+  for(let k=0;k<n;k++)m+=(sig[idx[k]]||0);
+  m/=n;
+  let ss=0;
+  for(let k=0;k<n;k++){const x=(sig[idx[k]]||0)-m;out[k]=x;ss+=x*x;}
+  if(!(ss>0))return {v:out,flat:true};
+  const inv=1/Math.sqrt(ss);
+  for(let k=0;k<n;k++)out[k]*=inv;
+  return {v:out,flat:false};
+}
+function _dotp(a,b){let s=0;for(let i=0;i<a.length;i++)s+=a[i]*b[i];return s;}
+function effectiveN(signals, opts){
+  opts=opts||{};
+  const corrThreshold=opts.corrThreshold==null?EFFECTIVE_N_DEF.corrThreshold:+opts.corrThreshold;
+  const maxBars=Math.max(8,Math.round(opts.barSubsample==null?EFFECTIVE_N_DEF.barSubsample:+opts.barSubsample));
+  const maxSignals=Math.max(2,Math.round(opts.signalSample==null?EFFECTIVE_N_DEF.signalSample:+opts.signalSample));
+  const coarseBars=Math.max(8,Math.round(opts.coarseBars==null?EFFECTIVE_N_DEF.coarseBars:+opts.coarseBars));
+  const nInput=(signals&&signals.length)||0;
+  if(!nInput)return {effectiveN:0,sampled:0,clusters:0,corrThreshold,exactDuplicates:0,unique:0,nInput:0,method:'empty input'};
+  const nBars=_sigMinLen(signals);
+  if(!(nBars>=2))return {effectiveN:0,sampled:0,clusters:0,corrThreshold,exactDuplicates:0,unique:0,nInput,method:'degenerate (series shorter than 2 bars)'};
+  const idx=_barIndexList(nBars,maxBars);
+  const seen=new Set(); const reps=[]; let exactDuplicates=0;
+  for(let i=0;i<nInput;i++){
+    const sig=signals[i]; if(!sig)continue;
+    const h=_fnv1aSampled(sig,idx);
+    if(seen.has(h)){exactDuplicates++;continue;}
+    seen.add(h); reps.push({sig,h,i});
+  }
+  const unique=reps.length;
+  if(unique<=1)return {effectiveN:unique,sampled:unique,clusters:unique,corrThreshold,exactDuplicates,unique,nInput,bars:idx.length,method:unique?'exact duplicates only (1 unique hypothesis)':'empty input'};
+  reps.sort((a,b)=>(a.h-b.h)||(a.i-b.i)); // deterministic
+  const sStride=Math.max(1,Math.ceil(unique/maxSignals));
+  const sampled=[];
+  for(let i=0;i<unique;i+=sStride)sampled.push(reps[i]);
+  const cStride=Math.max(1,Math.ceil(idx.length/coarseBars));
+  const cidx=[];
+  for(let i=0;i<idx.length;i+=cStride)cidx.push(idx[i]);
+  const clusters=[];
+  for(const r of sampled){
+    const c=_unitCentered(r.sig,cidx);
+    let placed=false;
+    for(const cl of clusters){
+      // coarse prefilter (cheap), then verify on the full bar sample
+      const d=_dotp(c.v,cl.cv);
+      const coarse=(c.flat&&cl.cflatCoarse)?1:((c.flat||cl.cflatCoarse)?0:d);
+      if(Math.abs(coarse)<corrThreshold)continue;
+      if(!cl.fv){cl.fv=_unitCentered(cl.sig,idx);cl.cflatFull=cl.fv.flat;}
+      if(!c.fv){c.fv=_unitCentered(r.sig,idx);c.cflatFull=c.fv.flat;}
+      const df=_dotp(c.fv.v,cl.fv.v);
+      const full=(c.cflatFull&&cl.cflatFull)?1:((c.cflatFull||cl.cflatFull)?0:df);
+      if(Math.abs(full)>=corrThreshold){placed=true;cl.n++;break;}
+    }
+    if(!placed)clusters.push({cv:c.v,cflatCoarse:c.flat,sig:r.sig,fv:null,cflatFull:false,n:1});
+  }
+  const clustersN=clusters.length;
+  const popUnique=(opts.nTotal!=null&&isFinite(opts.nTotal)&&opts.nTotal>nInput)
+    ?Math.round(opts.nTotal*(unique/nInput)):unique;
+  const effective=Math.max(1,Math.round(popUnique*clustersN/Math.max(1,sampled.length)));
+  return {effectiveN:effective,sampled:sampled.length,clusters:clustersN,corrThreshold,exactDuplicates,unique,nInput,
+    population:popUnique,bars:idx.length,coarseBars:cidx.length,
+    method:'exact-dedup FNV-1a-32 ('+idx.length+' bars) + greedy |corr|>='+corrThreshold
+      +' clustering on '+sampled.length+'/'+unique+' unique reps (coarse '+cidx.length+' bars), scaled to population '+popUnique};
+}
+
 function strategyScore(m, over){
   // Components (all 0..1, monotonic, bounded):
   // ret: R-multiple expectancy E/|avgLoss| → R/(1+R) (0 when E≤0)
@@ -2891,7 +3116,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,todBucket15,aggregateProfile,classifyCell,mergeBuckets,classifyTransfer,consumeProfile,profileId,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,todBucket15,aggregateProfile,classifyCell,mergeBuckets,classifyTransfer,consumeProfile,profileId,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,probabilisticSharpe,expectedMaxSharpe,benchmarkSharpe,deflatedSharpe,perObservationSharpe,effectiveN,normInv,normCdf,EFFECTIVE_N_DEF,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

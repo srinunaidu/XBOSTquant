@@ -30,6 +30,11 @@ export type BoardRow = {
   symbol: string;
   oosNet?: number; oosWR?: number; oosN?: number; survived?: boolean | null;
   oosFolds?: { net: number; wr: number; n: number; sharpe?: number; skipped: boolean }[];
+  foldWins?: number; foldWinRate?: number | null;
+  // Trials-aware inference (deflated Sharpe Ratio): attached by the runner
+  // after the grid completes, using the trial count actually evaluated.
+  dsr?: number; sr0?: number; effectiveN?: number;
+  validated?: boolean; notValidated?: string[];
   robustScore?: number; robustness?: any;
   rawRank?: number; rawObjective?: { key: string; value: number };
   pair?: boolean;
@@ -78,6 +83,21 @@ export interface Engine {
   whyNotRanked(row: BoardRow, over?: any): string;
   sharpeAdj(sharpeRaw: number, n: number, shrK?: number): number;
   sharpeReliability(n: number): string;
+  // ---- trials-aware statistical inference (mirrors the Python engine) ----
+  // PSR: sr is the NON-ANNUALIZED per-observation Sharpe, T the observation count.
+  probabilisticSharpe(sr: number, T: number, skew: number, kurt: number, srBenchmark?: number): number;
+  expectedMaxSharpe(nTrials: number, srVariance?: number): number;
+  benchmarkSharpe(nTrials: number): number;
+  deflatedSharpe(sr: number, T: number, skew: number, kurt: number, nTrials: number, srVariance?: number): { dsr: number; sr0: number; sr: number; T: number; nTrials: number };
+  perObservationSharpe(m: any): number;
+  normInv(p: number): number;
+  normCdf(z: number): number;
+  effectiveN(signals: any[], opts?: { corrThreshold?: number; barSubsample?: number; signalSample?: number; coarseBars?: number; nTotal?: number }): {
+    effectiveN: number; sampled: number; clusters: number; corrThreshold: number;
+    exactDuplicates: number; unique: number; nInput: number; population?: number;
+    bars?: number; coarseBars?: number; method: string;
+  };
+  EFFECTIVE_N_DEF: { corrThreshold: number; barSubsample: number; signalSample: number; coarseBars: number };
   strategyScore(m: any, over?: any): { composite: number; parts: Record<string, number>; sharpeRaw: number; sharpeAdj: number; tier: string; reliability: string; n: number };
   rankableScore(m: any, over?: any): { composite: number } | null;
   paretoFrontier(rows: BoardRow[], keys?: [string, number][]): BoardRow[];

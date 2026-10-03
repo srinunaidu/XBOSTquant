@@ -469,6 +469,7 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
     return { t: pk(raw.t), o: pk(raw.o), h: pk(raw.h), l: pk(raw.l), c: pk(raw.c), v: pk(raw.v) };
   };
   let total = 0, surv = 0;
+  let gfWins = 0, gfTotal = 0; // run-level fold wins / live folds (all symbols)
   for (const sym of Object.keys(bySym)) {
     if (useStore.getState().runSeq !== mySeq) return 'aborted';
     const ds = st.datasets[sym];
@@ -487,21 +488,37 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
     const pick = (a: Float64Array) => a.slice(si, ei);
     const oos = { t: pick(data.t), o: pick(data.o), h: pick(data.h), l: pick(data.l), c: pick(data.c), v: pick(data.v) };
     if (oos.t.length < 50) continue;
-    // Folded OOS: split the tail into ≤3 contiguous folds so survival is
-    // proven across sub-periods, not one lucky stretch. Folds with <5 trades
-    // are skipped (thin), never counted as failures.
-    const N_FOLDS = oos.t.length >= 300 ? 3 : 1;
-    const foldOf = (a: Float64Array, fi: number) => {
-      const s0 = Math.floor(oos.t.length * fi / N_FOLDS), s1 = Math.floor(oos.t.length * (fi + 1) / N_FOLDS);
-      return a.slice(s0, s1);
+    // Purged K-fold OOS. Each fold's TEST window comes from
+    // engine.purgedFolds() over the OOS tail, so every fold carries a real
+    // purge gap (no indicator-warmup leakage into the test window) instead of
+    // one contiguous split. The tail itself is already purged/embargoed at the
+    // IS boundary above; the in-tail purge is therefore an extra (conservative)
+    // safety margin. Fallback when the tail is too short for the purge scheme
+    // (< ~2*(K+1)*50 bars): the legacy contiguous split, unchanged.
+    const K_FOLDS = 3, FOLD_MIN_BARS = 50;
+    const L_TAIL = oos.t.length;
+    const pfolds = engine.purgedFolds(L_TAIL, K_FOLDS, purge, embargo);
+    const usePurged = pfolds.length > 0 && L_TAIL >= 2 * (K_FOLDS + 1) * FOLD_MIN_BARS;
+    const foldRanges: [number, number][] = usePurged
+      ? pfolds.map(f => [f.test[0], f.test[1]] as [number, number])
+      : (() => {
+        const N_FOLDS = L_TAIL >= 300 ? 3 : 1;
+        const out: [number, number][] = [];
+        for (let fi = 0; fi < N_FOLDS; fi++) out.push([Math.floor(L_TAIL * fi / N_FOLDS), Math.floor(L_TAIL * (fi + 1) / N_FOLDS)]);
+        return out;
+      })();
+    if (!usePurged) logLine(`  WF [${sym}]: tail ${L_TAIL} bars < ${2 * (K_FOLDS + 1) * FOLD_MIN_BARS} — single-split fallback (${foldRanges.length} fold${foldRanges.length > 1 ? 's' : ''})`);
+    const foldData = (fr: [number, number]) => {
+      const s0 = fr[0], s1 = fr[1];
+      const seg = (a: Float64Array) => a.slice(s0, s1);
+      return { t: seg(oos.t), o: seg(oos.o), h: seg(oos.h), l: seg(oos.l), c: seg(oos.c), v: seg(oos.v) };
     };
-    const foldData = (fi: number) => ({ t: foldOf(oos.t, fi), o: foldOf(oos.o, fi), h: foldOf(oos.h, fi), l: foldOf(oos.l, fi), c: foldOf(oos.c, fi), v: foldOf(oos.v, fi) });
     const tfCache: Record<string, any> = {};
     const wfRouteCaches: Record<string, Record<number, any>> = {};
-    const getTFF = (tf: number, fi: number) => {
-      const k = tf + 'f' + fi;
+    const getTFF = (tf: number, fr: [number, number]) => {
+      const k = tf + 'f' + fr[0] + '-' + fr[1];
       if (!tfCache[k]) {
-        const d = engine.resample(foldData(fi) as any, tf);
+        const d = engine.resample(foldData(fr) as any, tf);
         let mi = engine.buildSessionMask(d, opts.sessionStart, opts.sessionEnd);
         mi = engine.combineMasks(mi, engine.buildExpiryMask(d, opts.excludeExpiry)) as Int8Array;
         if (opts.ivMaxRank != null && opts.ivMaxRank < 1) mi = engine.combineMasks(mi, engine.ivRankMask(d, opts.ivMaxRank, 20, 75600).mask) as Int8Array;
@@ -510,8 +527,8 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
       }
       return tfCache[k];
     };
-    const evalFold = (r: BoardRow, fi: number) => {
-      const tfc = getTFF(r.timeframe, fi);
+    const evalFold = (r: BoardRow, fr: [number, number]) => {
+      const tfc = getTFF(r.timeframe, fr);
       if (tfc.d.t.length < 20) return { net: 0, wr: 0, n: 0, skipped: true };
       const eff: any = Object.assign({}, opts, {
         sessionMask: r.carry ? tfc.maskCarry : tfc.maskIn,
@@ -520,7 +537,7 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
       });
       const xo = engine.exitOptsFromParams(r.indicator, r.params || {});
       if (xo) { eff.ckPeriod = xo.ckPeriod; eff.ckMult = xo.ckMult; }
-      const routed = routingFor(wfRouteCaches[r.timeframe + 'f' + fi], r.timeframe, tfc.d, r, eff);
+      const routed = routingFor(wfRouteCaches[r.timeframe + 'f' + fr[0] + '-' + fr[1]], r.timeframe, tfc.d, r, eff);
       if (routed.mask) eff.tradeMask = routed.mask;
       const sig = engine.buildSignals(tfc.d, { indicator: r.indicator, params: r.params });
       const bt = engine.backtest(tfc.d, sig.pos, eff);
@@ -530,13 +547,15 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
     for (const r of bySym[sym]) {
       if (useStore.getState().runSeq !== mySeq) return 'aborted';
       const folds = [];
-      for (let fi = 0; fi < N_FOLDS; fi++) folds.push(evalFold(r, fi));
+      for (const fr of foldRanges) folds.push(evalFold(r, fr));
       const live = folds.filter(f => !f.skipped);
       const totN = live.reduce((a, f) => a + f.n, 0);
       r.oosNet = live.reduce((a, f) => a + f.net, 0);
       r.oosN = totN;
       r.oosWR = totN ? live.reduce((a, f) => a + f.wr * f.n, 0) / totN : 0;
       r.oosFolds = folds;
+      r.foldWins = live.filter(f => f.net > 0).length;
+      r.foldWinRate = live.length ? r.foldWins / live.length : null;
       r.survived = live.length ? live.every(f => f.net > 0) : null;
       total++;
       if (r.survived) surv++;
@@ -546,11 +565,173 @@ export async function wfVerify(rows: BoardRow[], opts: any, mySeq: number) {
     const symSurv = symRows.filter(r => r.survived).length;
     const liveFolds = symRows.flatMap(r => (r.oosFolds || []).filter(f => !f.skipped));
     const foldWin = liveFolds.filter(x => x.net > 0).length;
+    gfWins += foldWin; gfTotal += liveFolds.length;
     const thinFolds = symRows.flatMap(r => (r.oosFolds || []).filter(f => f.skipped)).length;
     const foldShr = liveFolds.length ? ` mean_fold_sharpe=${(liveFolds.reduce((a, f) => a + (f.sharpe || 0), 0) / liveFolds.length).toFixed(2)}` : '';
-    logLine(`  WF [${sym}]: ${symSurv}/${symRows.length} rows survived OOS (${N_FOLDS} folds/row: ${foldWin}/${liveFolds.length} fold-wins${thinFolds ? `, ${thinFolds} thin-skipped(<5 trades)` : ''}${foldShr})`);
+    const fwr = liveFolds.length ? ` foldWinRate=${(foldWin / liveFolds.length).toFixed(3)}` : ' foldWinRate=n/a';
+    logLine(`  WF [${sym}]: ${symSurv}/${symRows.length} rows survived OOS (${usePurged ? `K=${foldRanges.length} purged folds` : `${foldRanges.length} fold${foldRanges.length > 1 ? 's' : ''} (fallback)`}/row: foldWins=${foldWin}/${liveFolds.length}${fwr}${thinFolds ? `, ${thinFolds} thin-skipped(<5 trades)` : ''}${foldShr})`);
   }
-  return `WF ${st.wfSplit}/${100 - st.wfSplit}: ${surv}/${total} rows survived OOS`;
+  const foldWinRate = gfTotal ? gfWins / gfTotal : null;
+  logLine(`  WF total: foldWins=${gfWins}/${gfTotal} foldWinRate=${foldWinRate == null ? 'n/a' : foldWinRate.toFixed(3)} (purged K-fold OOS; single-split fallback on short tails)`);
+  return `WF ${st.wfSplit}/${100 - st.wfSplit}: ${surv}/${total} rows survived OOS · foldWins=${gfWins}/${gfTotal}${foldWinRate == null ? '' : ` foldWinRate=${foldWinRate.toFixed(3)}`}`;
+}
+
+// ---------- Trials-aware statistical inference (DSR / effectiveN / LEADS) ----------
+// After the grid completes we know how many configurations were ACTUALLY
+// evaluated and the dispersion of their per-observation Sharpes. Under the null
+// the expected best Sharpe of N trials is
+//   SR0 = sqrt(var) * ((1-γ)·Φ⁻¹(1-1/N) + γ·Φ⁻¹(1-1/(N·e)))
+// (Bailey, Borwein, López de Prado & Zhu 2014); the Deflated Sharpe Ratio is
+// then PSR evaluated against SR0 instead of 0 — the probability the TRUE Sharpe
+// is positive after accounting for having searched N configurations.
+//
+// m.sharpe in this codebase IS ANNUALIZED (mean/std × √252 over DAILY returns),
+// so engine.perObservationSharpe() divides √252 back out and T is the number of
+// DAILY observations (m.days). Per-trade skew/kurtosis are not retained on a
+// BoardRow, so the normal moments (skew 0, raw kurt 3) are used unless the
+// metrics object carries m.skew / m.kurt.
+function estimateEffectiveN(allRows: BoardRow[], opts: any, symData: [string, OHLCV][], trialCountIn?: number): any {
+  const st = useStore.getState();
+  const maxSignals = Math.max(16, Math.round(st.effectiveNSample ?? 3000));
+  const bars = Math.max(64, Math.round(st.effectiveNBarSubsample ?? 2000));
+  if (!allRows.length || !symData.length) return null;
+  if (opts && opts.sigSource === 'underlying') {
+    return { effectiveN: null, skipped: 'underlying signal source — the option series is not the signal series' };
+  }
+  // Bounded, deterministic sample of the evaluated configurations.
+  const stride = Math.max(1, Math.ceil(allRows.length / maxSignals));
+  const picks: BoardRow[] = [];
+  for (let i = 0; i < allRows.length; i += stride) picks.push(allRows[i]);
+  // Group by symbol|timeframe so each resampled dataset is built once.
+  const groups = new Map<string, BoardRow[]>();
+  for (const r of picks) {
+    const sym = r.symbol || (symData[0] ? symData[0][0] : 'DATA');
+    const k = sym + '|' + r.timeframe;
+    const g = groups.get(k);
+    if (g) g.push(r); else groups.set(k, [r]);
+  }
+  const signals: any[] = [];
+  for (const [k, rows] of groups) {
+    const cut = k.lastIndexOf('|');
+    const sym = k.slice(0, cut), tf = +k.slice(cut + 1);
+    const sd = symData.find(([s]) => s === sym) || symData[0];
+    if (!sd) continue;
+    let d: any;
+    try { d = engine.resample(sd[1], tf); } catch { continue; }
+    const L = d.c.length;
+    if (L < 2) continue;
+    const bs = Math.max(1, Math.ceil(L / bars)); // bounded bars per signal (memory + cost)
+    const n = Math.ceil(L / bs);
+    for (const r of rows) {
+      try {
+        const sig = engine.buildSignals(d, { indicator: r.indicator, params: r.params });
+        const pos: any = sig && sig.pos ? sig.pos : sig;
+        const compact = new Int8Array(n);
+        for (let i = 0, j = 0; i < L; i += bs, j++) compact[j] = pos[i] || 0;
+        signals.push(compact);
+      } catch { /* unbuildable row (PAIR legs missing, …) — skipped */ }
+    }
+  }
+  if (signals.length < 2) return { effectiveN: null, sampled: signals.length, requested: picks.length, skipped: 'fewer than 2 signal series could be rebuilt' };
+  const en = engine.effectiveN(signals as any[], { barSubsample: bars, signalSample: maxSignals, nTotal: Math.max(trialCountIn || allRows.length, signals.length) });
+  return { ...en, requested: picks.length, rebuilt: signals.length, barSubsample: bars, signalSample: maxSignals };
+}
+
+export function attachTrialsAwareInference(
+  allRows: BoardRow[], opts: any, symData: [string, OHLCV][], trialCountIn: number,
+): any {
+  const st = useStore.getState();
+  const dsrThreshold = st.dsrThreshold ?? 0.95;
+  const leadsN = Math.max(1, Math.round(st.leadsN ?? 200));
+  const trialCount = Math.max(1, Math.round(trialCountIn || allRows.length));
+  // (a) variance of the PER-OBSERVATION Sharpes across the evaluated trials.
+  // Primary variance excludes zero-trade rows (their Sharpe 0 is not a draw of
+  // the estimator); the all-rows variance is reported alongside for contrast.
+  let nT = 0, sT = 0, ssT = 0, nA = 0, sA = 0, ssA = 0;
+  for (const r of allRows) {
+    const sro = engine.perObservationSharpe(r.m);
+    if (!isFinite(sro)) continue;
+    nA++; sA += sro; ssA += sro * sro;
+    if (((r.m as any)?.totalTrades || 0) > 0) { nT++; sT += sro; ssT += sro * sro; }
+  }
+  const varianceOf = (k: number, s: number, ss: number) => (k >= 2 ? Math.max(0, (ss - (s * s) / k) / (k - 1)) : NaN);
+  const srVariance = varianceOf(nT, sT, ssT);
+  const srVarianceAll = varianceOf(nA, sA, ssA);
+  const srMean = nT ? sT / nT : NaN;
+  // (b) effectiveN over a bounded deterministic sample of evaluated configs.
+  let effectiveInfo: any = null;
+  try { effectiveInfo = estimateEffectiveN(allRows, opts, symData, trialCount); }
+  catch (e: any) { logLine('effectiveN skipped: ' + (e?.message || e)); }
+  const runEffectiveN = effectiveInfo && isFinite(effectiveInfo.effectiveN) ? effectiveInfo.effectiveN : null;
+  // (c) attach DSR + validation verdict to EVERY evaluated row.
+  const bench = engine.benchmarkSharpe(trialCount);
+  const varForDsr = isFinite(srVariance) ? srVariance : (isFinite(srVarianceAll) ? srVarianceAll : 1);
+  const scoreCfg = { weights: st.scoreW, tiers: { insufficient: st.sampleT.ins, rankable: st.sampleT.rank } };
+  for (const r of allRows) {
+    const m: any = r.m || {};
+    const sro = engine.perObservationSharpe(m);
+    const T = (m.days >= 2) ? m.days : (m.totalTrades || 0);
+    const skew = isFinite(m.skew) ? m.skew : 0;
+    const kurt = isFinite(m.kurt) ? m.kurt : 3;
+    const d = engine.deflatedSharpe(sro, T, skew, kurt, trialCount, varForDsr);
+    r.dsr = d.dsr; r.sr0 = d.sr0;
+    if (runEffectiveN != null) r.effectiveN = runEffectiveN;
+    const reasons: string[] = [];
+    if (!isFinite(d.dsr)) reasons.push('dsr undefined (needs ≥2 daily observations and a finite Sharpe)');
+    else if (!(d.dsr >= dsrThreshold)) reasons.push(`dsr ${d.dsr.toFixed(4)} < ${dsrThreshold}`);
+    if (r.survived == null) reasons.push('no OOS verdict (walk-forward off or thin OOS)');
+    else if (!r.survived) reasons.push('OOS not survived');
+    r.validated = reasons.length === 0;
+    r.notValidated = reasons;
+    if (!r.compositeScore) { try { r.compositeScore = engine.strategyScore(m, scoreCfg); } catch { r.compositeScore = null; } }
+  }
+  // (d) LEADS: top-N by composite, INCLUDING rows that fail the validation gate.
+  const byComposite = allRows.slice().sort((a, b) =>
+    ((((b.compositeScore || {}) as any).composite || 0) - (((a.compositeScore || {}) as any).composite || 0))
+    || ((b.m?.netPnL || 0) - (a.m?.netPnL || 0))
+    || ((b.m?.totalTrades || 0) - (a.m?.totalTrades || 0)));
+  const leads = byComposite.slice(0, leadsN);
+  const validatedBoard = byComposite.filter(r => r.validated).slice(0, leadsN);
+  let paperBoard: BoardRow[] = [];
+  try {
+    const gateOpts = { scoreThreshold: st.paperThreshold ?? 9.5, cost: opts.cost, allowZeroCost: opts.costMode === 'signal', minTrades: st.paperMinTrades ?? 200 };
+    paperBoard = leads.filter(r => engine.paperEligible(r, gateOpts).eligible);
+  } catch { paperBoard = []; }
+  return {
+    trialCount, srVariance, srVarianceN: nT, srVarianceAll, srVarianceAllN: nA, srMean,
+    benchmark: bench, dsrThreshold, leadsN, effectiveN: runEffectiveN, effectiveInfo,
+    varForDsr, leads, validatedBoard, paperBoard,
+  };
+}
+
+// Machine-readable + human-readable trials-aware block (logged EVERY run).
+export function logTrialsAwareInference(info: any, champion: BoardRow | null) {
+  logLine('===== TRIALS_AWARE_INFERENCE =====');
+  logLine(`  configurations_evaluated=${info.trialCount}`);
+  const ei = info.effectiveInfo;
+  if (info.effectiveN == null) logLine(`  effective_hypotheses=UNAVAILABLE${ei && ei.skipped ? ' (' + ei.skipped + ')' : ''}`);
+  else logLine(`  effective_hypotheses=${info.effectiveN} (sampled ${ei.sampled}/${ei.requested} series, unique=${ei.unique}, clusters=${ei.clusters}, threshold=${ei.corrThreshold}, bars<=${ei.barSubsample}, method=${ei.method})`);
+  logLine(`  sr_variance=${isFinite(info.srVariance) ? info.srVariance.toExponential(4) : 'NA'} (per-observation, N=${info.srVarianceN} traded rows; all-rows=${isFinite(info.srVarianceAll) ? info.srVarianceAll.toExponential(4) : 'NA'} over ${info.srVarianceAllN})`);
+  logLine(`  best_of_N_null_bar=${isFinite(info.benchmark) ? info.benchmark.toFixed(4) + ' sigma' : 'NA'} (benchmarkSharpe(${info.trialCount}), variance=1)`);
+  if (champion) {
+    const d = champion.dsr, sr0 = champion.sr0;
+    logLine(`  champion: dsr=${isFinite(d as number) ? (d as number).toFixed(4) : 'NA'} vs ${info.dsrThreshold} · bar=${isFinite(sr0 as number) ? (sr0 as number).toFixed(4) + ' sigma (per-observation)' : 'NA'} · raw_per_obs_sharpe=${isFinite(engine.perObservationSharpe(champion.m)) ? engine.perObservationSharpe(champion.m).toFixed(4) : 'NA'} · T=${champion.m?.days ?? 0}d · OOS_survived=${champion.survived ?? 'NA'} · VALIDATED=${champion.validated ? 'YES' : 'NO'}${!champion.validated && champion.notValidated?.length ? ' (' + champion.notValidated.join('; ') + ')' : ''}`);
+  }
+}
+
+// Yield per indicator family/tier across the LEADS pool and the VALIDATED pool.
+export function logDiscoveryYield(info: any) {
+  const famOf = (r: BoardRow) => ((engine as any).FAMILY || {})[r.indicator] || '?';
+  const tierOf = (r: BoardRow) => IND_TIER[r.indicator] || '?';
+  const buckets = (keyOf: (r: BoardRow) => string) => {
+    const m: Record<string, { leads: number; validated: number }> = {};
+    for (const r of info.leads) { const k = keyOf(r); (m[k] = m[k] || { leads: 0, validated: 0 }).leads++; if (r.validated) m[k].validated++; }
+    return m;
+  };
+  const fams = buckets(famOf), tiers = buckets(tierOf);
+  logLine(`DISCOVERY_YIELD leads=${info.leads.length} validated=${info.validatedBoard.length} paper=${info.paperBoard.length}`);
+  logLine('  by_family: ' + (Object.keys(fams).sort().map(k => `${k}=${fams[k].leads}/${fams[k].validated}`).join(' ') || 'none'));
+  logLine('  by_tier: ' + (Object.keys(tiers).sort().map(k => `${k}=${tiers[k].leads}/${tiers[k].validated}`).join(' ') || 'none') + ' (leads/validated)');
 }
 
 export async function runGrid() {
@@ -606,6 +787,9 @@ export async function runGrid() {
   // (e.g. logLine) replaces the state object and silently drops the write,
   // which used to wedge runs at "warming up" forever. Always use set().
   useStore.getState().set({ runSeq: mySeq, runId });
+  // Clear the previous run's trials-aware boards: they are recomputed at the end
+  // of THIS run, and stale LEADS must never be read as this run's result.
+  useStore.getState().set({ leads: [], validatedBoard: [], paperBoard: [], inference: null });
   st.set({ alert: null });
   const t0 = performance.now();
   let lastRender = 0;
@@ -967,6 +1151,27 @@ export async function runGrid() {
       logLine(wfMsg);
       useStore.getState().set({ board: useStore.getState().board });
     }
+    // ---- trials-aware inference: DSR for every row, effectiveN, LEADS pool ----
+    // The VALIDATED verdict is dsr >= store.dsrThreshold (default 0.95) AND OOS
+    // survival — the naive score/tier gate stays for the EXPLORATORY board only.
+    if (!stopped) {
+      try {
+        setRun({ summary: 'done · trials-aware inference (DSR, effectiveN, LEADS)…' });
+        await new Promise(rr => setTimeout(rr, 0));
+        const inf = attachTrialsAwareInference(allRows, opts, symData, tested);
+        logTrialsAwareInference(inf, useStore.getState().board[0] || null);
+        logDiscoveryYield(inf);
+        useStore.getState().set({
+          leads: inf.leads, validatedBoard: inf.validatedBoard, paperBoard: inf.paperBoard,
+          inference: {
+            trialCount: inf.trialCount, srVariance: inf.srVariance, srVarianceN: inf.srVarianceN,
+            srVarianceAll: inf.srVarianceAll, srVarianceAllN: inf.srVarianceAllN, srMean: inf.srMean,
+            benchmark: inf.benchmark, dsrThreshold: inf.dsrThreshold, leadsN: inf.leadsN,
+            effectiveN: inf.effectiveN, effectiveInfo: inf.effectiveInfo,
+          },
+        });
+      } catch (e: any) { logLine('trials-aware inference skipped: ' + (e?.message || e)); }
+    }
     setRun({ running: false, refined: 0, passes: 0, summary: `done · ${tested} combos in ${secs.toFixed(1)}s${refineInfo}${errs ? ` · ⚠ ${errs} errored` : ''}${wfMsg ? ` · ${wfMsg}` : ''}` });
     flushLogMirror(); // run tail must be in crash-recovery storage NOW, not ≤2s later
     logLine(`run done (${runMode}): ${tested} combos in ${secs.toFixed(1)}s [grid ${gridSecs.toFixed(1)}s${s3._refineAt ? ` + refine ${(secs - gridSecs).toFixed(1)}s` : ''}] ${(tested / Math.max(secs, 0.01)).toFixed(0)}/s objective=${objective} errors=${errs}${refineInfo}${wfMsg ? ' · ' + wfMsg : ''}${heapNote()}`);
@@ -1309,6 +1514,13 @@ function candidateRecord(r: BoardRow, rank: number | null, totalCombos: number, 
     robust_score: (r as any).robustScore ?? null,
     robust_classification: (r as any).robustness?.classification ?? null,
     oos: { net: (r as any).oosNet ?? null, wr: (r as any).oosWR ?? null, n: (r as any).oosN ?? null, survived: (r as any).survived ?? null, folds: (r as any).oosFolds ?? null },
+    fold_wins: (r as any).foldWins ?? null, fold_win_rate: (r as any).foldWinRate ?? null,
+    // Trials-aware inference: deflated Sharpe vs the best-of-N null bar.
+    dsr: isFinite((r as any).dsr) ? +((r as any).dsr).toFixed(6) : null,
+    sr0: isFinite((r as any).sr0) ? +((r as any).sr0).toFixed(6) : null,
+    effective_n: (r as any).effectiveN ?? null,
+    validated: !!(r as any).validated,
+    not_validated_reasons: (r as any).notValidated || [],
     why_not_ranked: engine.whyNotRanked(r as any, { tiers: runCtx.tiers }),
     rank, search_percentile: totalCombos && rank ? +((1 - rank / totalCombos) * 100).toFixed(2) : 0,
   };
@@ -1507,6 +1719,9 @@ export function buildAuditArtifact(): any {
       train_expectancy: +r.m.expectancy.toFixed(4), test_expectancy: null,
       train_PF: +r.m.profitFactor.toFixed(2), test_PF: null,
       train_Sharpe: +r.m.sharpe.toFixed(2), test_Sharpe: null,
+      fold_wins: (r as any).foldWins ?? null, fold_win_rate: (r as any).foldWinRate ?? null,
+      dsr: isFinite((r as any).dsr) ? +((r as any).dsr).toFixed(6) : null,
+      validated: !!(r as any).validated,
       survived: !!(r as any).survived,
       failure_reason: (r as any).survived ? '' : ((r as any).survived === false ? 'OOS_FOLDS_NEGATIVE' : 'NO_FOLD_VERDICT'),
     })),
@@ -1532,6 +1747,13 @@ export function buildAuditArtifact(): any {
     PARETO_COUNT: paretoIds.length,
     WF: { survived: walkforward_results.SURVIVED_WF, failed: walkforward_results.FAILED_WF, skipped: walkforward_results.SKIPPED_WF },
     SAMPLE_TIERS: tierCounts,
+    // ---- trials-aware inference (LEADS / VALIDATED / PAPER boards) ----
+    LEADS_COUNT: (st.leads || []).length,
+    VALIDATED_COUNT: (st.validatedBoard || []).length,
+    PAPER_ELIGIBLE_COUNT: (st.paperBoard || []).length,
+    LEADS: (st.leads || []).map((r: any) => engine.cfgKey(r)),
+    VALIDATED: (st.validatedBoard || []).map((r: any) => engine.cfgKey(r)),
+    PAPER: (st.paperBoard || []).map((r: any) => engine.cfgKey(r)),
     RANKING_DECISIONS: 'composite selection over rankable rows; raw views preserved; demotion logged',
     EXCLUSIONS: 'see candidate why_not_ranked fields',
     VERDICT: useStore.getState().lastPaper,
@@ -1553,6 +1775,21 @@ export function buildAuditArtifact(): any {
       eligible: p.eligible, merged: p.merged,
     })),
     pareto_results,
+    // Trials-aware inference: how many configurations were searched, how many
+    // INDEPENDENT hypotheses they represent, the best-of-N null bar, and the
+    // LEADS pool (with per-row dsr/validated/not_validated_reasons).
+    trials_aware_inference: st.inference ? {
+      ...st.inference,
+      effective_hypotheses: st.inference.effectiveN,
+      null_bar_sigma: st.inference.benchmark,
+      dsr_threshold: st.inference.dsrThreshold,
+      leads_count: (st.leads || []).length,
+      validated_count: (st.validatedBoard || []).length,
+      paper_count: (st.paperBoard || []).length,
+    } : null,
+    leads: (st.leads || []).map((r: any) => candidateRecord(r, null, allRows.length, runCtx)),
+    validated_candidates: (st.validatedBoard || []).map((r: any) => engine.cfgKey(r)),
+    paper_candidates: (st.paperBoard || []).map((r: any) => engine.cfgKey(r)),
     stage_summary: ranking_results.stages, final_report,
     hash_manifest: {},
     hashes: {
@@ -1857,19 +2094,34 @@ export function buildProfiles(bd: BoardRow[], symData: [string, OHLCV][], opts: 
   } catch (e: any) { logLine('profiles skipped: ' + (e?.message || e)); }
 }
 
-// Hard adaptive gate: raw Sharpe is necessary but never sufficient. With
-// worker-path evidence present, robustness + surrogate + PSS + OOS are all
-// required. Without evidence (main-thread fallback), falls back to the Sharpe
-// gate with a loud warning.
+// Hard adaptive gate. The VALIDATED decision is trials-aware:
+//   dsr >= store.dsrThreshold (default 0.95) AND OOS survival,
+// plus the robustness/surrogate/PSS evidence gates whenever that evidence was
+// computed. The legacy score/tier gate (isGood) is kept, but only as the
+// EXPLORATORY board classifier — it can never validate a row on its own.
 export function tierGate(best: BoardRow, opts: any): { ok: boolean; lines: string[] } {
   const lines: string[] = [];
   const st = useStore.getState();
   const th = st.paperThreshold ?? 9.5;
+  const dsrTh = st.dsrThreshold ?? 0.95;
   const base = isGood(best.m);
-  lines.push(`  gate[sharpe]: ${base ? 'PASS' : 'FAIL'} (sharpe=${best.m.sharpe.toFixed(2)} wr=${best.m.winRate.toFixed(1)}% pf=${best.m.profitFactor.toFixed(2)})`);
+  lines.push(`  gate[exploratory]: ${base ? 'PASS' : 'FAIL'} (score/tier gate, EXPLORATORY board only — sharpe=${best.m.sharpe.toFixed(2)} wr=${best.m.winRate.toFixed(1)}% pf=${best.m.profitFactor.toFixed(2)})`);
+  // ---- VALIDATED gate: deflated Sharpe vs the best-of-N null bar ----
+  let gDsr = false;
+  if (!isFinite(best.dsr as number)) {
+    lines.push('  gate[dsr]: MISSING (no trials-aware inference — rerun on this build)');
+  } else {
+    gDsr = (best.dsr as number) >= dsrTh;
+    lines.push(`  gate[dsr]: ${gDsr ? 'PASS' : 'FAIL'} (dsr=${(best.dsr as number).toFixed(4)} vs ${dsrTh}; bar=${isFinite(best.sr0 as number) ? (best.sr0 as number).toFixed(4) : 'NA'}σ per-observation)`);
+  }
   if (best.robustScore == null) {
-    lines.push('  gate[evidence]: MISSING (fallback path — no robustness computed) → Sharpe gate only, treat board as unverified');
-    return { ok: base, lines };
+    lines.push('  gate[evidence]: MISSING (fallback path — no robustness computed) → dsr + OOS only, treat board as unverified');
+    let gOosOnly = false;
+    if (!st.wfOn) lines.push('  gate[oos]: SKIP (walk-forward off — enable it for a real verdict)');
+    else if (best.survived == null) lines.push('  gate[oos]: MISSING (thin OOS — no fold verdict)');
+    else { gOosOnly = !!best.survived; lines.push(`  gate[oos]: ${gOosOnly ? 'PASS' : 'FAIL'} (survived=${best.survived})`); }
+    const oosReq2 = st.wfOn ? gOosOnly : true;
+    return { ok: gDsr && oosReq2, lines };
   }
   const rb = best.robustness || {};
   const gScore = best.robustScore >= th;
@@ -1887,7 +2139,7 @@ export function tierGate(best: BoardRow, opts: any): { ok: boolean; lines: strin
   else if (best.survived == null) lines.push('  gate[oos]: MISSING (thin OOS — no fold verdict)');
   else { gOos = !!best.survived; lines.push(`  gate[oos]: ${gOos ? 'PASS' : 'FAIL'} (survived=${best.survived})`); }
   const oosReq = st.wfOn ? gOos : true;
-  return { ok: base && gScore && gSurr && gPss && oosReq, lines };
+  return { ok: gDsr && gScore && gSurr && gPss && oosReq, lines };
 }
 
 function hasTierLabel(): string {  const cur = useStore.getState().inds;

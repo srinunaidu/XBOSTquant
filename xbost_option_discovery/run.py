@@ -40,7 +40,7 @@ from .sequences import (add_atomic_events, add_combo_events, add_sequences,
 from .labels import add_labels, FW
 from .validation import chronological_splits, walk_forward, cluster, oos_gate
 from .metrics import (calculate_trade_metrics, metric_recalculation_test,
-                      daily_sharpe, bootstrap_sharpe, surrogate_stats, SHARPE_DEFS,
+                      daily_sharpe, bootstrap_sharpe, permutation_null, SHARPE_DEFS,
                       label_metrics, cap_dominance, block_bootstrap_ci, proportion_ci)
 from .robustness import (concentration, best_removal, time_split, entry_perturbation,
                          exit_independence, parameter_neighborhood, robustness_score)
@@ -70,6 +70,27 @@ MIN_EVENTS = 50
 
 # locked final exit configs by hypothesis (for post-search audits)
 _EXIT_CFG = {}
+
+def _nlargest_candidates(df, col, n=20, fallback="FWD_expectancy"):
+    """Top-`n` candidate ids ranked by `col`, tolerating non-numeric columns.
+
+    Candidate frames mix real numbers with the literal string "NA" for
+    not-calculable metrics, which makes the column object dtype and makes
+    `DataFrame.nlargest` raise. Rank on a coerced numeric copy instead, and
+    fall back to a numeric column when the requested one is unusable, so a
+    leaderboard is always produced instead of aborting the run.
+    """
+    if df is None or len(df) == 0 or "candidate" not in df.columns:
+        return []
+    for key in (col, fallback):
+        if not key or key not in df.columns:
+            continue
+        v = pd.to_numeric(df[key], errors="coerce")
+        if v.notna().any():
+            out = df.assign(_rank=v).nlargest(n, "_rank")["candidate"].tolist()
+            return out
+    return df["candidate"].tolist()[:n]
+
 
 # ledger identity failure counters (§39 TEST 6-9, §48)
 _LEDGER_AUDIT = {"trade_cross_instrument": 0, "trade_cross_symbol": 0,
@@ -368,8 +389,8 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
             _rng = np.random.default_rng(42)
             _dds = []
             for _ in range(50):
-                _eq = pd.Series(_rng.permutation(_r)).cumsum()
-                _dds.append(float((_eq - _eq.cummax()).min()))
+                _eq = (1 + pd.Series(_rng.permutation(_r)) / 100).cumprod()
+                _dds.append(float(((_eq - _eq.cummax()) / _eq.cummax() * 100).min()))
             shufl = {"shuffled_maxDD_mean": round(float(np.mean(_dds)), 4),
                      "observed_maxDD": m_all["maxDD"]}
     except Exception:
@@ -387,10 +408,25 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
     n_clu = int(cl["cluster_id"].nunique())
     ds = daily_sharpe(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
     bs = bootstrap_sharpe(led_all["ret"])
-    sg = surrogate_stats(led_all["ret"], n_perm=int(settings.n_perm))
+    # valid surrogate: event-time permutation null on the ENTRY MASK
+    # (rolling mask within symbol/day blocks; labels untouched)
+    try:
+        _blocks = pd.factorize(feat["symbol"].astype(str) + "|" +
+                               feat["day"].astype(str))[0]
+        sg = permutation_null(mask.values,
+                              pd.to_numeric(feat["fwd_ret_5m"],
+                                            errors="coerce").values,
+                              blocks=_blocks, n_perm=int(settings.n_perm),
+                              seed=int(settings.random_seed), stat="mean")
+        registry.count_test(1)
+    except Exception:
+        sg = {"p_value": float("nan"), "observed": float("nan"),
+              "null_mean": float("nan"), "null_sd": float("nan"),
+              "observed_percentile": float("nan"),
+              "n_perm": 0, "n_events": 0}
     bb = block_bootstrap_ci(led_all["ret"])
     wr_ci = proportion_ci(m_all["wins"], m_all["trade_count"])
-    padj = float(fwd_all["surrogate_p"]) if pd.notna(fwd_all["surrogate_p"]) else 1.0
+    padj = float(sg["p_value"]) if pd.notna(sg["p_value"]) else 1.0
     og = oos_gate(len(led_oos), settings.min_oos_events) if oos_days else "THIN_OOS"
     status = assign_status(len(led_all), n_clu, int(feat.loc[mask, "day"].nunique()),
                            len(led_oos),
@@ -513,13 +549,15 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
         "OOS_result": ("OOS_SURVIVED_MARK" if oos_trading_pass else "OOS_REJECTED"),
         "OOS_trading_result": ("OOS_TRADING_RULE_PASS" if oos_trading_pass
                                else "OOS_TRADING_RULE_FAIL"),
+        "oos_gate": og,
+        "days": int(feat.loc[mask, "day"].nunique()),
         "IS_expectancy": m_all["expectancy"], "IS_PF": m_all["PF"],
         "IS_TRADE_SHARPE": m_all["TRADE_SHARPE"], "IS_Sortino": m_all["Sortino"],
         "IS_MAE": m_all["MAE"], "IS_MFE": m_all["MFE"],
         "IS_DAILY_SHARPE": ds["DAILY_SHARPE"],
         "IS_BOOTSTRAP_SHARPE": bs["BOOTSTRAP_SHARPE"],
         "IS_BLOCK_BOOTSTRAP_CI": str(bb["block_bootstrap_ci"]),
-        "WR_CI": str(wr_ci), "IS_SURROGATE_SHARPE": sg["SURROGATE_SHARPE"],
+        "WR_CI": str(wr_ci), "IS_SURROGATE_MEAN": sg.get("observed"),
         "exit_cap_dominated": cap["cap_dominated"],
         "exit_reason_mix": str(cap["exit_reason_mix"]),
         "return_path": str({k: rpath["horizons"].get(k) for k in (1, 3, 5, 10, 15, 30)}),
@@ -558,7 +596,7 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
     row["edge_kind"] = lad["edge_kind"]
     row["edge_fails_at"] = lad["fails_at"]
     # surrogate transparency (FIX 3): full null summary + empirical percentile
-    row["surrogate_observed"] = sg.get("SURROGATE_SHARPE")
+    row["surrogate_observed"] = sg.get("observed")
     row["surrogate_mean"] = sg.get("surrogate_mean")
     row["surrogate_sd"] = sg.get("surrogate_sd")
     row["surrogate_percentile"] = sg.get("observed_percentile")
@@ -820,11 +858,17 @@ def contract_levels_and_transfer(row, recipe, own_id, symbol_store,
                       trail=None, trail_cfg=_tc, exit_mode="premium",
                       cid="POOL", verify=False)
         registry.count_test(1)
+        # The partition MUST cover every contract carrying an event in
+        # `bmask`, not just the ones thick enough to appear in level_A
+        # (level_A skips <5-event contracts for reporting). Partitioning
+        # over level_A alone left the pooled P&L containing trades that no
+        # part accounted for, so additivity could never hold and the run
+        # aborted with ENGINE_ERROR_POOL_SUM on ordinary data.
         _ind = [_bt(_scope_feat,
-                    bmask & (_scope_feat["symbol"].astype(str) == _a["contract"]),
+                    bmask & (_scope_feat["symbol"].astype(str) == _inst),
                     hold_bars=hold, sl=sl, tp=tp, trail=None, trail_cfg=_tc,
                     exit_mode="premium", cid="INDP", verify=False)
-                for _a in out["level_A"]]
+                for _inst in _insts]
         for _l in _ind:
             registry.count_test(1)
         out["test10"] = audit_pool_sum(_pooled, _ind)
@@ -2100,6 +2144,12 @@ def main():
                 cands_df["perm_p_holm"] = cands_df["perm_p_adj"]
                 cands_df["perm_p_bonf"] = cands_df["perm_p_adj"]
             cands_df["mt_pass"] = (cands_df["perm_p_adj"] < 0.10).astype(str)
+            # retier from BH-adjusted p: tier never more optimistic than
+            # the multiple-testing gate acting on the same row
+            from .reporting import retier_from_adjusted
+            cands_df = retier_from_adjusted(
+                cands_df, max_padj=0.10,
+                min_oos_events=settings.min_oos_events)
             for obj, col in [("sharpe", "IS_TRADE_SHARPE"), ("expectancy", "FWD_expectancy"),
                              ("pf", "FWD_PF"), ("oos", "FWD_OOS_expectancy"),
                              ("robustness", "robustness_score")]:
@@ -2286,62 +2336,47 @@ def main():
         print(f"GLOBAL_TEST_COUNT={hreg.global_test_count} "
               f"UNIQUE_HYPOTHESES={hreg.n} DUPLICATES={hreg.duplicate_count} "
               f"CLONES={hreg.clone_count}")
-        # FIX 3 surrogate transparency: full null distribution + empirical
-        # percentile for top validation candidates, written to file
+        # FIX 3 surrogate transparency: event-time permutation null per
+        # top candidate (mask rolled within symbol/day blocks; labels
+        # untouched) — the only valid surrogate in this package
         import json as _js
         surr_out = []
         if len(cands_df):
             _top = cands_df.nlargest(min(20, len(cands_df)),
                                      "FWD_IS_expectancy")
-            _rng = np.random.default_rng(42)
             for _, _r in _top.iterrows():
                 _ss = symbol_store.get(_r.get("symbol_id"), {})
                 _m = _ss.get("masks", {}).get(_r["hypothesis_id"])
-                _cfg = _EXIT_CFG.get(_r["hypothesis_id"], {})
-                if _m is None or not _cfg:
+                _feat = _ss.get("feat")
+                if _m is None or _feat is None or len(_feat) == 0:
                     continue
                 try:
-                    _tc = _cfg.get("trail_cfg")
-                    _led = backtest(_ss["feat"], _m.fillna(False),
-                                    hold_bars=int(_cfg.get("hold", 5)),
-                                    sl=float(_cfg.get("sl", 0.5)),
-                                    tp=float(_cfg.get("tp", 1.0)),
-                                    trail=None,
-                                    trail_cfg=None if (
-                                        not _tc or _tc.get("kind") == "none")
-                                    else _tc,
-                                    stop_type=_cfg.get("stop_type",
-                                                       "FIXED_PERCENT"),
-                                    target_type=_cfg.get("target_type",
-                                                         "FIXED_PERCENT"),
-                                    trail_type=_cfg.get("trail_type", "NONE"),
-                                    exit_mode="premium", cid="SURR",
-                                    verify=False)
-                    _rv = pd.to_numeric(_led["ret"], errors="coerce").dropna().values
-                    if len(_rv) < 10:
-                        continue
-                    _obs = float(np.mean(_rv) / (np.std(_rv) + 1e-9) * np.sqrt(len(_rv)))
-                    _null = [float(np.mean(_p) / (np.std(_p) + 1e-9) * np.sqrt(len(_p)))
-                             for _p in (_rng.permutation(_rv)
-                                        for _ in range(int(settings.n_perm)))]
+                    _blocks = pd.factorize(
+                        _feat["symbol"].astype(str) + "|" +
+                        _feat["day"].astype(str))[0]
+                    _null = permutation_null(
+                        _m.fillna(False).values,
+                        pd.to_numeric(_feat["fwd_ret_5m"],
+                                      errors="coerce").values,
+                        blocks=_blocks, n_perm=int(settings.n_perm),
+                        seed=int(settings.random_seed), stat="mean")
                     surr_out.append({
                         "hypothesis_id": _r["hypothesis_id"],
                         "symbol_id": _r.get("symbol_id", ""),
-                        "observed_sharpe": round(_obs, 4),
-                        "surrogate_mean": round(float(np.mean(_null)), 4),
-                        "surrogate_sd": round(float(np.std(_null)), 4),
-                        "empirical_percentile": round(
-                            float((np.array(_null) < _obs).mean() * 100), 2),
-                        "p_value": round(float((np.sum(np.abs(_null) >= abs(_obs)) + 1)
-                                               / (int(settings.n_perm) + 1)), 4),
-                        "n_perm": int(settings.n_perm),
-                        "null_distribution": [round(float(x), 4) for x in _null]})
+                        "observed_mean": _null.get("observed"),
+                        "surrogate_mean": _null.get("null_mean"),
+                        "surrogate_sd": _null.get("null_sd"),
+                        "empirical_percentile": _null.get("observed_percentile"),
+                        "p_value": _null.get("p_value"),
+                        "n_perm": _null.get("n_perm"),
+                        "n_events": _null.get("n_events"),
+                        "method": "event-time mask roll within (symbol,day) blocks"})
                 except Exception:
                     continue
             with open(os.path.join(outdir, "surrogate_distributions.json"), "w") as _sf:
                 _js.dump(surr_out, _sf, indent=1)
             print(f"SURROGATE_DISTRIBUTIONS written for {len(surr_out)} candidates "
-                  f"(null + empirical percentile; FIX 3)")
+                  f"(event-time permutation null; FIX 3)")
         # execution/data limitation statuses aggregated across symbols
         # (§14/§15, FIX 8/9/10)
         _any_bidask = any(v.get("has_bidask", False)
@@ -2390,6 +2425,7 @@ def main():
         boards = {}
         if len(cands_df):
             num = cands_df.copy()
+            num["_cand_ord"] = range(len(num))
             boards["TOP_INFORMATIONAL"] = num.nlargest(20, "FWD_expectancy")["candidate"].tolist()
             boards["TOP_PREDICTIVE"] = num.nlargest(20, "FWD_IS_expectancy")["candidate"].tolist()
             boards["TOP_ENTRY"] = boards["TOP_PREDICTIVE"]
@@ -2414,10 +2450,8 @@ def main():
                     boards[f"TOP_SYMBOL_{_s}"] = _g.nlargest(
                         20, "FWD_IS_expectancy")["candidate"].tolist()
             if "contract" in num:
-                boards["TOP_CONTRACT"] = num.nlargest(
-                    20, "contract_positive_fraction"
-                    if "contract_positive_fraction" in num else "FWD_expectancy")[
-                    "candidate"].tolist()
+                boards["TOP_CONTRACT"] = _nlargest_candidates(
+                    num, "contract_positive_fraction", 20)
             if "return_path_class" in num:
                 boards["TOP_RETURN_PATH"] = num[
                     num["return_path_class"] != "NOISE"].nlargest(

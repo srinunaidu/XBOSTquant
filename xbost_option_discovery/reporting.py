@@ -33,6 +33,55 @@ def assign_status(n, n_clu, days, oos_n, oos_mean, train_mean, padj, conc, thin_
         return "OOS_SURVIVED"
     return "ROBUST"
 
+def retier_from_adjusted(cands, max_padj=0.10, min_oos_events=20):
+    """Recompute `final_status` / `failure_reason` from the BH-ADJUSTED p.
+
+    The statistical tier must never be more optimistic than the
+    multiple-testing gate acting on the same row: the eval-time tier uses
+    the raw permutation p while F11/paper use `perm_p_adj`, so without this
+    a row could read OOS_SURVIVED while rejected for data-snooping."""
+    if cands is None or len(cands) == 0:
+        return cands
+    df = cands.copy()
+    statuses, fails = [], []
+    for _, r in df.iterrows():
+        og = str(r.get("oos_gate", "THIN_OOS") or "THIN_OOS")
+        padj = r.get("perm_p_adj", 1.0)
+        try:
+            padj = float(padj) if padj == padj else 1.0
+        except (TypeError, ValueError):
+            padj = 1.0
+        st = assign_status(int(r["events"]), int(r["clusters"]), int(r.get("days", 0)),
+                           int(r.get("OOS_events", 0)), r.get("FWD_OOS_expectancy", float("nan")),
+                           r.get("FWD_IS_expectancy", float("nan")), padj,
+                           r.get("top5", 1.0), og,
+                           cap_dominated=bool(r.get("exit_cap_dominated", False)))
+        if str(r.get("METRIC_INTEGRITY")) == "FAIL":
+            st = "REJECTED"
+        reasons = []
+        if og == "THIN_OOS":
+            reasons.append("THIN_OOS")
+        try:
+            _top5 = float(r.get("top5", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            _top5 = 1.0
+        if _top5 > 0.5:
+            reasons.append("concentration")
+        if not (padj < max_padj):
+            reasons.append("surrogate-fail")
+        if str(r.get("METRIC_INTEGRITY")) == "FAIL":
+            reasons.append("metric-fail")
+        if bool(r.get("exit_cap_dominated", False)):
+            reasons.append("exit-cap-dominated")
+        if str(r.get("OOS_result")) != "OOS_SURVIVED_MARK":
+            reasons.append("OOS_REJECTED")
+        statuses.append(st)
+        fails.append(";".join(reasons) if reasons else "none")
+    df["final_status"] = statuses
+    df["failure_reason"] = fails
+    return df
+
+
 def paper_gate(df):
     # §32: one-month data -> PAPER_ELIGIBLE=NO unless every gate passes
     if len(df) == 0:

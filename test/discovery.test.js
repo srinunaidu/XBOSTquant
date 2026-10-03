@@ -114,7 +114,16 @@ test('end-to-end run on 2-day sample file', () => {
   assert.ok(res.chainMetadata.n_contracts >= 6);
   assert.ok(logs.some(l => l.includes('EXIT_PARAMETER_PROPAGATION = PASS')));
   assert.ok(logs.some(l => l.includes('NO_LOOKAHEAD_TEST = PASS')));
-  assert.ok(res.statusBar.PAPER_ELIGIBLE === 'FALSE');
+  // PAPER gate is DERIVED from measured evidence (never hardcoded). This engine
+  // runs cost_mode=ZERO, so promotion must be refused with an explicit cost reason.
+  assert.equal(res.statusBar.PAPER_ELIGIBLE, res.boards.PAPER_ELIGIBLE.length > 0 ? 'TRUE' : 'FALSE');
+  assert.equal(res.statusBar.PAPER_ELIGIBLE, res.finalReport.PAPER_ELIGIBLE ? 'TRUE' : 'FALSE');
+  assert.equal(res.boards.PAPER_ELIGIBLE.length, 0);
+  for (const c of res.candidates) {
+    assert.equal(c.paper_eligible, (c.paper_blockers || []).length === 0);
+    assert.ok((c.paper_blockers || []).some(b => b.startsWith('cost_model_real')),
+      'zero-cost run must name the cost blocker: ' + JSON.stringify(c.paper_blockers));
+  }
 });
 
 /* TEST 1–12 acceptance: reported wide-file shape (12 contracts, 2 expiries,
@@ -344,17 +353,73 @@ test('EXP TEST12: OOS tested/positive/threshold/final counts separate + consiste
   }
 });
 
+test('EXP TEST12b: statistical tier uses the BH-adjusted p, not the raw p', () => {
+  for (const c of EXPFULL.candidates) {
+    // BH only ever increases p-values
+    if (!isNaN(c.perm_p) && !isNaN(c.perm_p_adj)) {
+      assert.ok(c.perm_p_adj >= c.perm_p - 1e-12, `BH lowered p: ${c.perm_p} -> ${c.perm_p_adj}`);
+    }
+    if (c.final_status === 'OOS_SURVIVED' || c.final_status === 'ROBUST') {
+      assert.ok(c.perm_p_adj < 0.10,
+        `survivor ${c.candidate} must clear the ADJUSTED p, got raw=${c.perm_p} adj=${c.perm_p_adj}`);
+      // the multiple-testing board must never omit an advertised survivor
+      assert.ok(EXPFULL.boards.TOP_MT.indexOf(c.candidate) >= 0,
+        `TOP_MT must be a superset of survivors; missing ${c.candidate}`);
+    }
+  }
+  for (const id of EXPFULL.boards.TOP_MT) {
+    assert.ok(EXPFULL.candidates.some(c => c.candidate === id), 'TOP_MT id must resolve to a candidate');
+  }
+  // any row whose raw p cleared but whose adjusted p did not must be downgraded
+  for (const c of EXPFULL.candidates.filter(x => x.perm_p < 0.10 && !(x.perm_p_adj < 0.10))) {
+    assert.ok(['OOS_SURVIVED', 'ROBUST'].indexOf(c.final_status) < 0,
+      `${c.candidate} escaped multiple-testing correction (adj=${c.perm_p_adj})`);
+  }
+});
+
+test('EXP TEST12c: tier recompute unit — adjusted p drives status/failure_class/TIER', () => {
+  const mk = () => ({ candidate: 'U', events: 100, clusters: 20, day_count: 10, top5: 0.2,
+    exit_cap_dominated: false, FWD_IS_expectancy: 0.5, FWD_OOS_expectancy: 0.4,
+    OOS_result: 'OOS_SURVIVED_MARK', OOS_gate: 'OOS_OK', perm_p: 0.001,
+    final_status: 'OOS_SURVIVED', failure_reason: 'none', failure_class: 'NONE', TIER: 4 });
+  const a = Object.assign(mk(), { perm_p_adj: 0.20 });
+  OD.recomputeStatusFromAdjusted([a], { minEvents: 50, maxPadj: 0.10 });
+  assert.equal(a.final_status, 'SURROGATE_REJECTED');
+  assert.equal(a.failure_class, 'MULTIPLE_TESTING');
+  assert.equal(a.TIER, 2);
+  assert.ok(a.failure_reason.indexOf('surrogate-fail') >= 0);
+  assert.equal(a.perm_p, 0.001, 'raw p preserved');
+  assert.equal(a.perm_p_adj, 0.20, 'adjusted p preserved');
+  const b = Object.assign(mk(), { perm_p_adj: 0.03 });
+  OD.recomputeStatusFromAdjusted([b], { minEvents: 50, maxPadj: 0.10 });
+  assert.equal(b.final_status, 'OOS_SURVIVED');
+  assert.equal(b.TIER, 4);
+  assert.equal(b.failure_class, 'NONE');
+  const c2 = Object.assign(mk(), { perm_p_adj: 0.07 });
+  OD.recomputeStatusFromAdjusted([c2], { minEvents: 50, maxPadj: 0.10 });
+  assert.equal(c2.final_status, 'ROBUST');
+  assert.equal(c2.TIER, 5);
+});
+
 test('EXP TEST13: feature missingness explained (causes sum to total)', () => {
   //missingness is computed in-engine; verify audit rows exist in a fresh small run
   const small = OD.run(WIDE12, Object.assign({}, EXPCFG, { rounds: [1], maxTotalCandidates: 5 }), null, null);
   assert.ok(small.log.some(l => l.indexOf('MISSINGNESS worst:') >= 0));
 });
 
-test('EXP TEST16: paper only via frozen pipeline (never assigned here)', () => {
+test('EXP TEST16: paper gate is DERIVED; zero-cost run always refused', () => {
   for (const c of EXPFULL.candidates) {
     assert.notEqual(c.final_status, 'PAPER_ELIGIBLE');
+    // the gate is self-consistent: eligible iff no blocker was measured
+    assert.equal(c.paper_eligible, (c.paper_blockers || []).length === 0);
+    assert.ok((c.paper_blockers || []).some(b => b.startsWith('cost_model_real')),
+      'zero-cost run must name the cost blocker: ' + JSON.stringify(c.paper_blockers));
   }
-  assert.ok(EXPFULL.boards.PAPER_ELIGIBLE.length === 0);
+  const derived = EXPFULL.candidates.filter(c => c.paper_eligible).map(c => c.candidate);
+  assert.deepEqual(EXPFULL.boards.PAPER_ELIGIBLE, derived);
+  assert.equal(EXPFULL.boards.PAPER_ELIGIBLE.length, 0);
+  assert.equal(EXPFULL.finalReport.PAPER_ELIGIBLE, false);
+  assert.equal(EXPFULL.finalReport.PAPER_ELIGIBLE_COUNT, 0);
   assert.ok(EXPFULL.boards.TOP_TRAIN.length > 0);
 });
 
@@ -443,7 +508,10 @@ test('ADAPT checkpoint resume + termination + winner rules', () => {
   assert.equal(resumed.newUnique, resumed.hypothesisTotals.unique - part.checkpoint.seen.length);
   const tiny = OD.run(ADAPT_CSV, { focusStrikes: 2, minEvents: 40, nPerms: 10, seed: 5, maxTotalCandidates: 3 }, null, null);
   assert.equal(tiny.finalStatus, 'SEARCH_BUDGET_EXHAUSTED');
-  for (const c of ADAPT_RUN.candidates) assert.equal(c.paper_eligible, false);
+  for (const c of ADAPT_RUN.candidates) {
+    assert.equal(c.paper_eligible, (c.paper_blockers || []).length === 0);
+    assert.ok((c.paper_blockers || []).some(b => b.startsWith('cost_model_real')));
+  }
   assert.ok(ADAPT_RUN.globalTests >= ADAPT_RUN.hypothesisTotals.total);
 });
 
@@ -513,14 +581,17 @@ test('NINE underlying ordered attempts; moneyness bands only with reference', ()
   assert.equal(u.reference, null);
 });
 
-test('NINE final status is always a valid state; paper never auto-assigned', () => {
+test('NINE final status is always a valid state; paper derived, never auto-assigned', () => {
   const valid = ['VALIDATED_EDGE_FOUND', 'NO_EDGE_FOUND_WITHIN_SEARCH_BUDGET',
     'SEARCH_BUDGET_EXHAUSTED', 'INSUFFICIENT_DATA', 'ENGINE_ERROR', 'BLOCKED_DATA',
     'BLOCKED_PARSER', 'BLOCKED_CHAIN', 'BLOCKED_FEATURES', 'BLOCKED_TRUE_LOOKAHEAD',
     'BLOCKED_AUDIT_MISMATCH', 'BLOCKED_PNL_NAN', 'DISCOVERY_EDGE_OOS_FAILED', 'DISCOVERY_COMPLETED_NO_EDGE'];
   assert.ok(valid.indexOf(ADAPT_RUN.finalStatus) >= 0);
-  for (const c of ADAPT_RUN.candidates) assert.equal(c.paper_eligible, false);
-  assert.ok(ADAPT_RUN.finalReport && ADAPT_RUN.finalReport.PAPER_ELIGIBLE === false);
+  for (const c of ADAPT_RUN.candidates) {
+    assert.equal(c.paper_eligible, (c.paper_blockers || []).length === 0);
+    assert.ok(c.paper_blockers.length > 0, 'zero-cost engine blocks every candidate');
+  }
+  assert.ok(ADAPT_RUN.finalReport && ADAPT_RUN.finalReport.PAPER_ELIGIBLE === (ADAPT_RUN.boards.PAPER_ELIGIBLE.length > 0));
   assert.ok(ADAPT_RUN.finalReport.ROUNDS_COMPLETED > 0);
 });
 

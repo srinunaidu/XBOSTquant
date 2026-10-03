@@ -8,6 +8,38 @@ def fingerprint(cid, sl, tp, trail, exit_mode, hold_bars=5):
     return (f"candidate_id={cid}|sl={sl}|tp={tp}|trail={trail}|exit_mode={exit_mode}"
             f"|hold={hold_bars}|cost=ZERO|model=RESEARCH")
 
+
+class MarketCache:
+    """Per-contract numpy arrays + timestamp->position map, built once per
+    run. Import-compatible cache structure for vectorized forward-bar
+    lookups (used by grid-alignment-aware execution paths)."""
+
+    def __init__(self, feat):
+        self.d = {}
+        sym = feat["symbol"].astype(str)
+        for k, g in feat.groupby(sym, sort=False):
+            g = g.sort_values("timestamp")
+            ts = pd.to_datetime(g["timestamp"])
+            n = len(g)
+            rec = {"n": n, "ts": ts.to_numpy(),
+                   "day": ts.dt.normalize().to_numpy(),
+                   "pos": {pd.Timestamp(t): i for i, t in enumerate(ts)}}
+            for c in ("open", "high", "low", "close", "volume"):
+                rec[c] = (pd.to_numeric(g[c], errors="coerce").to_numpy(dtype=float)
+                          if c in g.columns else np.full(n, np.nan))
+            rec["expiry"] = (g["expiry"].to_numpy() if "expiry" in g
+                             else np.array(["UNKNOWN"] * n, dtype=object))
+            rec["strike"] = (pd.to_numeric(g["strike"], errors="coerce").to_numpy(dtype=float)
+                             if "strike" in g else np.full(n, np.nan))
+            rec["option_type"] = (g["option_type"].to_numpy() if "option_type" in g
+                                  else np.array(["UNKNOWN"] * n, dtype=object))
+            fin = np.flatnonzero(np.isfinite(rec["close"]))
+            rec["last_day"] = rec["day"][fin[-1]] if len(fin) else None
+            self.d[str(k)] = rec
+
+    def get(self, key):
+        return self.d.get(str(key))
+
 def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="premium",
              cid="CAND", direction="long", verify=True, trail_cfg=None,
              stop_type="FIXED_PERCENT", target_type="FIXED_PERCENT",
@@ -140,7 +172,7 @@ def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="pre
         if not np.isfinite(exit_px) or not exit_px > 0:
             skipped["nan_exit"] += 1
             continue
-        ret = (exit_px / entry * 100 - 100) if direction == "long" else (entry / exit_px * 100 - 100)
+        ret = (exit_px / entry * 100 - 100) if direction == "long" else ((entry - exit_px) / entry * 100)
         mae = (entry - trough) / entry * 100 if direction == "long" else (peak - entry) / entry * 100
         mfe = (peak - entry) / entry * 100 if direction == "long" else (entry - trough) / entry * 100
         rows.append({"trade_id": f"{cid}#{len(rows)}",

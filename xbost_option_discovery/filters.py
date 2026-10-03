@@ -6,9 +6,15 @@ def run_filters(cands_df, min_events=50, min_oos_events=20):
     """Sequential filters F1..F13 over candidate rows. Returns (survivors, log)."""
     log = []
     if cands_df is None or len(cands_df) == 0:
-        log.append({"filter": "F1_DATA_QUALITY", "input_count": 0,
-                    "passed_count": 0, "rejected_count": 0,
-                    "rejection_reason": "no candidates produced"})
+        # fail-closed full pipeline log (never crash, never claim survivors)
+        for _f in ("F1_DATA_QUALITY", "F2_LIQUIDITY", "F3_CHAIN_QUALITY",
+                   "F4_EVENT_QUALITY", "F5_FORWARD_EDGE", "F6_SAMPLE_SIZE",
+                   "F7_CLUSTER_INDEPENDENCE", "F8_TRAIN_VALIDATION", "F9_OOS",
+                   "F10_ROBUSTNESS", "F11_MULTIPLE_TESTING", "F12_EXECUTION",
+                   "F13_PAPER_GATE"):
+            log.append({"filter": _f, "input_count": 0,
+                        "passed_count": 0, "rejected_count": 0,
+                        "rejection_reason": "no candidates produced"})
         return cands_df, log
 
     def stage(name, df, keep, reason):
