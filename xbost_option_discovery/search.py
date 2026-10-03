@@ -415,3 +415,80 @@ def save_checkpoint(path, payload):
 def load_checkpoint(path):
     with open(path) as f:
         return json.load(f)
+
+
+class MethodMemory:
+    """§19: learn from failure. Per-method attempts/coverage/signals/
+    survivors/failures steer priority — failed methods deprioritize,
+    exit-unresolved methods boost exit research. Never reruns blindly."""
+
+    def __init__(self):
+        self.methods = {}
+
+    def _m(self, mid, requirements=""):
+        return self.methods.setdefault(mid, {
+            "method_id": mid, "data_requirements": requirements,
+            "attempts": 0, "eligible_rows": 0, "coverage": 0.0,
+            "signals_found": 0, "oos_survivors": 0, "validated_edges": 0,
+            "failure_state": "", "failure_reason": "",
+            "compute_total": 0.0, "average_compute": 0.0})
+
+    def record(self, mid, eligible_rows, coverage, found_signal=False,
+               oos_survived=False, validated=False, failure_state="",
+               reason="", compute_s=0.0, requirements=""):
+        m = self._m(mid, requirements)
+        m["attempts"] += 1
+        m["eligible_rows"] = int(eligible_rows)
+        m["coverage"] = float(coverage)
+        m["signals_found"] += int(bool(found_signal))
+        m["oos_survivors"] += int(bool(oos_survived))
+        m["validated_edges"] += int(bool(validated))
+        if failure_state:
+            m["failure_state"] = failure_state
+            m["failure_reason"] = reason
+        m["compute_total"] += float(compute_s)
+        m["average_compute"] = m["compute_total"] / max(1, m["attempts"])
+        return m
+
+    def priority(self, mid, novelty=1.0, remaining=1.0):
+        """§8: coverage × sample × history × novelty / cost (research
+        prioritization only, never a trading-performance score). Untried
+        methods score ~1.0; productive history raises, structural blocks
+        lower steeply."""
+        m = self.methods.get(mid)
+        if m is None:
+            return novelty * remaining
+        cov = max(0.2, min(1.0, m["coverage"] * 10.0))
+        samp = min(1.0, m["eligible_rows"] / 200.0)
+        hist = 1.0 + m["signals_found"] - 2.0 * (
+            m["attempts"] - m["signals_found"]) * 0.25
+        hist = max(0.1, hist)
+        if m["failure_state"] in ("NO_MATCHING_ROWS", "INSUFFICIENT_DATA",
+                                  "UNSUPPORTED_METHOD", "INSUFFICIENT_VARIATION"):
+            hist *= 0.2  # structurally blocked: deprioritize hard
+        cost = max(0.5, m["average_compute"] * 10.0)
+        return max(0.01, cov * samp * hist * novelty * remaining / cost)
+
+    def to_json(self):
+        return list(self.methods.values())
+
+    def load(self, items):
+        for it in items or []:
+            self.methods[it["method_id"]] = it
+
+
+# §4 relationship fallback chain: relax stepwise, never repeat impossibles
+FALLBACK_CHAIN = ("cross_expiry", "same_expiry", "same_strike_cepe",
+                  "adjacent_strike", "single_contract_temporal")
+
+
+def next_fallback(failed_level, tried):
+    """Return the next untried fallback level, or None when exhausted."""
+    try:
+        i = FALLBACK_CHAIN.index(failed_level)
+    except ValueError:
+        i = -1
+    for lvl in FALLBACK_CHAIN[i + 1:]:
+        if lvl not in tried:
+            return lvl
+    return None

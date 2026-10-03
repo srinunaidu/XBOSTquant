@@ -61,7 +61,9 @@ from .generalization import (contract_generalization, strike_robustness,
                              time_robustness, regime_robustness)
 from .edge_ladder import (edge_ladder, final_status, paper_eligible,
                            discovery_category, edge_levels_l1_l8, oos_stage,
-                           oos_final_survivor)
+                           oos_final_survivor, ladder_l1_l10,
+                           frontier_bucket, final_research_state)
+from .research_state import classify_candidate, TERMINAL as _TERMINAL_STATES
 
 LAG_WINDOWS = (1, 2, 3, 5, 10)
 MIN_EVENTS = 50
@@ -127,6 +129,22 @@ FAMILY_BUCKET = {
 
 def _bucket(fam):
     return FAMILY_BUCKET.get(fam, "MOMENTUM")
+
+
+def level_of(fam, depth=1):
+    """§7 progressive discovery levels A(raw) → B(temporal) → C(volume) →
+    D(cross-contract) → E(conditional) → F(higher-order)."""
+    if depth >= 3 or (fam == "COMBINATION" and depth >= 3):
+        return "F"
+    if fam == "COMBINATION":
+        return "E"
+    if fam in ("RAW_OPTION_PRICE",):
+        return "A"
+    if fam in ("EVENT", "SEQUENCE", "CHAIN_STATE", "CHAIN_BREADTH"):
+        return "B"
+    if fam in ("OPTION_VOLUME",):
+        return "C"
+    return "D"
 
 
 def _shift_mask(feat, mask, k):
@@ -451,6 +469,7 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
         "entry_best_variant": entry_best, "entry_variants": str(entry_variants),
         "entry_timing": entry_best, "entry_price_rule": "signal bar close t",
         "strategy_scope": "SINGLE_CONTRACT",
+        "discovery_level": level_of(fam, depth),
         "mask_recipe": __import__("json").dumps(
             item_recipe or {}, default=str),
         "exit_rule": f"hold={hold}/sl={sl}/tp={tp}/trail={trail_cfg} "
@@ -585,6 +604,20 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
                               ("trade_cross_instrument", "trade_cross_symbol",
                                "trade_cross_expiry",
                                "ledger_identity_fail")) == 0 else "FAIL")
+    # research state (§1): classified attempt, never a silent outcome
+    row["research_state"] = classify_candidate(
+        bool(info_pos), bool(trad_pos), bool(oos_trading_pass),
+        bool(rs["robustness_score"] >= 4.0),
+        bool(padj < 0.10), bool(has_bidask),
+        bool(code in ("ENTRY_PROMISING_EXIT_UNRESOLVED",
+                      "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED")))
+    # horizon eligibility (§5/§6): only sufficient horizons are trusted
+    try:
+        from .capability import horizon_eligibility
+        row["horizon_status"] = str(horizon_eligibility(
+            feat, mask, (1, 3, 5, 10, 15, 30), min_events))
+    except Exception:
+        row["horizon_status"] = "UNTESTABLE"
     # research-registry status (§33)
     if code == "ENTRY_PROMISING_EXIT_UNRESOLVED":
         reg_status = "ENTRY_PROMISING_EXIT_UNRESOLVED"
@@ -1091,8 +1124,12 @@ def main():
         prop_by_symbol = {}
         symbol_health = {}
         symbol_ok = {}
+        cap_by_symbol = {}
         from .exits import reset_audit as _reset_exit_audit
         _reset_exit_audit()
+        from .search import MethodMemory
+        method_memory = MethodMemory()
+        method_states = {}
         for _sym_idx, (_sym_id, _sym_norm) in enumerate(symbol_frames):
             norm = _sym_norm
             sym_id = _sym_id
@@ -1249,11 +1286,39 @@ def main():
             for _, r in fq.head(30).iterrows():
                 print(f"  {r['feature']}: missing={r['missing_fraction']} tier={r['tier']} "
                       f"usable={r['usable_event_count']}")
+            # ---- data capability map (§2/§3): gate methods on what the
+            # data can actually support; skipped != failed
+            from .capability import (build_capability_map, capability_matrix,
+                                     feature_capability)
+            _caps = build_capability_map(norm, a.min_events)
+            cap_by_symbol[sym_id] = _caps
+            print(f"DATA_CAPABILITY [{sym_id}]:")
+            for _mrow in capability_matrix(_caps):
+                print(f"  {_mrow['capability']}: {_mrow['status']}")
+            _fcap = feature_capability(feat, probe_cols)
+            _unusable = set(_fcap[~_fcap["usable_for_discovery"]]["feature"].tolist())
+            if _unusable:
+                print(f"CAPABILITY_GATED_FEATURES={sorted(_unusable)[:10]} "
+                      f"(UNSUPPORTED_METHOD, skipped — not failed)")
+            _vol_ok = _caps.get("field:volume") in ("AVAILABLE", "PARTIAL")
+            _x_ok = _caps.get("overlap:cross_contract") in ("AVAILABLE", "PARTIAL")
+            if not _vol_ok:
+                print("VOLUME_METHODS=SKIPPED (no volume capability)")
+            if not _x_ok:
+                print("CROSS_CONTRACT_METHODS=SKIPPED (no overlap; "
+                      "fallback single-contract temporal)")
+            n_disabled = int((fq["tier"] == "DISABLED").sum()) if len(fq) else 0
+            print(f"FEATURE_QUALITY features={len(fq)} disabled={n_disabled}")
+            for _, r in fq.head(30).iterrows():
+                print(f"  {r['feature']}: missing={r['missing_fraction']} tier={r['tier']} "
+                      f"usable={r['usable_event_count']}")
 
-            # ---- lead/lag screening (staged, §21) ----
+            # ---- lead/lag screening (§21, §4 fallback): skipped entirely
+            # when no cross-contract overlap (UNSUPPORTED_METHOD, not failure)
             ll_rows = []
+            ll_method_state = "UNSUPPORTED_METHOD" if not _x_ok else "ATTEMPTED"
             by_sym = {s: g.set_index("timestamp").sort_index()
-                      for s, g in feat.groupby("symbol")}
+                      for s, g in feat.groupby("symbol")} if _x_ok else {}
             for src, tgt in itertools.permutations(sorted(by_sym), 2):
                 for k in LAG_WINDOWS:
                     common = by_sym[src].index.intersection(by_sym[tgt].index)
@@ -1286,7 +1351,22 @@ def main():
             default_exit = None
             depth1 = build_depth1_specs(feat, mods, strikes, lead_cols,
                                         a.min_events, quality)
-            print(f"DEPTH1_SPECS={len(depth1)}")
+            # capability gating (§3/§7): skip methods the data cannot
+            # support (UNSUPPORTED_METHOD) — Level C volume / Level D
+            # cross-contract only when capabilities allow
+            _skip_fams = set()
+            if not _vol_ok:
+                _skip_fams.add("OPTION_VOLUME")
+            if not _x_ok:
+                _skip_fams.update(["OPTION_TYPE_RELATIONSHIP",
+                                   "STRIKE_RELATIONSHIP", "LEAD_LAG"])
+            _n0 = len(depth1)
+            depth1 = [sp for sp in depth1 if sp["family"] not in _skip_fams]
+            method_skipped = {}
+            for _sf in _skip_fams:
+                method_skipped[_sf] = "UNSUPPORTED_METHOD"
+            print(f"DEPTH1_SPECS={len(depth1)} (gated_out={_n0 - len(depth1)} "
+                  f"families={sorted(_skip_fams) if _skip_fams else 'none'})")
             # seed frontier with depth-1 specs (iterative queue)
             for i, sp in enumerate(depth1):
                 reg = hreg.register(f"ATOMIC-{i}", sp["family"], sp["feature"],
@@ -1341,6 +1421,8 @@ def main():
             fam_rejected = 0
             budget_hit = False
             stop_why = ""
+            has_promising_d2 = False  # §7F: depth-3 only after depth-2 signal
+            gated_depth3 = 0
 
             def _mem():
                 try:
@@ -1416,16 +1498,34 @@ def main():
                     break
                 n_round += 1
                 round_fam = {}  # per-round quota counters (§7: quota per round batch)
-                batch = frontier.pop_batch(min(settings.maxEvaluationBatch,
-                                               settings.maxRawCandidatesPerRound),
-                                           fam_counts)
+                # §23/§24 compression past soft targets: halve breadth,
+                # exploit frontier, keep going (soft budgets never terminate)
+                _soft_hit = (n_round > int(settings.maxRounds) or
+                             len(all_rows) >= int(
+                                 getattr(settings, "soft_candidate_budget", 0)
+                                 or settings.maxTotalCandidates))
+                _compressed = bool(_soft_hit and frontier.size() > 0)
+                _batch_k = min(settings.maxEvaluationBatch,
+                               settings.maxRawCandidatesPerRound)
+                if _compressed:
+                    _batch_k = max(1, _batch_k // 2)
+                    print(f"COMPRESSION_ACTIVE round={n_round} batch={_batch_k} "
+                          f"(past soft budget; frontier prioritized, continuing)")
+                # §8 method-priority → novelty: historically productive
+                # methods get attention, structurally blocked ones fade
+                for _it in frontier.items.values():
+                    if _it["status"] != "QUEUED":
+                        continue
+                    _mp = method_memory.priority(
+                        f"{sym_id}:{_it['family']}", novelty=1.0,
+                        remaining=1.0)
+                    _it["novelty"] = round(max(0.3, min(2.0, _mp)), 3)
+                batch = frontier.pop_batch(_batch_k, fam_counts)
                 if not batch and frontier.size() > 0:
                     # family stops starved the batch while work remains: lift
                     # stops and repop rather than burning a round (§7/§21)
                     frontier.stopped_families = set()
-                    batch = frontier.pop_batch(
-                        min(settings.maxEvaluationBatch,
-                            settings.maxRawCandidatesPerRound), fam_counts)
+                    batch = frontier.pop_batch(_batch_k, fam_counts)
                 # batch-proportional quota: each family may take at most
                 # max_family_share of the round batch (min 1 slot); excess items
                 # are deferred only when another family is present in the batch.
@@ -1495,7 +1595,39 @@ def main():
                         depth, exit_cfg, has_bidask, do_exit, True, hreg)
                     if row is None:
                         item["status"] = "REJECTED"
+                        method_memory.record(
+                            f"{sym_id}:{fam}", int(m.sum()), 0.0,
+                            found_signal=False,
+                            failure_state="NO_SIGNAL_FOUND",
+                            reason="below minimum events",
+                            requirements="min_events")
                         continue
+                    # §19 method memory (per-symbol scope: discovery is
+                    # independent per symbol): learn from every attempt
+                    try:
+                        _t0 = wd.candidate_start
+                        import time as _tm
+                        _dt = _tm.time() - _t0
+                    except Exception:
+                        _dt = 0.0
+                    _sig = bool(pd.notna(row["FWD_IS_expectancy"])
+                                and row["FWD_IS_expectancy"] > 0)
+                    method_memory.record(
+                        f"{sym_id}:{fam}", int(m.sum()),
+                        round(int(m.sum()) / max(1, len(feat)), 4),
+                        found_signal=_sig,
+                        oos_survived=row["OOS_trading_result"] == "OOS_TRADING_RULE_PASS",
+                        failure_state="" if _sig else "NO_SIGNAL_FOUND",
+                        reason="" if _sig else row.get("failure_why", ""),
+                        compute_s=_dt)
+                    method_memory.record(
+                        f"{sym_id}:{fam}:exit",
+                        int(m.sum()), 0.0,
+                        found_signal=row.get("exit_discovery_status") == "DISCOVERED",
+                        failure_state="" if row.get("exit_discovery_status") == "DISCOVERED" else row.get("exit_discovery_status", ""),
+                        reason=row.get("unresolved_code", ""))
+                    if _sig and depth == 2:
+                        has_promising_d2 = True
                     if wd.candidate_expired():
                         print(f"SLOW_CANDIDATE {hid} exceeded "
                               f"{wd.candidate_timeout_s:.0f}s")
@@ -1583,10 +1715,14 @@ def main():
                     if fam not in seen_families:
                         new_fams.add(fam)
                         seen_families.add(fam)
-                    # promote to frontier children (§26 iterative, depth-capped)
+                    # promote to frontier children (§26 iterative, depth-capped;
+                    # §7F progressive: depth-3+ only after depth-2 signal exists)
                     promising = pd.notna(row["FWD_IS_expectancy"]) and \
                         row["FWD_IS_expectancy"] > 0 and row["events"] >= a.min_events
-                    if promising and depth < settings.maxCombinationDepth:
+                    if promising and depth + 1 >= 3 and not has_promising_d2:
+                        gated_depth3 += 1
+                        frontier.set_status(hid, "EVALUATED")
+                    elif promising and depth < settings.maxCombinationDepth:
                         # top diverse confirmation legs (not yet dominant)
                         legs = [c for c in
                                 ["e_expansion", "e_vol_shock", "e_compression",
@@ -1733,9 +1869,22 @@ def main():
                 if round_best_oos != float("-inf"):
                     prev_best_oos = max(prev_best_oos, round_best_oos)
                     best_oos = max(best_oos, round_best_oos)
-                # family hard-stop >50% for next cycle (§7)
+                # family hard-stop >50% for next cycle (§7) + §17: a
+                # family with many attempts and zero signals is rested for
+                # the next cycle (change family, never weaken gates)
                 fam_total = max(1, sum(fam_counts.values()))
                 stopped = frontier.update_family_stops(fam_counts, fam_total)
+                for _mm in method_memory.to_json():
+                    if _mm["attempts"] >= 10 and _mm["signals_found"] == 0 \
+                            and not _mm["method_id"].endswith(":exit"):
+                        _fam_only = _mm["method_id"].split(":")[-1]
+                        # per-symbol scope: only rest on the failing symbol
+                        if _mm["method_id"].startswith(f"{sym_id}:"):
+                            stopped.add(_fam_only)
+                            frontier.stopped_families.add(_fam_only)
+                if stopped - set(fam_counts):
+                    print(f"FAMILY_SWITCH rested-on-failure: "
+                          f"{sorted(stopped - set(fam_counts))}")
                 # exit / trading-rule research exhausted? (§25)
                 exit_open = sum(1 for it in frontier.items.values()
                                 if it.get("unresolved_code")
@@ -1989,6 +2138,27 @@ def main():
             cands_df["discovery_category"] = cats
             cands_df["edge_levels_l1_l8"] = lvls
             cands_df["OOS_stage"] = stages
+            # final research states + L1-L10 ladder + frontier buckets
+            # (§1/§20/§25)
+            _frs, _ladd, _lfail, _fb = [], [], [], []
+            for _, r in cands_df.iterrows():
+                _d = r.to_dict()
+                _frs.append(final_research_state(
+                    _d.get("discovery_category"),
+                    _d.get("mt_pass"),
+                    str(_d.get("execution_model"))
+                    == "EXECUTABLE_PRICE_MODEL",
+                    str(_d.get("unresolved_code", "")),
+                    str(_d.get("OOS_trading_result", "")),
+                    float(_d.get("robustness_score") or 0) >= 4.0))
+                _ll = ladder_l1_l10(_d)
+                _ladd.append(str(_ll["levels"]))
+                _lfail.append(_ll["failed_at"])
+                _fb.append(frontier_bucket(_d))
+            cands_df["research_state_final"] = _frs
+            cands_df["ladder_l1_l10"] = _ladd
+            cands_df["ladder_failed_at"] = _lfail
+            cands_df["frontier_bucket"] = _fb
             # contract levels A-D + transfer + TEST 10 (§10/§11/§29/§39)
             # for validation-positive, non-clone candidates with recipes
             _lvl_pool = cands_df[
@@ -2264,6 +2434,49 @@ def main():
         # Any leak → ENGINE_ERROR (§49). No continuation on failure.
         from .identity import run_identity_tests
         _ident = {}
+        # §27 DISCOVERY + FAILURE CLASSIFICATION report
+        print("===== RESEARCH REPORT (§27) =====")
+        if len(cands_df) and "research_state_final" in cands_df:
+            print("FAILURE_CLASSIFICATION:")
+            for _st, _n in cands_df["research_state_final"].value_counts().items():
+                print(f"  {_st}: {_n}")
+        if len(cands_df) and "frontier_bucket" in cands_df:
+            print("FRONTIER_BUCKETS:")
+            for _b, _n in cands_df["frontier_bucket"].value_counts().items():
+                print(f"  {_b}: {_n}")
+        print("METHOD_MEMORY (attempts/signals/OOS/failures):")
+        for _mm in sorted(method_memory.to_json(),
+                           key=lambda x: -x["attempts"])[:20]:
+            print(f"  {_mm['method_id']}: attempts={_mm['attempts']} "
+                  f"eligible={_mm['eligible_rows']} signals={_mm['signals_found']} "
+                  f"oos={_mm['oos_survivors']} validated={_mm['validated_edges']} "
+                  f"fail={_mm['failure_state'] or 'none'} "
+                  f"{(_mm['failure_reason'] or '')[:80]}")
+        # §22 DATA_INSUFFICIENT with evidence (not a silent empty result)
+        if len(cands_df) == 0:
+            _ev_rows = int(len(norm_global))
+            _ev_days = int(pd.to_datetime(
+                norm_global["timestamp"]).dt.date.nunique()) \
+                if len(norm_global) else 0
+            _ev_syms = sorted(norm_global["symbol_id"].astype(str).unique().tolist()) \
+                if "symbol_id" in norm_global.columns else []
+            print("DATA_ASSESSMENT: zero candidates evaluated across all symbols")
+            print(f"  available_rows={_ev_rows} sessions/days={_ev_days} "
+                  f"symbols={_ev_syms} min_events={a.min_events} "
+                  f"remaining_families=none-evaluated")
+            data_ok = False
+        # §27 EXIT QUEUE table
+        if len(cands_df):
+            _xq = cands_df[cands_df["frontier_bucket"] ==
+                           "PROMISING_ENTRY_EXIT_UNRESOLVED"]
+            print(f"EXIT_QUEUE: {len(_xq)} entries")
+            for _, _r in _xq.head(15).iterrows():
+                print(f"  {_r['hypothesis_id']} [{_r.get('symbol_id', '')}] "
+                      f"{_r['feature_definition']} n={_r['events']} "
+                      f"oos={_r['FWD_OOS_expectancy']} "
+                      f"mfe_med={_r.get('MFE_median')} "
+                      f"mae_med={_r.get('MAE_median')} "
+                      f"exit={_r.get('exit_discovery_status')}")
         for _sid, _ss in symbol_store.items():
             _f = _ss.get("feat")
             if _f is None or len(_f) == 0:

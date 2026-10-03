@@ -203,3 +203,88 @@ def oos_final_survivor(oos_stage_value, paper_checks_pass: bool) -> str:
     if oos_stage_value == "OOS_MULTIPLE_TEST_PASS" and paper_checks_pass:
         return "OOS_FINAL_SURVIVOR"
     return oos_stage_value
+
+
+# ---- §25 edge validation ladder L1-L10 ----
+LADDER_L1_L10 = ("L1_DATA_VALID", "L2_ENTRY_SIGNAL", "L3_RETURN_PATH",
+                 "L4_EXIT_FOUND", "L5_OOS", "L6_ROBUSTNESS",
+                 "L7_MULTIPLE_TESTING", "L8_EXECUTION", "L9_PAPER_READY",
+                 "L10_VALIDATED_EDGE")
+
+
+def _num(x):
+    try:
+        v = float(x)
+        return v if v == v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def ladder_l1_l10(row: dict) -> dict:
+    """Every candidate moves through L1-L10; failing level routes back to
+    the appropriate queue (L4 fail → exit queue, never discard)."""
+    l1 = str(row.get("final_status")) not in ("THIN_SAMPLE", "DATA_INVALID")
+    l2 = (_num(row.get("FWD_IS_expectancy")) or -1) > 0
+    l3 = str(row.get("return_path_class", "")) not in ("", "NOISE", "NA", "None")
+    l4 = str(row.get("exit_discovery_status", "")) in (
+        "DISCOVERED", "PRESCRIBED_VARIANT", "EXIT_DISCOVERY_RAN_NO_IMPROVEMENT")
+    l5 = str(row.get("OOS_trading_result")) == "OOS_TRADING_RULE_PASS"
+    l6 = (_num(row.get("robustness_score")) or 0) >= 4.0
+    l7 = str(row.get("mt_pass")) == "True" or row.get("mt_pass") is True
+    l8 = str(row.get("execution_model")) == "EXECUTABLE_PRICE_MODEL"
+    l9 = row.get("paper_eligible") is True
+    l10 = bool(l9 and l8)
+    levels = {"L1_DATA_VALID": l1, "L2_ENTRY_SIGNAL": l2,
+              "L3_RETURN_PATH": l3, "L4_EXIT_FOUND": l4, "L5_OOS": l5,
+              "L6_ROBUSTNESS": l6, "L7_MULTIPLE_TESTING": l7,
+              "L8_EXECUTION": l8, "L9_PAPER_READY": l9,
+              "L10_VALIDATED_EDGE": l10}
+    failed = next((k for k, v in levels.items() if not v), None)
+    return {"levels": levels, "failed_at": failed or "NONE_ALL_PASS"}
+
+
+def frontier_bucket(row: dict) -> str:
+    """§20 live-frontier states: validated > unresolved exits >
+    promising OOS > robust > promising entry."""
+    cat = str(row.get("discovery_category", ""))
+    if cat == "VALIDATED_EDGE":
+        return "VALIDATED_EDGE"
+    if str(row.get("unresolved_code", "")) in (
+            "ENTRY_PROMISING_EXIT_UNRESOLVED",
+            "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED"):
+        return "PROMISING_ENTRY_EXIT_UNRESOLVED"
+    if cat == "OOS_DISCOVERY":
+        return "PROMISING_OOS"
+    if cat == "ROBUST_DISCOVERY":
+        return "ROBUST_CANDIDATE"
+    if cat in ("TRADING_RULE_DISCOVERY", "PREDICTIVE_DISCOVERY",
+               "INFORMATION_DISCOVERY"):
+        return "PROMISING_ENTRY"
+    return "NO_FRONTIER"
+
+
+def final_research_state(category: str, mt_pass, exec_ok: bool,
+                         unresolved_code: str, oos_trading: str,
+                         robust_ok: bool) -> str:
+    """Post-search research state (§1) from validated gates."""
+    mt = str(mt_pass) == "True" or mt_pass is True
+    if category == "VALIDATED_EDGE":
+        return "VALIDATED_EDGE"
+    if category == "OOS_DISCOVERY":
+        if not mt:
+            return "MULTIPLE_TESTING_FAILED"
+        if not exec_ok:
+            return "EXECUTION_FAILED"
+        return "SIGNAL_FOUND_EXIT_FOUND"
+    if category == "ROBUST_DISCOVERY":
+        return "OOS_FAILED"
+    if category == "TRADING_RULE_DISCOVERY":
+        if oos_trading == "OOS_TRADING_RULE_PASS":
+            return "MULTIPLE_TESTING_FAILED" if not mt else "SIGNAL_FOUND_EXIT_FOUND"
+        return "OOS_FAILED"
+    if category == "PREDICTIVE_DISCOVERY":
+        if unresolved_code in ("ENTRY_PROMISING_EXIT_UNRESOLVED",
+                               "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED"):
+            return "SIGNAL_FOUND_EXIT_UNRESOLVED"
+        return "OOS_FAILED"
+    return "NO_SIGNAL_FOUND"
