@@ -22,9 +22,11 @@ const DEFAULT_CFG: Cfg = {
 const TABLE_COLS: { key: string; label: string; num: boolean }[] = [
   { key: 'candidate', label: 'Candidate', num: false },
   { key: 'discovery_family', label: 'Family', num: false },
+  { key: 'TIER', label: 'Tier', num: true },
   { key: 'contract', label: 'Contract', num: false },
   { key: 'events', label: 'Events', num: true },
   { key: 'clusters', label: 'Clusters', num: true },
+  { key: 'ENTRY_INFORMATION_SCORE', label: 'Entry score', num: true },
   { key: 'FWD_expectancy', label: 'FWD Exp', num: true },
   { key: 'FWD_WR', label: 'FWD WR', num: true },
   { key: 'FWD_OOS_expectancy', label: 'OOS Exp', num: true },
@@ -88,8 +90,8 @@ function buildReport(res: any): string {
   }
   L.push('## CANDIDATES');
   for (const c of res.candidates || []) {
-    L.push(`- ${c.candidate} [${c.discovery_family}] events=${c.events} clusters=${c.clusters} ` +
-      `FWDexp=${fmt(c.FWD_expectancy)} OOSexp=${fmt(c.FWD_OOS_expectancy)} BHp=${fmt(c.perm_p_adj)} status=${c.final_status} :: ${c.formula}`);
+    L.push(`- ${c.candidate} [${c.discovery_family}] TIER=${c.TIER} events=${c.events} clusters=${c.clusters} ` +
+      `ENTRYscore=${fmt(c.ENTRY_INFORMATION_SCORE)} FWDexp=${fmt(c.FWD_expectancy)} OOSexp=${fmt(c.FWD_OOS_expectancy)} BHp=${fmt(c.perm_p_adj)} status=${c.final_status} :: ${c.formula}`);
   }
   L.push('');
   L.push('## PAPER ELIGIBILITY: FALSE (research-only until explicitly promoted)');
@@ -451,6 +453,52 @@ export default function Discovery() {
                       <div key={i}><span className="text-zinc-500">{f.hypothesis_id} [{f.family}]</span> score={fmt(f.score)} · next: {fmt(f.next)}</div>
                     ))}
                   </div>
+                </div>
+              )}
+              {res.baselines && res.baselines.length > 0 && (
+                <div className="mt-2">
+                  <div className="lbl mb-1">FEATURE BASELINES (unconditional vs conditioned)</div>
+                  <div className="overflow-x-auto max-h-48 overflow-y-auto">
+                    <table className="w-full text-[11px] num">
+                      <thead><tr className="text-zinc-500 text-left border-b border-zinc-800">
+                        {['feature', 'n', 'uncond', 'pos', 'neg', 'diff', 't-stat'].map(k => <th key={k} className="px-2 py-1">{k}</th>)}
+                      </tr></thead>
+                      <tbody>{res.baselines.slice(0, 30).map((b: any, i: number) => (
+                        <tr key={i} className="border-b border-zinc-900"><td className="px-2 py-1">{b.feature}</td><td className="px-2 py-1 text-right">{b.n}</td><td className="px-2 py-1 text-right">{fmt(b.unconditional_mean)}</td><td className="px-2 py-1 text-right">{fmt(b.feature_positive_mean)}</td><td className="px-2 py-1 text-right">{fmt(b.feature_negative_mean)}</td><td className="px-2 py-1 text-right">{fmt(b.difference)}</td><td className="px-2 py-1 text-right">{fmt(b.t_stat)}</td></tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {res.icTable && res.icTable.length > 0 && (
+                <div className="mt-2">
+                  <div className="lbl mb-1">INFORMATION COEFFICIENTS (top by |rank IC|)</div>
+                  <div className="overflow-x-auto max-h-48 overflow-y-auto">
+                    <table className="w-full text-[11px] num">
+                      <thead><tr className="text-zinc-500 text-left border-b border-zinc-800">
+                        {['feature', 'n', 'pearson', 'spearman', 'day-IC mean±std'].map(k => <th key={k} className="px-2 py-1">{k}</th>)}
+                      </tr></thead>
+                      <tbody>{res.icTable.slice(0, 30).map((r: any, i: number) => (
+                        <tr key={i} className="border-b border-zinc-900"><td className="px-2 py-1">{r.feature}</td><td className="px-2 py-1 text-right">{r.n}</td><td className="px-2 py-1 text-right">{fmt(r.pearson)}</td><td className="px-2 py-1 text-right">{fmt(r.spearman)}</td><td className="px-2 py-1 text-right">{fmt(r.ic_by_day?.mean)}±{fmt(r.ic_by_day?.std)}</td></tr>
+                      ))}</tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+              {(res.whyRanked || res.tierDist || res.nearestSurvivor) && (
+                <div className="mt-2">
+                  <div className="lbl mb-1">WHY NO VALIDATED EDGE · TIERS · NEAREST SURVIVOR</div>
+                  {res.whyRanked && (
+                    <div className="text-[11px] num text-zinc-400">rejections: {res.whyRanked.map((w: any) => `${w.reason}=${w.count}`).join(' · ')}</div>
+                  )}
+                  {res.tierDist && (
+                    <div className="text-[11px] num text-zinc-400">tiers: {Object.entries(res.tierDist).map(([k, v]) => `T${k}=${v}`).join(' · ')}</div>
+                  )}
+                  {res.nearestSurvivor ? (
+                    <div className="text-[11px] num text-zinc-300 mt-1">nearest: {res.nearestSurvivor.candidate} OOSexp={fmt(res.nearestSurvivor.OOS_expectancy)} adjP={fmt(res.nearestSurvivor.adjusted_p)} rejected={fmt(res.nearestSurvivor.reason_rejected)}</div>
+                  ) : (
+                    <div className="text-[11px] text-zinc-500 mt-1">nearest survivor: none with sufficient OOS sample</div>
+                  )}
                 </div>
               )}
               {res.familyTable && res.familyTable.length > 0 && (

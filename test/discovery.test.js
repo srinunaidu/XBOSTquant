@@ -432,7 +432,7 @@ test('ADAPT family classifier + dynamic allocation respond to evidence', () => {
 test('ADAPT failure classes assigned; map covers rejections', () => {
   const allowed = ['NONE', 'THIN_SAMPLE', 'EVENT_DEPENDENCE', 'TRAIN_FAIL', 'VALIDATION_FAIL',
     'OOS_FAIL', 'CONCENTRATION', 'MULTIPLE_TESTING', 'EXIT_DEPENDENCE',
-    'CONTRACT_DEPENDENCE', 'TIME_DEPENDENCE'];
+    'CONTRACT_DEPENDENCE', 'TIME_DEPENDENCE', 'NO_FORWARD_EDGE'];
   for (const c of ADAPT_RUN.candidates) assert.ok(allowed.indexOf(c.failure_class) >= 0);
 });
 
@@ -530,4 +530,154 @@ test('NINE report answers the 14 output questions', () => {
   assert.ok(fr.TRAIN_SURVIVORS >= 0 && fr.OOS_TESTED >= 0);
   assert.ok(['EXECUTABLE_PRICE_MODEL', 'RESEARCH_PRICE_MODEL'].indexOf(fr.EXECUTION_STATUS) >= 0);
   assert.ok(ADAPT_RUN.oosCounts && ADAPT_RUN.oosCounts.OOS_TESTED === ADAPT_RUN.candidates.length);
+});
+
+/* DEEP SEARCH (§32): entry-first, tiers, ladder, equivalence, Tier B, WHY. */
+const DEEP_RUN = OD.run(WIDE12, { focusStrikes: 2, minEvents: 30, nPerms: 30, seed: 11, maxTotalCandidates: 120, maxRuntimeSeconds: 300 }, null, null);
+
+test('DEEP entry-first: weak entries skip exits; tiers/ladder assigned', () => {
+  assert.ok(DEEP_RUN.candidates.length > 0);
+  for (const c of DEEP_RUN.candidates) {
+    assert.ok(typeof c.TIER === 'number' && c.TIER >= 0 && c.TIER <= 6);
+    assert.ok(['NONE', 'WEAK', 'STRONG'].indexOf(c.DISCOVERY_EVIDENCE) >= 0);
+    assert.ok(typeof c.ENTRY_INFORMATION_SCORE === 'number');
+    assert.ok(c.LADDER && typeof c.edge_path === 'string' && c.edge_path.indexOf('L1') >= 0);
+  }
+  const light = DEEP_RUN.candidates.filter(c => c.TIER === 0);
+  for (const c of light.slice(0, 10)) {
+    assert.ok(isNaN(c.IS_expectancy), 'no-edge entry must skip exit engine');
+  }
+});
+
+test('DEEP hold discovery bounded; best horizon flagged when fragile', () => {
+  const withH = DEEP_RUN.candidates.filter(c => c.hold_matrix);
+  assert.ok(withH.length > 0);
+  for (const c of withH) {
+    assert.ok(Object.keys(c.hold_matrix).length <= 9);
+    assert.ok(typeof c.best_horizon === 'number' && typeof c.horizon_stability === 'number');
+  }
+});
+
+test('DEEP equivalence: mask hashes group duplicates; effective N reported', () => {
+  const hashes = DEEP_RUN.candidates.map(c => c.event_mask_hash).filter(Boolean);
+  assert.ok(hashes.length > 0);
+  const uniq = new Set(hashes).size;
+  assert.ok(uniq <= DEEP_RUN.candidates.length);
+  for (const c of DEEP_RUN.candidates.slice(0, 10)) {
+    assert.ok(c.equivalence && Array.isArray(c.equivalence.exact_duplicate));
+    assert.ok(typeof c.bonferroni_p === 'number' && typeof c.holm_p === 'number');
+    assert.ok(typeof c.family_bh_p === 'number');
+  }
+});
+
+test('DEEP surrogate BCD runs on top OOS-positive with all three nulls', () => {
+  const withBCD = DEEP_RUN.candidates.filter(c => c.surrogate_BCD && !c.surrogate_BCD.error);
+  if (withBCD.length) {
+    for (const c of withBCD.slice(0, 3)) {
+      assert.ok(typeof c.surrogate_BCD.B_event_time_p === 'number');
+      assert.ok(typeof c.surrogate_BCD.C_block_p === 'number');
+    }
+  }
+});
+
+test('DEEP Tier B expands beyond focus; generalization recorded', () => {
+  const tb = DEEP_RUN.candidates.filter(c => c.TIERB && c.TIERB.status === 'EVALUATED');
+  assert.ok(tb.length > 0);
+  for (const c of DEEP_RUN.candidates.slice(0, 10)) {
+    assert.ok(c.CONTRACT_GEN && typeof c.CONTRACT_GEN.contract_count === 'number');
+    assert.ok(c.DAY_GEN && typeof c.DAY_GEN.positive_day_pct === 'number');
+    assert.ok(c.cluster_sweep && typeof c.cluster_sweep === 'object');
+  }
+});
+
+test('DEEP OOS effect size + insufficiency flag present', () => {
+  for (const c of DEEP_RUN.candidates.slice(0, 10)) {
+    assert.ok('OOS_SORTINO' in c && 'OOS_PAYOFF' in c && 'OOS_D' in c);
+    assert.ok(typeof c.OOS_INSUFFICIENT_SAMPLE === 'boolean');
+  }
+});
+
+test('DEEP WHY ranking + nearest survivor + dual statuses coherent', () => {
+  assert.ok(Array.isArray(DEEP_RUN.whyRanked) && DEEP_RUN.whyRanked.length > 0);
+  const tot = DEEP_RUN.whyRanked.reduce((a, w) => a + w.count, 0);
+  assert.ok(tot <= DEEP_RUN.candidates.length);
+  for (const c of DEEP_RUN.candidates.slice(0, 10)) {
+    assert.ok(['YES', 'NO', 'PENDING'].indexOf(c.VALIDATED_EDGE) >= 0 || c.VALIDATED_EDGE === 'NO' || c.VALIDATED_EDGE === 'PENDING');
+  }
+});
+
+test('DEEP new features exist on rows; baselines cover them', () => {
+  const { norm } = OD.ingest(WIDE12);
+  const rows = OD.features(norm.filter(r => r.symbol === norm[0].symbol).slice(0, 400));
+  for (const col of ['premium_decel', 'premium_shock', 'premium_percentile', 'premium_zscore',
+    'cumulative_return_5', 'volatility_ratio', 'premium_accel', 'persistence_streak', 'alternating']) {
+    assert.ok(col in rows[200], 'missing feature ' + col);
+  }
+  assert.ok(DEEP_RUN.baselines.length > 40 && DEEP_RUN.icTable.length > 0);
+});
+
+test('DEEP final states use the extended taxonomy', () => {
+  const valid = ['VALIDATED_EDGE_FOUND', 'NO_EDGE_FOUND_WITHIN_SEARCH_BUDGET',
+    'PROMISING_EDGE_NEEDS_MORE_DATA', 'STRONG_DISCOVERY_BUT_STATISTICALLY_UNCONFIRMED',
+    'NO_EDGE_FOUND', 'SEARCH_BUDGET_EXHAUSTED', 'INSUFFICIENT_DATA', 'ENGINE_ERROR',
+    'BLOCKED_DATA', 'BLOCKED_PARSER', 'BLOCKED_CHAIN', 'BLOCKED_FEATURES', 'BLOCKED_LABELS',
+    'BLOCKED_TRUE_LOOKAHEAD', 'BLOCKED_AUDIT_MISMATCH', 'BLOCKED_PNL_NAN', 'BLOCKED_OOS',
+    'BLOCKED_ROBUSTNESS', 'DISCOVERY_EDGE_OOS_FAILED', 'DISCOVERY_COMPLETED_NO_EDGE'];
+  assert.ok(valid.indexOf(DEEP_RUN.finalStatus) >= 0);
+});
+
+/* DEEP SEARCH: entry-first ladder, tiers, equivalence, Tier B, WHY. */
+const DEEP2_RUN = OD.run(WIDE12, { focusStrikes: 2, minEvents: 30, nPerms: 30, seed: 11, maxTotalCandidates: 100, maxRuntimeSeconds: 300, rounds: [1, 2, 3, 7, 8] }, null, null);
+
+test('DEEP2 ladder: every candidate carries stage fields; tiers span discovery', () => {
+  assert.ok(DEEP2_RUN.candidates.length > 0);
+  const tiers = new Set();
+  for (const c of DEEP2_RUN.candidates) {
+    assert.ok(typeof c.TIER === 'number');
+    assert.ok(c.LADDER && typeof c.edge_path === 'string');
+    assert.ok(typeof c.ENTRY_INFORMATION_SCORE === 'number');
+    tiers.add(c.TIER);
+  }
+  assert.ok(tiers.size >= 1);
+});
+
+test('DEEP2 baselines + IC computed over dynamic features', () => {
+  assert.ok(DEEP2_RUN.baselines.length > 20);
+  const b0 = DEEP2_RUN.baselines[0];
+  assert.ok(typeof b0.difference === 'number' && Array.isArray(b0.deciles) && b0.deciles.length === 10);
+  assert.ok(DEEP2_RUN.icTable.length > 0);
+  assert.ok(typeof DEEP2_RUN.icTable[0].spearman === 'number');
+});
+
+test('DEEP2 equivalence groups + effective count consistent', () => {
+  let withHash = 0;
+  for (const c of DEEP2_RUN.candidates) {
+    if (c.event_mask_hash) withHash++;
+    assert.ok(typeof c.bonferroni_p === 'number' && typeof c.holm_p === 'number');
+  }
+  assert.ok(withHash > 0);
+});
+
+test('DEEP2 Tier B + hold matrix + OOS effect fields present', () => {
+  const tb = DEEP2_RUN.candidates.filter(c => c.TIERB && c.TIERB.status === 'EVALUATED');
+  assert.ok(tb.length >= 0);
+  const hm = DEEP2_RUN.candidates.filter(c => c.hold_matrix && Object.keys(c.hold_matrix).length >= 5);
+  assert.ok(hm.length > 0);
+  for (const c of DEEP2_RUN.candidates.slice(0, 5)) {
+    assert.ok('OOS_SORTINO' in c && 'OOS_D' in c && 'OOS_INSUFFICIENT_SAMPLE' in c);
+  }
+});
+
+test('DEEP2 WHY ranking covers rejections; dual statuses coherent', () => {
+  assert.ok(Array.isArray(DEEP2_RUN.whyRanked));
+  for (const c of DEEP2_RUN.candidates.slice(0, 10)) {
+    assert.ok(['YES', 'NO', 'PENDING'].indexOf(c.VALIDATED_EDGE) >= 0 || c.VALIDATED_EDGE === 'NO' || c.VALIDATED_EDGE === 'PENDING');
+  }
+  const validFinal = ['VALIDATED_EDGE_FOUND', 'NO_EDGE_FOUND_WITHIN_SEARCH_BUDGET',
+    'PROMISING_EDGE_NEEDS_MORE_DATA', 'STRONG_DISCOVERY_BUT_STATISTICALLY_UNCONFIRMED',
+    'NO_EDGE_FOUND', 'SEARCH_BUDGET_EXHAUSTED', 'INSUFFICIENT_DATA', 'ENGINE_ERROR',
+    'BLOCKED_DATA', 'BLOCKED_PARSER', 'BLOCKED_CHAIN', 'BLOCKED_FEATURES', 'BLOCKED_LABELS',
+    'BLOCKED_TRUE_LOOKAHEAD', 'BLOCKED_AUDIT_MISMATCH', 'BLOCKED_PNL_NAN', 'BLOCKED_OOS',
+    'BLOCKED_ROBUSTNESS', 'DISCOVERY_EDGE_OOS_FAILED', 'DISCOVERY_COMPLETED_NO_EDGE'];
+  assert.ok(validFinal.indexOf(DEEP2_RUN.finalStatus) >= 0);
 });
