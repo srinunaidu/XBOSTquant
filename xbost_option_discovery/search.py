@@ -1,15 +1,32 @@
-"""Iterative frontier search controller (§4/§5/§6/§25/§26/§53).
+"""Iterative frontier search controller + continuous discovery loop state.
 
 Iterative queues only — never unbounded recursion. Every hypothesis gets a
-permanent global ID; the global test counter is monotonic and never reset.
+permanent global ID (H000001...); the global test counter is monotonic and
+never reset between cycles. Semantic duplicates and parameter-only clones are
+detected via canonical hashes and never counted as new discoveries.
 """
+import hashlib
 import json
 import os
+import re
 import time
 from collections import Counter, deque
 
 FRONTIER_STATUSES = ("QUEUED", "EVALUATING", "EVALUATED", "REJECTED",
                      "PROMOTED", "DEFERRED")
+
+CYCLE_STATUSES = ("CYCLE_DISCOVERY_FOUND", "CYCLE_NO_NEW_DISCOVERY",
+                  "CYCLE_BUDGET_EXHAUSTED", "CYCLE_ERROR")
+
+UNRESOLVED_CODES = (
+    "ENTRY_PROMISING_EXIT_UNRESOLVED",
+    "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED",
+    "OOS_PROMISING_BUT_MULTIPLE_TESTING_FAILED",
+    "ROBUST_SIGNAL_BUT_EXECUTION_UNAVAILABLE",
+    "SHORT_HORIZON_EDGE",
+    "TIME_SPECIFIC_EDGE",
+    "CHAIN_RELATIONSHIP_PROMISING",
+)
 
 EXPLORATION_FAMILIES = (
     "RAW_PRICE", "MOMENTUM", "MEAN_REVERSION", "VOLATILITY", "VOLUME",
@@ -20,16 +37,39 @@ EXPLORATION_FAMILIES = (
 )
 
 
+def canonical_hash(definition: str) -> str:
+    """Canonical hash (§5): normalize cosmetic naming so parameter-only clones
+    and renamed duplicates map to the same hash."""
+    s = str(definition).lower().strip()
+    s = re.sub(r"[\s_\-]+", "_", s)
+    # unify known aliases: momentum_5 threshold=1  ==  mom5 > 1
+    s = s.replace("momentum_", "mom").replace("threshold=", "thr_")
+    s = re.sub(r"\s*(>|>=|<|<=|==)\s*", r"\1", s)
+    s = re.sub(r"(>=|<=|==|>|<|=)", "_thr_", s)
+    s = re.sub(r"_thr_+", "_thr_", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+    return hashlib.sha256(s.encode()).hexdigest()[:16]
+
+
 class HypothesisRegistry:
-    """Global hypothesis identity (§27) + monotonic global test count (§28)."""
+    """Global research memory (§4): tested / rejected / promising /
+    oos_rejected / exit_unresolved / robust / validated buckets, family stats,
+    candidate hashes. IDs never reused; test count never reset."""
 
     def __init__(self):
         self.hypotheses = {}  # hid -> record
         self.by_signature = {}
+        self.by_hash = {}
+        self.clone_groups = {}  # canonical hash -> [hids]
         self.n = 0
         self.global_test_count = 0
         self.equivalence_groups = {}
         self.duplicate_count = 0
+        self.clone_count = 0
+        self.memory = {"tested": set(), "rejected": set(),
+                       "promising": set(), "oos_rejected": set(),
+                       "exit_unresolved": set(), "robust": set(),
+                       "validated": set()}
 
     def signature(self, feature_sig, ts_rule, label, direction,
                   contract_scope, entry_rule, exit_rule) -> str:
@@ -40,27 +80,42 @@ class HypothesisRegistry:
     def register(self, kind, family, feature_sig, ts_rule="signal-close",
                  label="fwd_ret_5m", direction="long", contract_scope="chain",
                  entry_rule="signal-close", exit_rule="hold5/sl.5/tp1",
-                 parent_ids=(), depth=1, reason="depth-1-scan") -> dict:
+                 parent_ids=(), depth=1, reason="depth-1-scan",
+                 cycle_id=0) -> dict:
         sig = self.signature(feature_sig, ts_rule, label, direction,
                              contract_scope, entry_rule, exit_rule)
         if sig in self.by_signature:
             self.duplicate_count += 1
             hid = self.by_signature[sig]
             return {"hypothesis_id": hid, "duplicate": True,
-                    "record": self.hypotheses[hid]}
+                    "is_clone": False, "record": self.hypotheses[hid]}
+        ch = canonical_hash(sig)
+        is_clone = ch in self.by_hash
+        if is_clone:
+            self.clone_count += 1
         self.n += 1
-        hid = f"H{kind}-{self.n}"
+        hid = f"H{self.n:06d}"
         rec = {"hypothesis_id": hid, "kind": kind, "family": family,
                "feature_signature": str(feature_sig),
                "timestamp_rule": ts_rule, "label": label,
                "direction": direction, "contract_scope": contract_scope,
                "entry_rule": entry_rule, "exit_rule": exit_rule,
                "parent_ids": list(parent_ids), "combination_depth": int(depth),
-               "reason_added": reason, "status": "REGISTERED"}
+               "reason_added": reason, "status": "REGISTERED",
+               "canonical_hash": ch, "is_clone": bool(is_clone),
+               "cycle_id": int(cycle_id)}
         self.hypotheses[hid] = rec
         self.by_signature[sig] = hid
+        self.by_hash.setdefault(ch, hid)
+        self.clone_groups.setdefault(ch, []).append(hid)
         self.equivalence_groups.setdefault(family, []).append(hid)
-        return {"hypothesis_id": hid, "duplicate": False, "record": rec}
+        self.memory["tested"].add(hid)
+        return {"hypothesis_id": hid, "duplicate": False,
+                "is_clone": bool(is_clone), "record": rec}
+
+    def mark(self, hid, bucket):
+        if hid in self.hypotheses and bucket in self.memory:
+            self.memory[bucket].add(hid)
 
     def count_test(self, k=1):
         self.global_test_count += int(k)
@@ -68,37 +123,70 @@ class HypothesisRegistry:
 
 
 class FrontierQueue:
-    """Persistent frontier queue (§6) with diversity-aware priority."""
+    """Persistent frontier queue with research-priority scoring, diversity
+    quotas, hard family stops, and unresolved-reason routing."""
 
-    def __init__(self, max_family_share=0.30):
+    def __init__(self, max_family_share=0.30, max_size=5000):
         self.items = {}  # hid -> item
         self.max_family_share = float(max_family_share)
+        self.max_size = int(max_size)
+        self.stopped_families = set()  # >50% hard stop for next cycle
+        self.dropped_overflow = 0
 
     def add(self, hid, family, feature_sig, depth, reason, train=0.0,
-            val=0.0, oos=0.0, robust=0.0, parent_ids=()):
+            val=0.0, oos=0.0, robust=0.0, parent_ids=(),
+            unresolved_code="", next_action="evaluate"):
         if hid in self.items:
             return False
+        if len(self.items) >= self.max_size:
+            # queue-size limit (§29): drop lowest-priority QUEUED item
+            queued = [it for it in self.items.values()
+                      if it["status"] == "QUEUED"]
+            if queued:
+                worst = min(queued, key=lambda x: x.get("priority", 0.0))
+                del self.items[worst["hypothesis_id"]]
+                self.dropped_overflow += 1
+            else:
+                self.dropped_overflow += 1
+                return False
         info = float(val) if val == val else 0.0
         item = {"hypothesis_id": hid, "parent_hypotheses": list(parent_ids),
                 "family": family, "feature_signature": str(feature_sig),
                 "combination_depth": int(depth), "reason_added": reason,
+                "reason_promising": reason,
+                "reason_unresolved": unresolved_code,
+                "unresolved_code": unresolved_code,
+                "next_action": next_action,
                 "train_score": train, "validation_score": val,
                 "OOS_score": oos, "robustness_score": robust,
-                "priority": 0.0, "status": "QUEUED",
+                "priority": 0.0, "research_priority_score": 0.0,
+                "status": "QUEUED",
                 "information_gain": info, "novelty": 1.0}
         self.items[hid] = item
         return True
 
-    def compute_priority(self, item, family_counts, total):
+    def research_priority_score(self, item, family_counts, total,
+                                sample_quality=1.0, exec_ok=False):
+        """§23: determines investigation order ONLY — never overrides gates."""
         fam_share = (family_counts.get(item["family"], 0) / max(1, total))
         diversity = max(0.0, 1.0 - fam_share * 2.0)
-        item["priority"] = (
-            0.35 * max(0.0, item.get("information_gain", 0.0))
-            + 0.25 * max(0.0, item.get("validation_score", 0.0) or 0.0)
-            + 0.15 * max(0.0, item.get("OOS_score", 0.0) or 0.0)
-            + 0.15 * diversity
-            + 0.10 * item.get("novelty", 1.0))
-        return item["priority"]
+        unresolved_boost = 0.2 if item.get("unresolved_code") else 0.0
+        s = (0.25 * max(0.0, item.get("information_gain", 0.0))
+             + 0.20 * max(0.0, item.get("validation_score", 0.0) or 0.0)
+             + 0.15 * max(0.0, item.get("OOS_score", 0.0) or 0.0)
+             + 0.10 * max(0.0, item.get("robustness_score", 0.0) or 0.0)
+             + 0.10 * diversity
+             + 0.10 * item.get("novelty", 1.0)
+             + 0.05 * sample_quality
+             + 0.05 * (1.0 if exec_ok else 0.0)
+             + unresolved_boost)
+        item["research_priority_score"] = s
+        item["priority"] = s
+        return s
+
+    # legacy alias
+    def compute_priority(self, item, family_counts, total):
+        return self.research_priority_score(item, family_counts, total)
 
     def family_quota_ok(self, family, family_counts, total):
         if total == 0:
@@ -106,13 +194,27 @@ class FrontierQueue:
         share = family_counts.get(family, 0) / total
         return share < self.max_family_share
 
+    def update_family_stops(self, fam_counts, total):
+        """§7: >50% share hard-stops that family for the next cycle."""
+        self.stopped_families = {
+            f for f, c in fam_counts.items()
+            if total > 0 and c / total > 0.50}
+        return self.stopped_families
+
     def pop_batch(self, k, family_counts=None):
         queued = [it for it in self.items.values()
-                  if it["status"] == "QUEUED"]
+                  if it["status"] == "QUEUED"
+                  and it["family"] not in self.stopped_families]
         for it in queued:
-            self.compute_priority(it, family_counts or {}, len(self.items))
+            self.research_priority_score(it, family_counts or {},
+                                         len(self.items))
         queued.sort(key=lambda x: -x["priority"])
         return queued[:k]
+
+    def exit_unresolved_items(self):
+        return [it for it in self.items.values()
+                if it.get("unresolved_code") == "ENTRY_PROMISING_EXIT_UNRESOLVED"
+                and it["status"] == "QUEUED"]
 
     def set_status(self, hid, status):
         assert status in FRONTIER_STATUSES, status
@@ -131,8 +233,8 @@ class FrontierQueue:
 
 
 class ConvergenceChecker:
-    """§5: converged ONLY if frontier empty AND no new family AND deltas < eps
-    AND diversity saturated, sustained over N rounds."""
+    """Convergence ONLY if frontier empty AND no new family AND deltas < eps
+    AND diversity saturated AND exit/trading-rule research exhausted."""
 
     def __init__(self, n=3, epsilon=0.01):
         self.n = int(n)
@@ -140,38 +242,87 @@ class ConvergenceChecker:
         self.history = deque(maxlen=max(3, int(n) * 2))
 
     def update(self, frontier_size, new_families, best_val_delta,
-               best_oos_delta, diversity_saturated):
-        self.history.append({"frontier_size": int(frontier_size),
-                             "new_families": int(new_families),
-                             "best_val_delta": float(best_val_delta or 0.0),
-                             "best_oos_delta": float(best_oos_delta or 0.0),
-                             "diversity_saturated": bool(diversity_saturated)})
+               best_oos_delta, diversity_saturated,
+               exit_exhausted=True, trading_exhausted=True,
+               best_train_delta=0.0):
+        self.history.append({
+            "frontier_size": int(frontier_size),
+            "new_families": int(new_families),
+            "best_train_delta": float(best_train_delta or 0.0),
+            "best_val_delta": float(best_val_delta or 0.0),
+            "best_oos_delta": float(best_oos_delta or 0.0),
+            "diversity_saturated": bool(diversity_saturated),
+            "exit_exhausted": bool(exit_exhausted),
+            "trading_exhausted": bool(trading_exhausted)})
         if len(self.history) < self.n:
             return False
         tail = list(self.history)[-self.n:]
         return all(
             t["frontier_size"] == 0
             and t["new_families"] == 0
+            and abs(t["best_train_delta"]) < self.eps
             and abs(t["best_val_delta"]) < self.eps
             and abs(t["best_oos_delta"]) < self.eps
-            and t["diversity_saturated"] for t in tail)
+            and t["diversity_saturated"]
+            and t["exit_exhausted"]
+            and t["trading_exhausted"] for t in tail)
 
     def drain_converged(self):
-        """Natural-exhaustion convergence: frontier fully drained, last round
-        generated nothing new and deltas are below epsilon. The §5 frontier==0
-        clause holds by construction; the N-round smoother is satisfied by
-        the quiet final round."""
         if not self.history:
             return False
         t = self.history[-1]
         return (t["frontier_size"] == 0 and t["new_families"] == 0
+                and abs(t["best_train_delta"]) < self.eps
                 and abs(t["best_val_delta"]) < self.eps
                 and abs(t["best_oos_delta"]) < self.eps)
 
 
+class Watchdog:
+    """§29 engine-error protection: round timeout, candidate timeout,
+    memory check, heartbeat."""
+
+    def __init__(self, round_timeout_s=600.0, candidate_timeout_s=120.0,
+                 memory_budget_mb=2048.0):
+        self.round_timeout_s = float(round_timeout_s)
+        self.candidate_timeout_s = float(candidate_timeout_s)
+        self.memory_budget_mb = float(memory_budget_mb)
+        self.round_start = time.time()
+        self.candidate_start = time.time()
+        self.heartbeats = 0
+
+    def start_round(self):
+        self.round_start = time.time()
+
+    def start_candidate(self):
+        self.candidate_start = time.time()
+
+    def round_expired(self):
+        return (time.time() - self.round_start) > self.round_timeout_s
+
+    def candidate_expired(self):
+        return (time.time() - self.candidate_start) > self.candidate_timeout_s
+
+    def memory_mb(self):
+        try:
+            import psutil as _p
+            return _p.Process().memory_info().rss / 1e6
+        except Exception:
+            return float("nan")
+
+    def memory_ok(self):
+        m = self.memory_mb()
+        return not (m == m and m > self.memory_budget_mb)
+
+    def heartbeat(self):
+        self.heartbeats += 1
+        return {"heartbeat": self.heartbeats,
+                "round_elapsed": round(time.time() - self.round_start, 1),
+                "memory_mb": self.memory_mb()}
+
+
 class SearchController:
-    """Adaptive budget controller (§4/§44/§45). Soft targets may expand to hard
-    ceilings while unresolved frontier remains and runtime remains."""
+    """Adaptive budget controller: soft targets may expand to hard ceilings
+    while unresolved frontier remains and runtime remains."""
 
     def __init__(self, settings, t_start=None):
         self.s = settings
@@ -224,6 +375,34 @@ class SearchController:
                 and not self.may_expand_budget(frontier_size):
             return True, "BUDGET_NO_REMAINING"
         return False, ""
+
+
+def build_next_cycle_plan(frontier, fam_counts, explored_fams,
+                          blocked_fams, discoveries):
+    """§27 NEXT_CYCLE_PLAN consumed automatically by the next cycle."""
+    top_unresolved = sorted(
+        [it for it in frontier.to_json() if it["status"] == "QUEUED"],
+        key=lambda x: -x.get("priority", 0.0))[:10]
+    total = max(1, sum(fam_counts.values()))
+    over = [f for f, c in fam_counts.items() if c / total > 0.30]
+    under = [f for f in EXPLORATION_FAMILIES
+             if f not in explored_fams and f not in blocked_fams]
+    return {
+        "top_unresolved": [
+            {"hypothesis_id": it["hypothesis_id"], "family": it["family"],
+             "unresolved_code": it.get("unresolved_code", ""),
+             "next_action": it.get("next_action", "evaluate"),
+             "priority": round(it.get("priority", 0.0), 4)}
+            for it in top_unresolved],
+        "families_needing_exploration": under,
+        "families_over_explored": over,
+        "families_blocked": sorted(blocked_fams),
+        "new_feature_proposals": [f"explore:{f}" for f in under[:5]],
+        "new_exit_tests": int(sum(
+            1 for it in frontier.to_json()
+            if it.get("unresolved_code") == "ENTRY_PROMISING_EXIT_UNRESOLVED")),
+        "recent_discoveries": discoveries[-5:],
+    }
 
 
 def save_checkpoint(path, payload):

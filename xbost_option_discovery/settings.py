@@ -52,8 +52,8 @@ class DiscoverySettings:
     topKConditional: int = 10
     # soft/hard budget adaptation (§44)
     soft_candidate_budget: int = 500
-    hard_candidate_ceiling: int = 5000
-    hard_round_ceiling: int = 60
+    hard_candidate_ceiling: int = 10000
+    hard_round_ceiling: int = 200
     # convergence (§5/§46)
     convergence_N: int = 3
     convergence_epsilon: float = 0.01

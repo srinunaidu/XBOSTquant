@@ -51,14 +51,16 @@ from .reporting import write_report, assign_status
 from .filters import run_filters
 from .feature_quality import audit_features, tier_of, allowed_use
 from .search import (HypothesisRegistry, FrontierQueue, ConvergenceChecker,
-                     SearchController, save_checkpoint, load_checkpoint,
-                     EXPLORATION_FAMILIES)
+                     SearchController, Watchdog, canonical_hash,
+                     build_next_cycle_plan, save_checkpoint, load_checkpoint,
+                     CYCLE_STATUSES, EXPLORATION_FAMILIES)
 from .return_path import compute_return_path, first_touch_stats, classify_path
 from .exits import discover_exits
 from .generalization import (contract_generalization, strike_robustness,
                              expiry_robustness, otype_robustness,
                              time_robustness, regime_robustness)
-from .edge_ladder import edge_ladder, final_status, paper_eligible
+from .edge_ladder import (edge_ladder, final_status, paper_eligible,
+                           discovery_category, edge_levels_l1_l8, oos_stage)
 
 LAG_WINDOWS = (1, 2, 3, 5, 10)
 MIN_EVENTS = 50
@@ -154,13 +156,22 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
                                 + len(tuple(settings.trail_grid)))
         except Exception:
             pass
-    # ---- entry timing/perturbation on train/val (§13/§14) ----
+    # ---- entry timing/perturbation on train/val (§10/§13/§14) ----
+    # same-bar, +1/+2/+3 min, 1-bar confirmation. New research questions only;
+    # each variant increments GLOBAL_TEST_COUNT. No OOS reuse.
     entry_variants, entry_best = {}, "signal-close"
     if do_entry_search:
         base_e = fwd_tr["expectancy"]
+        try:
+            _prev = _shift_mask(feat, mask, 1)  # previous-bar signal at bar t
+            _confirm = mask.fillna(False) & _prev
+        except Exception:
+            _confirm = pd.Series(False, index=feat.index)
         for name, m2 in (("signal-close", mask),
                          ("t+1", _shift_mask(feat, mask, 1)),
-                         ("t+2", _shift_mask(feat, mask, 2))):
+                         ("t+2", _shift_mask(feat, mask, 2)),
+                         ("t+3", _shift_mask(feat, mask, 3)),
+                         ("confirm-1bar", _confirm)):
             v = pd.to_numeric(feat.loc[m2.fillna(False) & feat["day"].isin(tr),
                                        "fwd_ret_5m"], errors="coerce").dropna()
             e = float(v.mean()) if len(v) >= min_events else float("nan")
@@ -334,7 +345,94 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
     lad = edge_ladder(row)
     row["edge_kind"] = lad["edge_kind"]
     row["edge_fails_at"] = lad["fails_at"]
+    # surrogate transparency (FIX 3): full null summary + empirical percentile
+    row["surrogate_observed"] = sg.get("SURROGATE_SHARPE")
+    row["surrogate_mean"] = sg.get("surrogate_mean")
+    row["surrogate_sd"] = sg.get("surrogate_sd")
+    row["surrogate_percentile"] = sg.get("observed_percentile")
+    row["surrogate_n_perm"] = int(settings.n_perm)
+    # failure-driven WHY (§22) + unresolved routing (§6)
+    info_pos = pd.notna(fwd_all["expectancy"]) and fwd_all["expectancy"] > 0
+    trad_pos = pd.notna(m_all["expectancy"]) and m_all["expectancy"] > 0
+    val_pos = pd.notna(fwd_tr["expectancy"]) and fwd_tr["expectancy"] > 0
+    if info_pos and not trad_pos:
+        why, code, nxt = ("INFO_POS_TRADING_NEG",
+                          "ENTRY_PROMISING_EXIT_UNRESOLVED",
+                          "exit-discovery: alt holds, entry delay, MFE/MAE exits")
+    elif val_pos and not trad_pos:
+        why, code, nxt = ("VAL_POS_TRADING_NEG",
+                          "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED",
+                          "exit-discovery: MFE/MAE/time exits")
+    elif (pd.notna(fwd_tr["expectancy"]) and fwd_tr["expectancy"] > 0) is False \
+            and info_pos:
+        why, code, nxt = ("TRAIN_POS_VAL_NEG", "",
+                          "simplify: fewer conditions, orthogonal family")
+    elif val_pos and not oos_trading_pass:
+        why, code, nxt = ("VAL_POS_OOS_NEG", "",
+                          "independent structural hypothesis; DO NOT tune OOS")
+    elif oos_trading_pass and padj >= 0.10:
+        why, code, nxt = ("OOS_POS_MT_RISK",
+                          "OOS_PROMISING_BUT_MULTIPLE_TESTING_FAILED",
+                          "simpler independent hypothesis, orthogonal family")
+    elif trad_pos and rs["robustness_score"] < 4.0:
+        why, code, nxt = ("TRADING_POS_ROBUST_WEAK", "",
+                          "robustness-first: perturb, generalize, concentrate")
+    elif not has_bidask and trad_pos:
+        why, code, nxt = ("SIGNAL_EXECUTION_BLOCKED",
+                          "ROBUST_SIGNAL_BUT_EXECUTION_UNAVAILABLE",
+                          "flag data acquisition; research-only status")
+    else:
+        why, code, nxt = ("NO_EDGE_SIGNAL", "", "explore new family")
+    row["failure_why"] = why
+    row["unresolved_code"] = code
+    row["next_action"] = nxt
+    row["OOS_FROZEN"] = True
+    row["OOS_REOPTIMIZED"] = False
     return row
+
+
+def _resolve_mask(feat, hid, hreg, atomic_masks, mask_cache, frontier):
+    """Iterative mask resolution (no recursion): atomic → feature column;
+    lead/lag → stored params; combo → AND of parent masks + confirm leg;
+    exit-variant → parent mask."""
+    if hid in mask_cache:
+        return mask_cache[hid]
+    if hid in atomic_masks:
+        try:
+            return atomic_masks[hid]["mask_fn"](feat).fillna(False)
+        except Exception:
+            return pd.Series(False, index=feat.index)
+    rec = hreg.hypotheses.get(hid, {})
+    if "_ll_mask" in rec:
+        return rec["_ll_mask"]
+    if "_ll_params" in rec:
+        try:
+            p = rec["_ll_params"]
+            src_idx = feat[feat["symbol"] == p["source"]].set_index(
+                "timestamp").sort_index().index
+            tgt_rows = feat[(feat["symbol"] == p["target"]) &
+                            feat["timestamp"].isin(
+                                pd.DatetimeIndex(sorted(src_idx)) +
+                                pd.Timedelta(minutes=int(p["lag"])))]
+            sm = pd.Series(False, index=feat.index)
+            sm.loc[tgt_rows.index] = True
+            return sm
+        except Exception:
+            return pd.Series(False, index=feat.index)
+    parents = rec.get("parent_ids", [])
+    if not parents and hid in frontier.items:
+        parents = frontier.items[hid].get("parent_hypotheses", [])
+    m = pd.Series(True, index=feat.index)
+    for p in parents:
+        pm = _resolve_mask(feat, p, hreg, atomic_masks, mask_cache, frontier)
+        m = m & pm.fillna(False)
+    leg = frontier.items.get(hid, {}).get("confirm_feature") if hid in frontier.items else None
+    if leg and leg in feat.columns:
+        try:
+            m = m & (feat[leg] == 1).fillna(False)
+        except Exception:
+            pass
+    return m
 
 
 def build_depth1_specs(feat, mods, strikes, lead_cols, min_events, quality):
@@ -675,6 +773,10 @@ def main():
                              f"{r['source_contract']}->{r['target_contract']}", 1,
                              "leadlag-screen")
                 reg["record"]["_ll_mask"] = smask
+                reg["record"]["_ll_params"] = {
+                    "source": r["source_contract"],
+                    "target": r["target_contract"],
+                    "lag": int(r["lag"])}
 
         spec_by_hid = {}
         for sp in depth1:
@@ -687,7 +789,10 @@ def main():
             atomic_masks[hid] = sp
 
         all_rows = []
+        all_discoveries = []
+        no_discovery_streak = 0
         mask_cache = {}
+        wd = Watchdog(round_timeout_s=600.0, candidate_timeout_s=120.0)
         n_round = 0
         converged = False
         best_val, best_oos = float("-inf"), float("-inf")
@@ -705,7 +810,8 @@ def main():
             except Exception:
                 return "NA"
 
-        # resume support (§53)
+        # resume support (§53): restore registry, frontier, counts, then
+        # rebuild masks in depth order so no completed hypothesis reruns
         if settings.resume_from and os.path.exists(settings.resume_from):
             cp = load_checkpoint(settings.resume_from)
             for r in cp.get("candidates", []):
@@ -714,6 +820,31 @@ def main():
             hreg.global_test_count = int(cp.get("global_test_count", 0))
             hreg.n = int(cp.get("hypothesis_n", hreg.n))
             n_round = int(cp.get("round", 0))
+            _reg = cp.get("registry", {})
+            for _hid, _rec in (_reg.get("hypotheses") or {}).items():
+                _rec.pop("_ll_mask", None)
+                hreg.hypotheses[_hid] = _rec
+                hreg.by_signature[_rec.get("signature", _hid)] = _hid
+                if _rec.get("canonical_hash"):
+                    hreg.by_hash.setdefault(_rec["canonical_hash"], _hid)
+                    hreg.clone_groups.setdefault(
+                        _rec["canonical_hash"], []).append(_hid)
+            for _k, _v in (_reg.get("memory") or {}).items():
+                if _k in hreg.memory:
+                    hreg.memory[_k] = set(_v)
+            hreg.duplicate_count = int(_reg.get("duplicates", 0))
+            hreg.clone_count = int(_reg.get("clones", 0))
+            for _d in cp.get("discoveries", []):
+                all_discoveries.append(_d)
+            for _it in sorted(frontier.to_json(),
+                              key=lambda x: x.get("combination_depth", 1)):
+                if _it["status"] == "QUEUED":
+                    try:
+                        mask_cache[_it["hypothesis_id"]] = _resolve_mask(
+                            feat, _it["hypothesis_id"], hreg, atomic_masks,
+                            mask_cache, frontier)
+                    except Exception:
+                        pass
             print(f"RESUMED_FROM_CHECKPOINT round={n_round} "
                   f"candidates={len(all_rows)} tests={hreg.global_test_count}")
 
@@ -737,6 +868,13 @@ def main():
             batch = frontier.pop_batch(min(settings.maxEvaluationBatch,
                                            settings.maxRawCandidatesPerRound),
                                        fam_counts)
+            if not batch and frontier.size() > 0:
+                # family stops starved the batch while work remains: lift
+                # stops and repop rather than burning a round (§7/§21)
+                frontier.stopped_families = set()
+                batch = frontier.pop_batch(
+                    min(settings.maxEvaluationBatch,
+                        settings.maxRawCandidatesPerRound), fam_counts)
             # batch-proportional quota: each family may take at most
             # max_family_share of the round batch (min 1 slot); excess items
             # are deferred only when another family is present in the batch.
@@ -749,12 +887,24 @@ def main():
             n_explore = max(1, int(len(batch) * settings.minimumExplorationFraction)) \
                 if batch else 0
             new_hyps, dup_hyps, explore_ct, exploit_ct = 0, 0, 0, 0
+            clone_hyps, skipped_small = 0, 0
+            robust_tested, robust_passed = 0, 0
+            oos_raw_pos, oos_thr_pass, exit_cands, trading_cands = 0, 0, 0, 0
+            round_discoveries = []
             added = 0
+            round_timeout_hit = False
+            frontier_before = frontier.size()
+            wd.start_round()
             round_best_val, round_best_oos, round_best_tr, round_best_rob = (
                 float("-inf"), float("-inf"), float("-inf"), float("-inf"))
             new_fams = set()
             for item in batch:
                 hid = item["hypothesis_id"]
+                wd.start_candidate()
+                if wd.round_expired():
+                    item["status"] = "QUEUED"
+                    round_timeout_hit = True
+                    break
                 item["status"] = "EVALUATING"
                 fam = item["family"]
                 # family quota (§7) against the round batch allowance: defer
@@ -774,52 +924,29 @@ def main():
                 fam_counts[fam] = fam_counts.get(fam, 0) + 1
                 round_fam[fam] = round_fam.get(fam, 0) + 1
                 hreg.count_test(1)
-                # resolve mask
-                m = None
-                if hid in atomic_masks:
-                    try:
-                        m = atomic_masks[hid]["mask_fn"](feat).fillna(False)
-                    except Exception:
-                        m = pd.Series(False, index=feat.index)
-                elif "_ll_mask" in hreg.hypotheses.get(hid, {}):
-                    m = hreg.hypotheses[hid]["_ll_mask"]
-                else:
-                    rec = hreg.hypotheses.get(hid, {})
-                    parents = rec.get("parent_ids", [])
-                    m = pd.Series(True, index=feat.index)
-                    for p in parents:
-                        pm = mask_cache.get(p)
-                        if pm is None and p in atomic_masks:
-                            try:
-                                pm = atomic_masks[p]["mask_fn"](feat).fillna(False)
-                            except Exception:
-                                pm = pd.Series(False, index=feat.index)
-                        if pm is None:
-                            pm = pd.Series(False, index=feat.index)
-                        m = m & pm.fillna(False)
-                    # confirmation leg: intersect with a diverse atomic
-                    leg = item.get("confirm_feature")
-                    if leg and leg in feat.columns:
-                        try:
-                            m = m & (feat[leg] == 1).fillna(False)
-                        except Exception:
-                            pass
+                # resolve mask (iterative helper; see _resolve_mask)
+                m = _resolve_mask(feat, hid, hreg, atomic_masks, mask_cache,
+                                  frontier)
                 if m is None or m.sum() < a.min_events:
                     item["status"] = "REJECTED"
-                    dup_hyps += 1
+                    skipped_small += 1
                     continue
                 mask_cache[hid] = m
                 rec = hreg.hypotheses.get(hid, {})
                 depth = int(rec.get("combination_depth", item.get("combination_depth", 1)))
                 do_exit = depth <= 2  # exit discovery on promising shallow events
+                exit_cfg = item.get("exit_cfg") or default_exit
                 row = evaluate_candidate(
                     feat, m, hid, fam, item.get("feature_signature", hid),
                     "fwd_ret_5m", rec.get("contract_scope", "chain"), "long", "5m",
                     splits, settings, a.min_events, rec or {"hypothesis_id": hid},
-                    depth, default_exit, has_bidask, do_exit, True, hreg)
+                    depth, exit_cfg, has_bidask, do_exit, True, hreg)
                 if row is None:
                     item["status"] = "REJECTED"
                     continue
+                if wd.candidate_expired():
+                    print(f"SLOW_CANDIDATE {hid} exceeded "
+                          f"{wd.candidate_timeout_s:.0f}s")
                 new_hyps += 1
                 if item.get("reason_added", "").startswith("explore"):
                     explore_ct += 1
@@ -827,6 +954,53 @@ def main():
                     exploit_ct += 1
                 all_rows.append(row)
                 item["status"] = "EVALUATED"
+                # discovery record (§3): only genuinely new, non-clone
+                # hypotheses count as discoveries (§5, §21)
+                _is_clone = bool(hreg.hypotheses.get(hid, {}).get("is_clone"))
+                clone_hyps += int(_is_clone)
+                robust_tested += 1
+                robust_passed += int(row["robustness_score"] >= 4.0)
+                trading_cands += 1
+                exit_cands += int(bool(row.get("exit_search_best")))
+                try:
+                    _oe = float(row["OOS_expectancy"])
+                except (TypeError, ValueError):
+                    _oe = float("nan")
+                if _oe == _oe and _oe > 0:
+                    oos_raw_pos += 1
+                    if int(row["OOS_events"] or 0) >= settings.min_oos_events:
+                        oos_thr_pass += 1
+                if not _is_clone:
+                    _dcat = discovery_category({
+                        "FWD_expectancy": row["FWD_expectancy"],
+                        "FWD_IS_expectancy": row["FWD_IS_expectancy"],
+                        "IS_expectancy": row["IS_expectancy"],
+                        "robustness_score": row["robustness_score"],
+                        "OOS_trading_result": row["OOS_trading_result"],
+                        "mt_pass": "False",
+                        "execution_model": row["execution_model"],
+                        "paper_eligible": False})
+                    _disc = {
+                        "discovery_id": f"D{n_round:03d}-{hid}",
+                        "cycle_id": n_round, "hypothesis_id": hid,
+                        "family": fam,
+                        "hypothesis_definition": row["feature_definition"],
+                        "parent_hypothesis": row["parent_ids"],
+                        "new_information": row["failure_why"]
+                        if _dcat == "NO_DISCOVERY"
+                        else f"{_dcat}:{row['return_path_class']}",
+                        "is_clone": False,
+                        "sample_size": int(row["events"]),
+                        "train_result": row["FWD_expectancy"],
+                        "validation_result": row["FWD_IS_expectancy"],
+                        "OOS_result": row["OOS_trading_result"],
+                        "status": _dcat,
+                        "trading_rule": row["exit_rule"],
+                        "exit": row["exit_search_best"],
+                        "robustness": row["robustness_score"],
+                        "edge_level": _dcat}
+                    round_discoveries.append(_disc)
+                    all_discoveries.append(_disc)
                 item["validation_score"] = row["FWD_IS_expectancy"] \
                     if pd.notna(row["FWD_IS_expectancy"]) else 0.0
                 item["train_score"] = row["FWD_expectancy"] \
@@ -865,6 +1039,11 @@ def main():
                             ["e_expansion", "e_vol_shock", "e_compression",
                              "ev_divergence", "ev_convergence", "ev_catchup_setup"]
                             if c in feat.columns and c != row["feature_definition"]]
+                    # §5: never re-add a leg already in the parent signature —
+                    # X&leg where leg ∈ X is the same signal, not a discovery
+                    _parent_tokens = set(
+                        row["feature_definition"].split("&"))
+                    legs = [lg for lg in legs if lg not in _parent_tokens]
                     added = 0
                     for leg in legs[:settings.topKConditional]:
                         if added >= 3:
@@ -875,7 +1054,7 @@ def main():
                             contract_scope=rec.get("contract_scope", "chain"),
                             exit_rule="hold5/sl.5/tp1",
                             parent_ids=[hid], depth=depth + 1,
-                            reason=f"combo-confirm:{leg}")
+                            reason=f"combo-confirm:{leg}", cycle_id=n_round)
                         if not reg2["duplicate"]:
                             it2 = {"hypothesis_id": reg2["hypothesis_id"],
                                    "family": "COMBINATION",
@@ -898,6 +1077,71 @@ def main():
                     frontier.set_status(hid, "PROMOTED")
                 else:
                     frontier.set_status(hid, "EVALUATED")
+                # failure-driven exit variants (§22, FIX 4): predictive signal
+                # with no working trading rule spawns NEW hypotheses carrying
+                # alternative exit structures into the next cycle's queue.
+                if row["unresolved_code"] in (
+                        "ENTRY_PROMISING_EXIT_UNRESOLVED",
+                        "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED"):
+                    try:
+                        import json as _jj
+                        _best = _jj.loads(row["exit_search_best"].replace("'", '"')) \
+                            if isinstance(row["exit_search_best"], str) else {}
+                    except Exception:
+                        _best = {}
+                    _alts = []
+                    if isinstance(_best, dict) and _best:
+                        _alts.append({"hold": _best.get("hold", 5),
+                                      "sl": 99.0, "tp": 99.0, "trail": None,
+                                      "note": "time-only-hold"})
+                        _alts.append({"hold": _best.get("hold", 5),
+                                      "sl": _best.get("sl", 0.5), "tp": 99.0,
+                                      "trail": None, "note": "hold+stop"})
+                    for _ax in _alts[:2]:
+                        _er = (f"hold={_ax['hold']}/sl={_ax['sl']}/"
+                               f"tp={_ax['tp']}/trail={_ax['trail']}")
+                        regx = hreg.register(
+                            "EXITVAR", fam, row["feature_definition"],
+                            contract_scope=rec.get("contract_scope", "chain"),
+                            entry_rule=rec.get("entry_rule", "signal-close"),
+                            exit_rule=_er, parent_ids=[hid], depth=depth,
+                            reason=f"exit-variant:{_ax['note']}",
+                            cycle_id=n_round)
+                        if not regx["duplicate"]:
+                            itx = {"hypothesis_id": regx["hypothesis_id"],
+                                   "family": fam,
+                                   "feature_signature": row["feature_definition"],
+                                   "combination_depth": depth,
+                                   "reason_added": f"exit-variant:{_ax['note']}",
+                                   "reason_promising": row["failure_why"],
+                                   "reason_unresolved": row["unresolved_code"],
+                                   "unresolved_code": row["unresolved_code"],
+                                   "next_action": "exit-discovery",
+                                   "exit_cfg": {k: _ax[k] for k in
+                                                ("hold", "sl", "tp", "trail")},
+                                   "train_score": 0.0, "validation_score": 0.0,
+                                   "OOS_score": 0.0, "robustness_score": 0.0,
+                                   "priority": 0.0, "status": "QUEUED",
+                                   "parent_hypotheses": [hid],
+                                   "information_gain": 0.0, "novelty": 1.2}
+                            frontier.items[regx["hypothesis_id"]] = itx
+                            mask_cache[regx["hypothesis_id"]] = m
+                            added += 1
+                        else:
+                            dup_hyps += 1
+                # research-memory buckets (§4)
+                _cat0 = "promising" if (
+                    pd.notna(row["FWD_IS_expectancy"])
+                    and row["FWD_IS_expectancy"] > 0) else "rejected"
+                hreg.mark(hid, _cat0)
+                if row["OOS_trading_result"] != "OOS_TRADING_RULE_PASS" \
+                        and pd.notna(row["FWD_OOS_expectancy"]) \
+                        and row["FWD_OOS_expectancy"] > 0:
+                    hreg.mark(hid, "oos_rejected")
+                if row["unresolved_code"]:
+                    hreg.mark(hid, "exit_unresolved")
+                if row["robustness_score"] >= 4.0:
+                    hreg.mark(hid, "robust")
             # exploration seeding (§26): family-diverse probes while budget remains
             n_new_fam = len(new_fams)
             fsize = frontier.size()
@@ -917,31 +1161,155 @@ def main():
             if round_best_oos != float("-inf"):
                 prev_best_oos = max(prev_best_oos, round_best_oos)
                 best_oos = max(best_oos, round_best_oos)
-            converged = conv.update(fsize, n_new_fam, dval, doos, div_sat)
+            # family hard-stop >50% for next cycle (§7)
+            fam_total = max(1, sum(fam_counts.values()))
+            stopped = frontier.update_family_stops(fam_counts, fam_total)
+            # exit / trading-rule research exhausted? (§25)
+            exit_open = sum(1 for it in frontier.items.values()
+                            if it.get("unresolved_code")
+                            in ("ENTRY_PROMISING_EXIT_UNRESOLVED",
+                                "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED")
+                            and it["status"] == "QUEUED")
+            exit_exhausted = (exit_open == 0)
+            trading_exhausted = (fsize == 0)
+            converged = conv.update(fsize, n_new_fam, dval, doos, div_sat,
+                                    exit_exhausted, trading_exhausted,
+                                    best_train_delta=round_best_tr
+                                    if round_best_tr != float("-inf") else 0.0)
+            # cycle status (§1/§21)
+            if round_timeout_hit:
+                cycle_status = "CYCLE_BUDGET_EXHAUSTED"
+            elif round_discoveries:
+                cycle_status = "CYCLE_DISCOVERY_FOUND"
+                no_discovery_streak = 0
+            else:
+                cycle_status = "CYCLE_NO_NEW_DISCOVERY"
+                no_discovery_streak += 1
+            # automatic direction change on no-discovery (§21/§22): lift
+            # family stops, boost exploration, reprioritize unseen families
+            if cycle_status == "CYCLE_NO_NEW_DISCOVERY":
+                frontier.stopped_families = set()
+                for it in frontier.items.values():
+                    if it["status"] == "QUEUED" \
+                            and it["family"] not in seen_families:
+                        it["novelty"] = 2.0
+            next_plan = build_next_cycle_plan(
+                frontier, fam_counts, seen_families, stopped,
+                [d["discovery_id"] for d in all_discoveries])
             fam_share_after = {k: round(v / max(1, sum(fam_counts.values())), 3)
                                for k, v in fam_counts.items()}
             dom = max(fam_share_after.values()) if fam_share_after else 0.0
-            print(f"ROUND {n_round} candidates={len(all_rows)} "
-                  f"new={new_hyps} dup={dup_hyps} frontier={fsize} "
+            print(f"ROUND {n_round} [{cycle_status}] candidates={len(all_rows)} "
+                  f"new={new_hyps} dup={dup_hyps} clones={clone_hyps} "
+                  f"skipped_small={skipped_small} frontier={fsize} "
                   f"added={added if batch else 0} removed={len(batch)} "
                   f"best_tr={round_best_tr:.4f} best_val={round_best_val:.4f} "
                   f"best_oos={round_best_oos:.4f} best_rob={round_best_rob:.4f} "
                   f"new_fam={n_new_fam} explore={explore_ct} exploit={exploit_ct} "
                   f"runtime={ctrl.elapsed():.0f}s mem={_mem()} "
                   f"tests={hreg.global_test_count} fam_reject={fam_rejected} "
-                  f"dominant_share={dom:.2f}")
+                  f"dominant_share={dom:.2f} stopped={sorted(stopped)}")
             ctrl.round_logs.append({"round": n_round,
+                                    "cycle_id": n_round,
+                                    "cycle_status": cycle_status,
                                     "candidate_count": len(all_rows),
+                                    "hypotheses_generated": new_hyps + dup_hyps,
+                                    "hypotheses_new": new_hyps,
+                                    "hypotheses_duplicate": dup_hyps,
+                                    "hypotheses_clones": clone_hyps,
+                                    "hypotheses_skipped_small": skipped_small,
+                                    "families_explored": sorted(seen_families),
+                                    "families_blocked": sorted(stopped),
+                                    "frontier_before": frontier_before,
+                                    "frontier_after": fsize,
                                     "frontier_size": fsize, "converged": converged,
+                                    "train_candidates": trading_cands,
+                                    "validation_candidates": trading_cands,
+                                    "OOS_candidates": trading_cands,
+                                    "OOS_positive": oos_raw_pos,
+                                    "OOS_threshold_pass": oos_thr_pass,
+                                    "OOS_final_survivors": 0,
+                                    "robustness_tested": robust_tested,
+                                    "robustness_passed": robust_passed,
+                                    "multiple_testing_count": hreg.global_test_count,
+                                    "multiple_testing_survivors": 0,
+                                    "trading_rule_candidates": trading_cands,
+                                    "exit_candidates": exit_cands,
+                                    "new_discoveries": len(round_discoveries),
+                                    "runtime": round(ctrl.elapsed(), 1),
+                                    "memory": wd.memory_mb(),
                                     "stop_why": ""})
-            save_checkpoint(ckpt_path, {
+            # multi-file checkpoints (§28)
+            ckpt_base = a.checkpoint_dir or outdir
+            mem = {k: sorted(v) for k, v in hreg.memory.items()}
+            _hyps = {}
+            for _hid, _rec in hreg.hypotheses.items():
+                _r = {k: v for k, v in _rec.items() if k != "_ll_mask"}
+                _r["signature"] = hreg.signature(
+                    _rec.get("feature_signature", ""),
+                    _rec.get("timestamp_rule", ""),
+                    _rec.get("label", ""), _rec.get("direction", ""),
+                    _rec.get("contract_scope", ""),
+                    _rec.get("entry_rule", ""),
+                    _rec.get("exit_rule", ""))
+                _hyps[_hid] = _r
+            _registry = {"hypotheses": _hyps, "memory": mem,
+                         "duplicates": hreg.duplicate_count,
+                         "clones": hreg.clone_count,
+                         "families": dict(fam_counts)}
+            save_checkpoint(os.path.join(ckpt_base, "checkpoint.json"), {
                 "run_id": run_id, "round": n_round,
                 "candidates": all_rows[-500:],
+                "discoveries": all_discoveries[-500:],
                 "frontier": frontier.to_json(),
+                "registry": _registry,
                 "global_test_count": hreg.global_test_count,
                 "hypothesis_n": hreg.n, "oos_days": [str(d) for d in splits["pseudo_oos"]],
                 "config_hash": settings.configuration_hash(),
                 "random_seed": settings.random_seed})
+            save_checkpoint(os.path.join(ckpt_base, "research_registry.json"), {
+                "hypotheses_tested": len(hreg.hypotheses),
+                "registry": _registry,
+                "global_test_count": hreg.global_test_count})
+            save_checkpoint(os.path.join(ckpt_base, "frontier.json"),
+                            frontier.to_json())
+            save_checkpoint(os.path.join(ckpt_base, "candidate_store.json"),
+                            all_rows[-1000:])
+            save_checkpoint(os.path.join(ckpt_base, "oos_store.json"), {
+                "oos_days": [str(d) for d in splits["pseudo_oos"]],
+                "OOS_FROZEN": True, "OOS_REOPTIMIZED": False})
+            save_checkpoint(os.path.join(ckpt_base, "exit_store.json"), {
+                "exit_unresolved": hreg.memory["exit_unresolved"] and
+                sorted(hreg.memory["exit_unresolved"])})
+            save_checkpoint(os.path.join(ckpt_base, "robustness_store.json"), {
+                "robust": sorted(hreg.memory["robust"])})
+            with open(os.path.join(ckpt_base, "discoveries.jsonl"), "a") as _df:
+                import json as _jj2
+                for _d in round_discoveries:
+                    _df.write(_jj2.dumps(_d, default=str) + "\n")
+            # per-cycle discovery report (§31)
+            print(f"===== DISCOVERY CYCLE {n_round} =====")
+            if round_discoveries:
+                _top = max(round_discoveries,
+                           key=lambda d: (d["status"] != "NO_DISCOVERY",
+                                          float(d["validation_result"] or -1e18)
+                                          if str(d["validation_result"]) not in
+                                          ("NA", "nan") else -1e18))
+                print(f"NEW DISCOVERY: ID={_top['discovery_id']} "
+                      f"FAMILY={_top['family']} DESC={_top['hypothesis_definition']} "
+                      f"WHY_NEW={_top['new_information']} "
+                      f"TRAIN={_top['train_result']} VAL={_top['validation_result']} "
+                      f"OOS={_top['OOS_result']} ROB={_top['robustness']} "
+                      f"RULE={_top['trading_rule']} EXIT={_top['exit']} "
+                      f"EDGE={_top['edge_level']}")
+            print(f"FRONTIER: {fsize} items "
+                  f"({len(next_plan['top_unresolved'])} prioritized)")
+            print(f"NEXT SEARCH: explore={next_plan['families_needing_exploration'][:5]} "
+                  f"over={next_plan['families_over_explored'][:5]} "
+                  f"exit_tests={next_plan['new_exit_tests']}")
+            print(f"STATUS: {cycle_status}")
+            if not wd.memory_ok():
+                print(f"WARNING memory budget exceeded: {wd.memory_mb():.0f}MB")
             if not batch and fsize == 0:
                 stop_why = "FRONTIER_DRAINED"
                 if conv.drain_converged():
@@ -966,6 +1334,7 @@ def main():
             cands_df["rank_composite"] = cands_df[
                 ["rank_sharpe", "rank_expectancy", "rank_oos", "rank_robustness"]].mean(axis=1)
             # paper gate per candidate (§56)
+            cands_df["lookahead_pass"] = str(bool(leak.get("PASS")))
             pe, per_ = [], []
             for _, r in cands_df.iterrows():
                 e, why = paper_eligible(r.to_dict(), has_bidask)
@@ -973,6 +1342,32 @@ def main():
                 per_.append(why)
             cands_df["paper_eligible"] = pe
             cands_df["paper_gate_reason"] = per_
+            # discovery category + §20 L1-L8 levels + OOS stage (FIX 2)
+            cats, lvls, stages = [], [], []
+            for _, r in cands_df.iterrows():
+                d = r.to_dict()
+                c = discovery_category(d)
+                cats.append(c)
+                lvls.append(str(edge_levels_l1_l8(d)["levels"]))
+                stages.append(oos_stage(d.get("OOS_expectancy"),
+                                        d.get("OOS_events"),
+                                        settings.min_oos_events,
+                                        d.get("mt_pass")))
+            cands_df["discovery_category"] = cats
+            cands_df["edge_levels_l1_l8"] = lvls
+            cands_df["OOS_stage"] = stages
+            # OOS-positive but MT-failed → frontier routing (§22, never tune)
+            for _, r in cands_df[
+                    (cands_df["OOS_stage"] == "OOS_THRESHOLD_PASS")].iterrows():
+                hreg.mark(r["hypothesis_id"], "oos_rejected")
+                if r["hypothesis_id"] in frontier.items:
+                    frontier.items[r["hypothesis_id"]]["unresolved_code"] = \
+                        "OOS_PROMISING_BUT_MULTIPLE_TESTING_FAILED"
+                    frontier.items[r["hypothesis_id"]]["next_action"] = \
+                        "simpler independent hypothesis, orthogonal family"
+            for _, r in cands_df[
+                    cands_df["paper_eligible"] == True].iterrows():  # noqa: E712
+                hreg.mark(r["hypothesis_id"], "validated")
         else:
             for _c in ("perm_p_adj", "OOS_trading_result", "paper_eligible",
                        "discovery_family"):
@@ -1011,7 +1406,62 @@ def main():
             if len(cands_df) else 0
         print(f"OOS_CANDIDATES_TESTED={tested}\nOOS_TRADING_SURVIVED={surv_n} MT_SURVIVORS={mt_surv}")
         print(f"GLOBAL_TEST_COUNT={hreg.global_test_count} "
-              f"UNIQUE_HYPOTHESES={hreg.n} DUPLICATES={hreg.duplicate_count}")
+              f"UNIQUE_HYPOTHESES={hreg.n} DUPLICATES={hreg.duplicate_count} "
+              f"CLONES={hreg.clone_count}")
+        # FIX 3 surrogate transparency: full null distribution + empirical
+        # percentile for top validation candidates, written to file
+        import json as _js
+        surr_out = []
+        if len(cands_df) and len(mask_cache):
+            _top = cands_df.nlargest(min(20, len(cands_df)),
+                                     "FWD_IS_expectancy")
+            _rng = np.random.default_rng(42)
+            for _, _r in _top.iterrows():
+                _m = mask_cache.get(_r["hypothesis_id"])
+                if _m is None:
+                    continue
+                try:
+                    _led = backtest(feat, _m.fillna(False),
+                                    hold_bars=int(_r["exit_hold"]),
+                                    sl=float(_r["exit_sl"]),
+                                    tp=float(_r["exit_tp"]),
+                                    trail=None if str(_r["exit_trail"]) in
+                                    ("None", "NA", "nan") else float(_r["exit_trail"]),
+                                    exit_mode="premium", cid="SURR",
+                                    verify=False)
+                    _rv = pd.to_numeric(_led["ret"], errors="coerce").dropna().values
+                    if len(_rv) < 10:
+                        continue
+                    _obs = float(np.mean(_rv) / (np.std(_rv) + 1e-9) * np.sqrt(len(_rv)))
+                    _null = [float(np.mean(_p) / (np.std(_p) + 1e-9) * np.sqrt(len(_p)))
+                             for _p in (_rng.permutation(_rv)
+                                        for _ in range(int(settings.n_perm)))]
+                    surr_out.append({
+                        "hypothesis_id": _r["hypothesis_id"],
+                        "observed_sharpe": round(_obs, 4),
+                        "surrogate_mean": round(float(np.mean(_null)), 4),
+                        "surrogate_sd": round(float(np.std(_null)), 4),
+                        "empirical_percentile": round(
+                            float((np.array(_null) < _obs).mean() * 100), 2),
+                        "p_value": round(float((np.sum(np.abs(_null) >= abs(_obs)) + 1)
+                                               / (int(settings.n_perm) + 1)), 4),
+                        "n_perm": int(settings.n_perm),
+                        "null_distribution": [round(float(x), 4) for x in _null]})
+                except Exception:
+                    continue
+            with open(os.path.join(outdir, "surrogate_distributions.json"), "w") as _sf:
+                _js.dump(surr_out, _sf, indent=1)
+            print(f"SURROGATE_DISTRIBUTIONS written for {len(surr_out)} candidates "
+                  f"(null + empirical percentile; FIX 3)")
+        # FIX 8/9/10 explicit limitation statuses
+        print(f"EXECUTION_STATUS={'AVAILABLE' if has_bidask else 'UNAVAILABLE'} "
+              f"PAPER_ELIGIBLE=FALSE")
+        _und = "AVAILABLE" if n_pu == len(registry) and len(registry) > 0 else "UNAVAILABLE"
+        print(f"UNDERLYING_STATUS={_und} MONEYNESS_STATUS=UNAVAILABLE "
+              f"(moneyness never inferred from strike labels)")
+        print(f"EXPIRY_GENERALIZATION={'AVAILABLE' if meta['n_expiries'] >= 2 else 'UNTESTABLE'}"
+              f"{'' if meta['n_expiries'] >= 2 else ' (single expiry: no neutral score assigned)'}")
+        print(f"OOS_FROZEN=true OOS_REOPTIMIZED=false")
         dataset_hash = hashlib.sha256(
             pd.util.hash_pandas_object(norm, index=True).values.tobytes()).hexdigest()[:16]
         seqs_df = cands_df[cands_df["discovery_family"] == "SEQUENCE"] if len(cands_df) else pd.DataFrame()
@@ -1025,7 +1475,11 @@ def main():
                   "effective_hypotheses": hreg.n,
                   "equivalence_groups": len(hreg.equivalence_groups),
                   "global_test_count": hreg.global_test_count,
-                  "OOS_exposure_count": int(cands_df["OOS_events"].sum()) if len(cands_df) else 0}
+                  "OOS_exposure_count": int(cands_df["OOS_events"].sum()) if len(cands_df) else 0,
+                  "total_cycles": n_round,
+                  "total_discoveries": len(all_discoveries),
+                  "clone_count": hreg.clone_count,
+                  "cycle_statuses": [l.get("cycle_status") for l in ctrl.round_logs]}
         # candidate boards (§43)
         boards = {}
         if len(cands_df):
@@ -1102,10 +1556,60 @@ def main():
               "EXECUTION,PAPER_GATE,SEARCH_CONVERGENCE")
         print(f"SEARCH_CONVERGENCE converged={converged} frontier={frontier.size()} "
               f"rounds={n_round} stop_why={stop_why or 'LOOP_END'}")
+        # search_completed: frontier empty and stop was NOT a hard-budget
+        # cutoff. A soft-target stop with nothing left to test is search
+        # completion (→ NO_EDGE), never budget exhaustion.
+        _completed = (frontier.size() == 0 and stop_why not in (
+            "HARD_ROUND_CEILING", "HARD_CANDIDATE_CEILING",
+            "RUNTIME_EXHAUSTED"))
         final_state = final_status(surv_n, converged, frontier.size(),
                                    budget_hit, data_ok, "", "",
-                                   search_completed=(stop_why == "FRONTIER_DRAINED"))
+                                   search_completed=_completed)
         print(f"FINAL_STATUS={final_state}")
+        # §32 final report strata (appended after FINAL_STATUS is known)
+        try:
+            _by_cat = cands_df["discovery_category"].value_counts().to_dict() \
+                if len(cands_df) and "discovery_category" in cands_df else {}
+            _unres = [it for it in frontier.to_json() if it["status"] == "QUEUED"]
+            with open(rep, "a") as _rf:
+                _rf.write("\n## 17. INFORMATION DISCOVERIES\n")
+                _rf.write(str(_by_cat.get("INFORMATION_DISCOVERY", 0)) + "\n")
+                _rf.write("\n## 18. PREDICTIVE DISCOVERIES\n")
+                _rf.write(str(_by_cat.get("PREDICTIVE_DISCOVERY", 0)) + "\n")
+                _rf.write("\n## 19. TRADING-RULE DISCOVERIES\n")
+                _rf.write(str(_by_cat.get("TRADING_RULE_DISCOVERY", 0)) + "\n")
+                _rf.write("\n## 20. ROBUST DISCOVERIES\n")
+                _rf.write(str(_by_cat.get("ROBUST_DISCOVERY", 0)) + "\n")
+                _rf.write("\n## 21. OOS DISCOVERIES\n")
+                _rf.write(str(_by_cat.get("OOS_DISCOVERY", 0)) + "\n")
+                _rf.write("\n## 22. VALIDATED EDGES\n")
+                _rf.write(str(_by_cat.get("VALIDATED_EDGE", 0)) + "\n")
+                _rf.write("\n## 23. FAILED HYPOTHESES\n")
+                _rf.write(str(_by_cat.get("NO_DISCOVERY", 0)) + "\n")
+                _rf.write("\n## 24. UNRESOLVED FRONTIER\n")
+                _rf.write(f"{len(_unres)} items\n")
+                for _it in _unres[:20]:
+                    _rf.write(f"- {_it['hypothesis_id']} {_it['family']} "
+                              f"{_it.get('unresolved_code', '')} "
+                              f"next={_it.get('next_action', '')}\n")
+                _rf.write("\n## 25. DATA LIMITATIONS\n")
+                _rf.write(f"UNDERLYING_STATUS={_und} MONEYNESS_STATUS=UNAVAILABLE "
+                          f"EXPIRY_GENERALIZATION="
+                          f"{'AVAILABLE' if meta['n_expiries'] >= 2 else 'UNTESTABLE'}\n")
+                _rf.write("\n## 26. EXECUTION LIMITATIONS\n")
+                _rf.write(f"EXECUTION_STATUS={'AVAILABLE' if has_bidask else 'UNAVAILABLE'} "
+                          f"model={exec_model}\n")
+                _rf.write("\n## 27. GLOBAL TEST COUNT\n")
+                _rf.write(f"{hreg.global_test_count} "
+                          f"(unique={hreg.n} dup={hreg.duplicate_count} "
+                          f"clones={hreg.clone_count})\n")
+                _rf.write("\n## 28. TOTAL SEARCH CYCLES\n")
+                _rf.write(f"{n_round} "
+                          f"statuses={[l.get('cycle_status') for l in ctrl.round_logs]}\n")
+                _rf.write("\n## 29. FINAL STATUS\n")
+                _rf.write(f"{final_state}\n")
+        except Exception as _e:
+            print(f"REPORT_APPEND_SKIPPED: {_e}")
         if data_ok and not engine_error and not blocked_reason and surv_n == 0:
             print("NO_VALIDATED_EDGE (gates retained; no weakening)")
     except SystemExit as e:

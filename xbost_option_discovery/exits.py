@@ -7,6 +7,19 @@ import pandas as pd
 import numpy as np
 
 
+def _atr_pct(feat, mask):
+    """Median ATR as % of close for ATR-derived stops/targets (§12)."""
+    import pandas as pd
+    if "atr" not in feat.columns:
+        return None
+    v = pd.to_numeric(
+        (feat.loc[mask.fillna(False), "atr"]
+         / feat.loc[mask.fillna(False), "close"] * 100),
+        errors="coerce").dropna()
+    v = v[(v > 0) & (v < 50)]
+    return float(v.median()) if len(v) else None
+
+
 def _val_expectancy(feat, mask, val_days, hold, sl, tp, trail=None):
     from .backtest import backtest
     from .metrics import calculate_trade_metrics
@@ -44,13 +57,23 @@ def discover_exits(feat, mask, val_days, hold_grid, stop_grid,
                    "val_expectancy": best_a_exp})
     if pd.notna(best_a_exp) and (pd.isna(base_exp) or best_a_exp > base_exp + min_improve):
         best["hold"] = best_a
-    # Stage B: + stop
+    # Stage B: + stop (fixed grid, then ATR-derived candidates §12)
     best_sl, best_b_exp = float(best["sl"]), base_exp
     for sl in stop_grid:
         e, _ = _val_expectancy(feat, mask, val_days, best["hold"], sl, 99.0)
         if pd.notna(e) and (pd.isna(best_b_exp) or e > best_b_exp + min_improve):
             best_sl, best_b_exp = float(sl), e
-    stages.append({"stage": "B_stop", "config": {"hold": best["hold"], "sl": best_sl},
+    atr_pct = _atr_pct(feat, mask)
+    atr_note = None
+    if atr_pct:
+        for mult in (0.5, 1.0, 1.5):
+            sl_atr = round(mult * atr_pct, 3)
+            e, _ = _val_expectancy(feat, mask, val_days, best["hold"], sl_atr, 99.0)
+            if pd.notna(e) and (pd.isna(best_b_exp) or e > best_b_exp + min_improve):
+                best_sl, best_b_exp = float(sl_atr), e
+                atr_note = f"ATRxsl{mult}"
+    stages.append({"stage": "B_stop", "config": {"hold": best["hold"], "sl": best_sl,
+                                                 "sl_source": atr_note or "fixed"},
                    "val_expectancy": best_b_exp})
     if pd.notna(best_b_exp) and (pd.isna(base_exp) or best_b_exp > base_exp + min_improve):
         best["sl"] = best_sl
@@ -67,16 +90,18 @@ def discover_exits(feat, mask, val_days, hold_grid, stop_grid,
         best["tp"] = best_tp
     else:
         best_c_exp = best_b_exp
-    # Stage D: + trail
+    # Stage D: + trail (fixed grid + breakeven: trail activates at
+    # entry so any give-back exits flat — approximated by tight trail)
     best_tr, best_d_exp = None, best_c_exp
-    for tr in trail_grid:
+    for tr in list(trail_grid) + ([0.05] if 0.05 not in list(trail_grid) else []):
         e, _ = _val_expectancy(feat, mask, val_days, best["hold"], best["sl"],
                                best["tp"], trail=tr)
         if pd.notna(e) and (pd.isna(best_d_exp) or e > best_d_exp + min_improve):
             best_tr, best_d_exp = float(tr), e
     stages.append({"stage": "D_trail",
                    "config": {"hold": best["hold"], "sl": best["sl"],
-                              "tp": best["tp"], "trail": best_tr},
+                              "tp": best["tp"], "trail": best_tr,
+                              "breakeven_candidate": 0.05},
                    "val_expectancy": best_d_exp})
     if best_tr is not None and pd.notna(best_d_exp) and \
             (pd.isna(base_exp) or best_d_exp > base_exp + min_improve):

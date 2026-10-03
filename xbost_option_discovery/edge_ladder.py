@@ -88,12 +88,103 @@ def paper_eligible(row: dict, has_bidask: bool) -> tuple:
         "OOS_TRADING_PASS": str(row.get("OOS_trading_result")) == "OOS_TRADING_RULE_PASS",
         "MULTIPLE_TESTING_PASS": str(row.get("mt_pass")) == "True"
         or row.get("mt_pass") is True,
-        "CONTRACT_GENERALIZATION_PASS": str(row.get("contract_status")) == "PASS",
+        # "where testable": single-contract data cannot generalize by
+        # construction; multi-contract data must show broad support
+        "CONTRACT_GENERALIZATION_PASS": (
+            str(row.get("contract_status")) == "PASS" or
+            (str(row.get("contract_status")) == "UNTESTABLE"
+             and int(row.get("contract_count") or 0) < 2)),
         "BEST_EVENT_PASS": float(row.get("rm_best3") if row.get("rm_best3") == row.get("rm_best3") else -1) > 0,
         "CONCENTRATION_PASS": float(row.get("top5") or 1) < 0.5,
         "EXECUTION_MODEL_VALID": bool(has_bidask),
+        "LOOKAHEAD_PASS": str(row.get("lookahead_pass")) == "True"
+        or row.get("lookahead_pass") is True,
     }
     failed = [k for k, v in checks.items() if not v]
     if failed:
         return False, "missing: " + ",".join(failed)
     return True, "all gates pass"
+
+
+# ---- continuous-loop discovery taxonomy (§20/§21) ----
+# L1=INFORMATIONAL L2=PREDICTIVE L3=TRADING_RULE L4=ROBUST L5=OOS_TRADING
+# L6=MULTIPLE_TESTING_SURVIVAL L7=EXECUTABLE L8=PAPER_ELIGIBLE
+LADDER_L1_L8 = ("L1_INFORMATIONAL", "L2_PREDICTIVE", "L3_TRADING_RULE",
+                "L4_ROBUST", "L5_OOS_TRADING", "L6_MULTIPLE_TESTING_SURVIVAL",
+                "L7_EXECUTABLE", "L8_PAPER_ELIGIBLE")
+
+
+def discovery_category(row: dict) -> str:
+    """One of INFORMATION_DISCOVERY / PREDICTIVE_DISCOVERY /
+    TRADING_RULE_DISCOVERY / ROBUST_DISCOVERY / OOS_DISCOVERY /
+    VALIDATED_EDGE. A discovery is never automatically a strategy."""
+    def num(x):
+        try:
+            v = float(x)
+            return v if v == v else None
+        except (TypeError, ValueError):
+            return None
+    info = num(row.get("FWD_expectancy")) is not None \
+        and num(row.get("FWD_expectancy")) > 0
+    pred = info and (num(row.get("FWD_IS_expectancy")) or -1) > 0
+    trade = pred and (num(row.get("IS_expectancy")) or -1) > 0
+    rob = trade and (num(row.get("robustness_score")) or 0) >= 4.0
+    oos = rob and str(row.get("OOS_trading_result")) == "OOS_TRADING_RULE_PASS"
+    mt = oos and (str(row.get("mt_pass")) == "True"
+                  or row.get("mt_pass") is True)
+    if mt and str(row.get("execution_model")) == "EXECUTABLE_PRICE_MODEL" \
+            and row.get("paper_eligible") is True:
+        return "VALIDATED_EDGE"
+    if mt or oos:
+        return "OOS_DISCOVERY"
+    if rob:
+        return "ROBUST_DISCOVERY"
+    if trade:
+        return "TRADING_RULE_DISCOVERY"
+    if pred:
+        return "PREDICTIVE_DISCOVERY"
+    if info:
+        return "INFORMATION_DISCOVERY"
+    return "NO_DISCOVERY"
+
+
+def edge_levels_l1_l8(row: dict) -> dict:
+    """Explicit §20 edge levels per candidate; never collapsed to one score."""
+    cat = discovery_category(row)
+    order = ("INFORMATION_DISCOVERY", "PREDICTIVE_DISCOVERY",
+             "TRADING_RULE_DISCOVERY", "ROBUST_DISCOVERY", "OOS_DISCOVERY",
+             "VALIDATED_EDGE")
+    reached = order.index(cat) if cat in order else -1
+    levels = {}
+    for i, name in enumerate(LADDER_L1_L8):
+        if name in ("L6_MULTIPLE_TESTING_SURVIVAL",):
+            on = cat in ("OOS_DISCOVERY", "VALIDATED_EDGE") and (
+                str(row.get("mt_pass")) == "True"
+                or row.get("mt_pass") is True)
+        elif name == "L7_EXECUTABLE":
+            on = str(row.get("execution_model")) == "EXECUTABLE_PRICE_MODEL"
+        elif name == "L8_PAPER_ELIGIBLE":
+            on = cat == "VALIDATED_EDGE"
+        else:
+            rank = {"L1_INFORMATIONAL": 0, "L2_PREDICTIVE": 1,
+                    "L3_TRADING_RULE": 2, "L4_ROBUST": 3,
+                    "L5_OOS_TRADING": 4}[name]
+            on = reached >= rank
+        levels[name] = bool(on)
+    return {"levels": levels, "category": cat}
+
+
+def oos_stage(expectancy, n_events, min_oos_events, mt_pass) -> str:
+    """FIX 2: OOS_RAW_POSITIVE vs OOS_THRESHOLD_PASS vs OOS_FINAL_SURVIVOR.
+    Positive OOS is never reported as validated."""
+    try:
+        e = float(expectancy)
+    except (TypeError, ValueError):
+        return "OOS_FAIL"
+    if not (e == e and e > 0):
+        return "OOS_FAIL"
+    if int(n_events or 0) < int(min_oos_events):
+        return "OOS_RAW_POSITIVE"
+    if not (str(mt_pass) == "True" or mt_pass is True):
+        return "OOS_THRESHOLD_PASS"
+    return "OOS_FINAL_SURVIVOR"
