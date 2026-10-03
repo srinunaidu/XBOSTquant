@@ -36,6 +36,39 @@ class DiscoverySettings:
     validation_frac: float = 0.2
     oos_frac: float = 0.3
     min_oos_events: int = 20
+    # search controller (§4/§5/§44/§45): HARD SAFETY LIMITS, not stop targets
+    maxRounds: int = 24
+    maxTotalCandidates: int = 500
+    maxRuntimeSeconds: float = 3600.0
+    maxRawCandidatesPerRound: int = 60
+    maxCombinationDepth: int = 3
+    maxFeatureCombinations: int = 200
+    maxPairCombinations: int = 120
+    maxTripleCombinations: int = 80
+    maxQuadCombinations: int = 40
+    maxEvaluationBatch: int = 50
+    minimumExplorationFraction: float = 0.30
+    exploitFraction: float = 0.70
+    topKConditional: int = 10
+    # soft/hard budget adaptation (§44)
+    soft_candidate_budget: int = 500
+    hard_candidate_ceiling: int = 5000
+    hard_round_ceiling: int = 60
+    # convergence (§5/§46)
+    convergence_N: int = 3
+    convergence_epsilon: float = 0.01
+    # diversity (§7)
+    max_family_share: float = 0.30
+    # exit discovery (§11)
+    hold_grid: tuple = (1, 2, 3, 5, 8, 10, 15, 20, 30)
+    stop_grid: tuple = (0.25, 0.5, 1.0, 1.5)
+    target_grid: tuple = (0.5, 1.0, 2.0, 3.0)
+    trail_grid: tuple = (0.5, 1.0)
+    # multiple testing / surrogates (§28/§36)
+    n_perm: int = 200
+    # checkpointing (§53)
+    checkpoint_dir: str = ""
+    resume_from: str = ""
     # execution (§17/28)
     cost_mode: str = "ZERO"        # ZERO | SPREAD (requires bid/ask)
     price_model: str = "RESEARCH_PRICE_MODEL"
@@ -53,8 +86,11 @@ class DiscoverySettings:
 
     def to_dict(self):
         d = asdict(self)
-        for k in ("forward_horizons", "lag_windows"):
-            d[k] = list(d[k])
+        for k in ("forward_horizons", "lag_windows", "hold_grid", "stop_grid",
+                  "target_grid", "trail_grid"):
+            v = d.get(k)
+            if isinstance(v, tuple):
+                d[k] = list(v)
         return d
 
     def configuration_hash(self):

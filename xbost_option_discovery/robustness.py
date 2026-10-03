@@ -104,14 +104,43 @@ def parameter_neighborhood(base_expectancy_fn, param_grid):
 
 
 def robustness_score(components: dict) -> dict:
-    """§40: configurable 0-10 score. Every component explicit; weakest dims dominate."""
+    """§39/§40: configurable 0-10 score with explicit coverage + hard caps.
+    UNTESTABLE (None) dimensions are excluded from the denominator and
+    reported as coverage — never converted into a fake 0.5."""
     w = {"signal": 1.5, "sample": 1.5, "param": 1.0, "time": 1.0, "contract": 1.0,
          "oos": 1.5, "exit": 0.5, "concentration": 0.5, "best_event": 0.25, "stats": 0.25}
+    tested = {k: v for k, v in components.items() if v is not None and k in w}
+    denom = sum(w[k] for k in tested)
     total = sum(w.values())
-    score = sum(max(0.0, min(1.0, components.get(k, 0.0))) * w[k] for k in w) / total * 10
+    if denom == 0:
+        return {"robustness_score": 0.0, "robustness_coverage": 0.0,
+                "untestable_tests": sorted(w), "failed_tests": [],
+                "components": {}, "weights": w, "caps_applied": []}
+    score = sum(max(0.0, min(1.0, float(tested[k]))) * w[k] for k in tested) / denom * 10
+    caps = []
+    # §40 hard caps (never removed to manufacture a winner)
+    if float(components.get("param", 1) or 0) < 0.3 and "param" in tested:
+        score = min(score, 6.0); caps.append("parameter stability <3 -> max 6")
+    if float(components.get("signal", 1) or 0) < 0.3 and "signal" in tested:
+        score = min(score, 6.0); caps.append("signal purity <3 -> max 6")
+    dens = float(components.get("param_density", 1) if "param_density" in components else 1)
+    if "param" in tested and dens < 0.3:
+        score = min(score, 6.0); caps.append("robustness density <30% -> max 6")
+    if float(components.get("exit", 1) or 0) < 0.3 and "exit" in tested:
+        score = min(score, 7.0); caps.append("exit independence <3 -> max 7")
+    if float(components.get("best_event", 1) or 0) < 0.3 and "best_event" in tested:
+        score = min(score, 7.0); caps.append("best-event survival <3 -> max 7")
+    if float(components.get("stats", 1) or 0) <= 0 and float(components.get("param", 1) or 0) < 0.4:
+        score = min(score, 5.0); caps.append("severe MT + weak neighborhood -> max 5")
     # hard vetoes: OOS rejection or surrogate failure cap the score
-    if components.get("oos", 0) <= 0 or components.get("stats", 0) <= 0:
-        score = min(score, 3.0)
+    if components.get("oos", 0) is not None and float(components.get("oos", 0) or 0) <= 0:
+        score = min(score, 3.0); caps.append("oos veto -> max 3")
+    if components.get("stats", 0) is not None and float(components.get("stats", 0) or 0) <= 0:
+        score = min(score, 3.0); caps.append("stats veto -> max 3")
+    failed = [k for k, v in tested.items() if float(v) <= 0]
     return {"robustness_score": round(float(score), 2),
-            "components": {k: round(float(components.get(k, 0.0)), 3) for k in w},
-            "weights": w}
+            "robustness_coverage": round(denom / total, 3),
+            "untestable_tests": sorted(set(w) - set(tested)),
+            "failed_tests": failed,
+            "components": {k: round(float(v), 3) for k, v in tested.items()},
+            "weights": w, "caps_applied": caps}

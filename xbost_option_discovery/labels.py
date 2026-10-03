@@ -1,7 +1,7 @@
 """Forward labels (§15): 1/3/5/10/15m, MFE/MAE, absolute + percentage. Never used in features."""
 import pandas as pd
 
-FW = (1, 3, 5, 10, 15)
+FW = (1, 3, 5, 10, 15, 30)
 
 def add_labels(df):
     df = df.sort_values(["symbol", "timestamp"]).copy()
