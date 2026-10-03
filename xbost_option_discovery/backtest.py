@@ -11,7 +11,7 @@ def fingerprint(cid, sl, tp, trail, exit_mode, hold_bars=5):
 def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="premium",
              cid="CAND", direction="long", verify=True, trail_cfg=None,
              stop_type="FIXED_PERCENT", target_type="FIXED_PERCENT",
-             trail_type="NONE", oos_flag=False):
+             trail_type="NONE", oos_flag=False, dataset_split=""):
     """Path-dependent exits on 1m OHLC *after* entry bar. Long: SL on low, TP on high.
     Same entries + different TP must diverge when path reaches the level (TEST_A/B/C).
 
@@ -170,6 +170,11 @@ def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="pre
                      "CONFIG_FINGERPRINT": fp,
                      "model": "RESEARCH_PRICE_MODEL",
                      "research_model": "RESEARCH_PRICE_MODEL",
+                     "execution_model": "RESEARCH_PRICE_MODEL",
+                     "symbol_id": sig.get("symbol_id", ""),
+                     "instrument_id": sig.get("symbol", ""),
+                     "dataset_split": dataset_split,
+                     "strategy_scope": "SINGLE_CONTRACT",
                      "oos_flag": bool(oos_flag)})
     from .ledger import ledger_hash, exit_config_hash
     ledger = pd.DataFrame(rows)

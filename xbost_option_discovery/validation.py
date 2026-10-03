@@ -25,8 +25,10 @@ def walk_forward(days, train_n=8, test_n=3):
     return out
 
 def cluster(sig, minutes=3):
+    # symbol-aware clustering (§6): cluster key includes symbol/instrument
+    # identity when present so events never cluster across symbols
     sig = sig.copy()
-    keys = [k for k in ("expiry", "strike", "option_type") if k in sig.columns]
+    keys = [k for k in ("symbol_id", "instrument_id", "expiry", "strike", "option_type") if k in sig.columns]
     if not keys:
         keys = ["strike", "option_type"]
     sig = sig.sort_values(keys + ["timestamp"]).copy()
