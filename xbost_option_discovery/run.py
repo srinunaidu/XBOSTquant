@@ -60,7 +60,8 @@ from .generalization import (contract_generalization, strike_robustness,
                              expiry_robustness, otype_robustness,
                              time_robustness, regime_robustness)
 from .edge_ladder import (edge_ladder, final_status, paper_eligible,
-                           discovery_category, edge_levels_l1_l8, oos_stage)
+                           discovery_category, edge_levels_l1_l8, oos_stage,
+                           oos_final_survivor)
 
 LAG_WINDOWS = (1, 2, 3, 5, 10)
 MIN_EVENTS = 50
@@ -99,18 +100,101 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
                        direction, tf, splits, settings, min_events,
                        hyp, depth, exit_cfg, has_bidask, do_exit_search,
                        do_entry_search, registry):
-    """Full L1-L8 evaluation of ONE locked rule. OOS evaluated once, frozen."""
+    """Full L1-L8 evaluation of ONE entry hypothesis with first-class exit
+    discovery. OOS evaluated once on the locked final rule, frozen."""
     from .metrics import label_metrics as _lm
     mask = mask.fillna(False)
     if mask.sum() < min_events:
         return None
     tr = splits["discovery"] + splits["refinement"]
     oos_days = splits["pseudo_oos"]
-    sl, tp, trail, hold = (exit_cfg["sl"], exit_cfg["tp"],
-                           exit_cfg.get("trail"), exit_cfg["hold"])
-    # ---- trading ledger on train+val (locked rule) ----
-    led_all = backtest(feat, mask, hold_bars=int(hold), sl=float(sl),
-                       tp=float(tp), trail=trail, exit_mode="premium", cid=cid)
+    BASELINE = {"hold": 5, "sl": 0.5, "tp": 1.0,
+                "trail_cfg": {"kind": "none"},
+                "stop_type": "FIXED_PERCENT",
+                "target_type": "FIXED_PERCENT", "trail_type": "NONE"}
+    # ---- contract universe budget (§9): log available/considered/excluded ----
+    _avail_contracts = sorted(feat.loc[mask, "symbol"].dropna().unique().tolist()) \
+        if "symbol" in feat.columns else []
+    _maxc = int(getattr(settings, "max_contracts_per_hypothesis", 0) or 0)
+    _excluded_contracts, _excl_reason = [], ""
+    if _maxc > 0 and len(_avail_contracts) > _maxc:
+        try:
+            _vol = feat.loc[mask].groupby("symbol")["volume"].sum().sort_values(
+                ascending=False)
+            _keep = set(_vol.head(_maxc).index.tolist())
+            _excluded_contracts = [c for c in _avail_contracts if c not in _keep]
+            _excl_reason = (f"contract budget max_contracts_per_hypothesis={_maxc}")
+            mask = mask & feat["symbol"].isin(_keep)
+        except Exception:
+            pass
+    # ---- OOS information level (rule-independent, frozen partitions) ----
+    fwd_tr = _lm(feat.loc[mask & feat["day"].isin(tr), "fwd_ret_5m"]) if tr else _lm([])
+    fwd_oos = _lm(feat.loc[mask & feat["day"].isin(oos_days), "fwd_ret_5m"]) \
+        if oos_days else _lm([])
+    fwd_all = _lm(feat.loc[mask, "fwd_ret_5m"])
+    oos_info = ("OOS_SURVIVED_MARK"
+                if (pd.notna(fwd_oos["expectancy"]) and fwd_oos["expectancy"] > 0)
+                else "OOS_REJECTED")
+    # ---- return path (§6/§8): independent of exits ----
+    rpath = compute_return_path(feat, mask)
+    touch = first_touch_stats(feat, mask, sl_pct=0.5, tp_pct=1.0, hold=5)
+    rpath.update(touch)
+    rpath["path_class"] = classify_path(rpath)
+    # ---- BASELINE ledger (§27/§28): fixed .5/1/5 benchmark ONLY ----
+    led_base = backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0,
+                        exit_mode="premium", cid=f"{cid}:BASELINE",
+                        stop_type="FIXED_PERCENT",
+                        target_type="FIXED_PERCENT", trail_type="NONE")
+    m_base = calculate_trade_metrics(led_base)
+    registry.count_test(1)
+    promising = bool(pd.notna(fwd_tr["expectancy"])
+                     and fwd_tr["expectancy"] > 0
+                     and mask.sum() >= min_events)
+    # ---- OPTION_EXIT_DISCOVERY on VALIDATION only (never OOS) ----
+    exit_search = {"best": dict(BASELINE), "improved": False, "stages": [],
+                   "matrix": [], "excluded_invalid": [],
+                   "exit_status": "BASELINE_ONLY (exit search skipped: "
+                   "entry not promising on validation)"}
+    if do_exit_search and promising:
+        try:
+            exit_search = discover_exits(
+                feat, mask, splits["refinement"] or tr, settings, rpath,
+                registry)
+        except Exception:
+            exit_search["exit_status"] = "FAILED (exception; baseline kept)"
+    fin = dict(BASELINE)
+    if isinstance(exit_cfg, dict) and exit_cfg.get("stop_type"):
+        # PRESCRIBED exit variant from the frontier (§7): evaluate the
+        # specified structure directly instead of re-running discovery
+        fin = {"hold": int(exit_cfg.get("hold", 5)),
+               "sl": float(exit_cfg.get("sl", 0.5)),
+               "tp": float(exit_cfg.get("tp", 1.0)),
+               "trail_cfg": exit_cfg.get("trail_cfg") or {"kind": "none"},
+               "stop_type": exit_cfg.get("stop_type", "FIXED_PERCENT"),
+               "target_type": exit_cfg.get("target_type", "FIXED_PERCENT"),
+               "trail_type": exit_cfg.get("trail_type", "NONE")}
+        exit_search["exit_status"] = "PRESCRIBED_VARIANT"
+        exit_search["best"] = dict(fin)
+        registry.count_test(1)
+    else:
+        fin = exit_search.get("best", dict(BASELINE))
+    hold = int(fin.get("hold", 5))
+    sl = float(fin.get("sl", 0.5))
+    tp = float(fin.get("tp", 1.0))
+    trail_cfg = fin.get("trail_cfg") or {"kind": "none"}
+    stop_type = fin.get("stop_type", "FIXED_PERCENT")
+    target_type = fin.get("target_type", "FIXED_PERCENT")
+    trail_type = fin.get("trail_type", "NONE")
+    _tc = None if trail_cfg.get("kind") == "none" else trail_cfg
+    exit_status = exit_search.get("exit_status", "BASELINE_ONLY")
+    # unresolved routing (§7): predictive entry, no working exit → frontier
+    if promising and exit_status in ("BASELINE_KEPT", "FAILED (exception; baseline kept)"):
+        exit_status = "EXIT_DISCOVERY_RAN_NO_IMPROVEMENT"
+    # ---- FINAL trading ledger on train+val (locked discovered rule) ----
+    led_all = backtest(feat, mask, hold_bars=hold, sl=sl, tp=tp,
+                       trail=None, trail_cfg=_tc, exit_mode="premium", cid=cid,
+                       stop_type=stop_type, target_type=target_type,
+                       trail_type=trail_type)
     if len(led_all) < min_events:
         return None
     m_all = calculate_trade_metrics(led_all)
@@ -120,42 +204,17 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
          "avg_loser": m_all["avg_loser"], "expectancy": m_all["expectancy"],
          "PF": m_all["PF"], "TRADE_SHARPE": m_all["TRADE_SHARPE"],
          "P&L": m_all["P&L"]}, led_all)
-    # ---- frozen OOS at TRADING-RULE level (§30), evaluated once ----
+    # ---- frozen OOS on the FINAL rule only, evaluated once ----
     oos_mask = mask & feat["day"].isin(oos_days) if oos_days else \
         pd.Series(False, index=feat.index)
-    led_oos = backtest(feat, oos_mask, hold_bars=int(hold), sl=float(sl),
-                       tp=float(tp), trail=trail, exit_mode="premium", cid=cid)
+    led_oos = backtest(feat, oos_mask, hold_bars=hold, sl=sl, tp=tp,
+                       trail=None, trail_cfg=_tc, exit_mode="premium", cid=cid,
+                       stop_type=stop_type, target_type=target_type,
+                       trail_type=trail_type, oos_flag=True)
     m_oos = calculate_trade_metrics(led_oos)
     oos_trading_exp = m_oos["expectancy"]
     oos_trading_pass = bool(pd.notna(oos_trading_exp) and oos_trading_exp > 0
                             and len(led_oos) >= settings.min_oos_events)
-    # ---- OOS information level (explicitly separate, §30) ----
-    fwd_tr = _lm(feat.loc[mask & feat["day"].isin(tr), "fwd_ret_5m"]) if tr else _lm([])
-    fwd_oos = _lm(feat.loc[mask & feat["day"].isin(oos_days), "fwd_ret_5m"]) \
-        if oos_days else _lm([])
-    fwd_all = _lm(feat.loc[mask, "fwd_ret_5m"])
-    oos_info = ("OOS_SURVIVED_MARK"
-                if (pd.notna(fwd_oos["expectancy"]) and fwd_oos["expectancy"] > 0)
-                else "OOS_REJECTED")
-    # ---- return path (§10/§12/§48) ----
-    rpath = compute_return_path(feat, mask)
-    touch = first_touch_stats(feat, mask, sl_pct=sl, tp_pct=tp, hold=hold)
-    rpath.update(touch)
-    rpath["path_class"] = classify_path(rpath)
-    # ---- staged exit discovery on VALIDATION only (§11, never OOS) ----
-    exit_search = {"best": dict(exit_cfg), "improved": False, "stages": []}
-    if do_exit_search and pd.notna(fwd_tr["expectancy"]) and fwd_tr["expectancy"] > 0:
-        try:
-            exit_search = discover_exits(
-                feat, mask, splits["refinement"] or tr,
-                tuple(settings.hold_grid), tuple(settings.stop_grid),
-                tuple(settings.target_grid), tuple(settings.trail_grid))
-            registry.count_test(len(tuple(settings.hold_grid))
-                                + len(tuple(settings.stop_grid))
-                                + len(tuple(settings.target_grid))
-                                + len(tuple(settings.trail_grid)))
-        except Exception:
-            pass
     # ---- entry timing/perturbation on train/val (§10/§13/§14) ----
     # same-bar, +1/+2/+3 min, 1-bar confirmation. New research questions only;
     # each variant increments GLOBAL_TEST_COUNT. No OOS reuse.
@@ -192,6 +251,50 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
     cap = cap_dominance(led_all)
     conc = concentration(led_all["ret"])
     br = best_removal(led_all["ret"], pd.to_datetime(led_all["entry_time"]).dt.date)
+    # §21 extensions: hold perturbation, best-day removal, trade-order
+    # randomization (UNTESTABLE stays UNTESTABLE, never a fake score)
+    hold_perturb, bestday, shufl = "UNTESTABLE", "UNTESTABLE", "UNTESTABLE"
+    try:
+        from .backtest import backtest as _bt
+        _hp = []
+        for _h in (max(1, hold - 1), hold + 1):
+            try:
+                _l = _bt(feat, mask.fillna(False) & feat["day"].isin(tr),
+                         hold_bars=int(_h), sl=float(sl), tp=float(tp),
+                         trail=None,
+                         trail_cfg=None if trail_cfg.get("kind") == "none" else trail_cfg,
+                         exit_mode="premium", cid="HOLDPERT", verify=False,
+                         stop_type=stop_type, target_type=target_type,
+                         trail_type=trail_type)
+                _hp.append(float(_l["ret"].mean()) if len(_l) else float("nan"))
+                registry.count_test(1)
+            except Exception:
+                _hp.append(float("nan"))
+        hold_perturb = {"hold_minus1": _hp[0], "hold_plus1": _hp[1],
+                        "stable": bool(all(pd.notna(_hp))) and
+                        (all(x > 0 for x in _hp) ==
+                         (pd.notna(m_all["expectancy"]) and m_all["expectancy"] > 0))}
+    except Exception:
+        pass
+    try:
+        _by = pd.to_numeric(led_all["ret"], errors="coerce").groupby(
+            pd.to_datetime(led_all["entry_time"]).dt.date).sum()
+        if len(_by) > 1:
+            bestday = float(_by.drop(_by.idxmax()).mean())
+    except Exception:
+        pass
+    try:
+        _r = pd.to_numeric(led_all["ret"], errors="coerce").dropna().values
+        if len(_r) >= 10:
+            _rng = np.random.default_rng(42)
+            _dds = []
+            for _ in range(50):
+                _eq = pd.Series(_rng.permutation(_r)).cumsum()
+                _dds.append(float((_eq - _eq.cummax()).min()))
+            shufl = {"shuffled_maxDD_mean": round(float(np.mean(_dds)), 4),
+                     "observed_maxDD": m_all["maxDD"]}
+    except Exception:
+        pass
     try:
         ei = exit_independence(feat, mask, cid, int(hold))
     except Exception:
@@ -281,10 +384,28 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
         "contract": rel, "direction": direction, "timeframe": tf,
         "entry_rule": hyp.get("entry_rule", "signal-close"),
         "entry_best_variant": entry_best, "entry_variants": str(entry_variants),
-        "exit_rule": f"hold={hold}/sl={sl}/tp={tp}/trail={trail}",
-        "exit_hold": hold, "exit_sl": sl, "exit_tp": tp, "exit_trail": trail,
-        "exit_search_best": str(exit_search.get("best")),
+        "entry_timing": entry_best, "entry_price_rule": "signal bar close t",
+        "exit_rule": f"hold={hold}/sl={sl}/tp={tp}/trail={trail_cfg} "
+                     f"stop_type={stop_type} target_type={target_type} "
+                     f"trail_type={trail_type}",
+        "exit_hold": hold, "exit_sl": sl, "exit_tp": tp,
+        "exit_trail_cfg": str(trail_cfg),
+        "exit_stop_type": stop_type, "exit_target_type": target_type,
+        "exit_trail_type": trail_type,
+        "exit_discovery_status": exit_status,
+        "exit_search_best": __import__("json").dumps(
+            exit_search.get("best", {}), default=str),
         "exit_search_improved": bool(exit_search.get("improved")),
+        "exit_combos_evaluated": int(exit_search.get("n_combos_evaluated", 0)),
+        "exit_combos_excluded": len(exit_search.get("excluded_invalid", [])),
+        "BASELINE_exit": "SL=.5/TP=1/hold=5 (benchmark only)",
+        "BASELINE_expectancy": m_base["expectancy"],
+        "BASELINE_trades": m_base["trade_count"],
+        "DISCOVERED_expectancy": m_all["expectancy"],
+        "contracts_available": len(_avail_contracts),
+        "contracts_considered": len(_avail_contracts) - len(_excluded_contracts),
+        "contracts_excluded": ";".join(_excluded_contracts[:12]),
+        "contract_exclusion_reason": _excl_reason,
         "events": m_all["trade_count"], "clusters": n_clu,
         "effective_sample_size": eff_n, "trade_autocorr_lag1": ac1,
         "wins": m_all["wins"], "losses": m_all["losses"],
@@ -329,6 +450,9 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
         "top1": concentration(led_all["ret"]).get("top1"), "top5": conc["top5"],
         "top10": conc.get("top10"), "rm_best3": br.get("rm_best3"),
         "rm_best1": br.get("rm_best1"), "rm_best5": br.get("rm_best5"),
+        "hold_perturbation": str(hold_perturb),
+        "rm_bestday": bestday,
+        "trade_order_randomization": str(shufl),
         "perm_p": padj, "final_status": status,
         "execution_model": ("EXECUTABLE_PRICE_MODEL" if has_bidask
                             else "RESEARCH_PRICE_MODEL"),
@@ -388,6 +512,35 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
     row["next_action"] = nxt
     row["OOS_FROZEN"] = True
     row["OOS_REOPTIMIZED"] = False
+    # research-registry status (§33)
+    if code == "ENTRY_PROMISING_EXIT_UNRESOLVED":
+        reg_status = "ENTRY_PROMISING_EXIT_UNRESOLVED"
+    elif exit_search.get("improved"):
+        reg_status = "EXIT_PROMISING"
+    elif conc["top5"] > 0.5:
+        reg_status = "CONCENTRATION_REJECTED"
+    elif str(row.get("contract_status")) == "FAIL":
+        reg_status = "CONTRACT_CONCENTRATION"
+    elif padj >= 0.10:
+        reg_status = "SURROGATE_REJECTED"
+    elif oos_trading_pass:
+        reg_status = "OOS_POSITIVE"
+    elif pd.notna(fwd_tr["expectancy"]) and fwd_tr["expectancy"] > 0:
+        reg_status = "VALIDATION_POSITIVE"
+    elif pd.notna(fwd_all["expectancy"]) and fwd_all["expectancy"] > 0:
+        reg_status = "TRAIN_POSITIVE"
+    else:
+        reg_status = "TESTED"
+    row["registry_status"] = reg_status
+    try:
+        registry.hypotheses[hyp["hypothesis_id"]]["registry_status"] = reg_status
+        registry.hypotheses[hyp["hypothesis_id"]]["train_result"] = fwd_all["expectancy"]
+        registry.hypotheses[hyp["hypothesis_id"]]["validation_result"] = fwd_tr["expectancy"]
+        registry.hypotheses[hyp["hypothesis_id"]]["oos_result"] = row["OOS_trading_result"]
+        registry.hypotheses[hyp["hypothesis_id"]]["robustness_result"] = rs["robustness_score"]
+        registry.hypotheses[hyp["hypothesis_id"]]["failure_class"] = why
+    except Exception:
+        pass
     return row
 
 
@@ -737,13 +890,16 @@ def main():
         print(f"LEAD_LAG pairs tested: {len(ll_rows)}")
 
         # ================= ITERATIVE FRONTIER SEARCH (§4) =================
+        from .exits import reset_audit as _reset_exit_audit
+        _reset_exit_audit()
         hreg = HypothesisRegistry()
         frontier = FrontierQueue(max_family_share=settings.max_family_share)
         conv = ConvergenceChecker(n=settings.convergence_N,
                                   epsilon=settings.convergence_epsilon)
         ctrl = SearchController(settings, t_start=t_start)
-        default_exit = {"hold": settings.exit_hold_bars, "sl": settings.exit_sl_pct,
-                        "tp": settings.exit_tp_pct, "trail": None}
+        # BASELINE config exists ONLY as benchmark (§27/§28); evaluation
+        # uses discovered or prescribed exits, never a fixed default
+        default_exit = None
         depth1 = build_depth1_specs(feat, mods, strikes, lead_cols,
                                     a.min_events, quality)
         print(f"DEPTH1_SPECS={len(depth1)}")
@@ -785,6 +941,7 @@ def main():
         atomic_masks = {}
         # rebuild mapping hid->spec in seed order
         seed_hids = [it["hypothesis_id"] for it in frontier.to_json()]
+        depth1_hids = seed_hids[:len(depth1)]
         for hid, sp in zip(seed_hids[:len(depth1)], depth1):
             atomic_masks[hid] = sp
 
@@ -1085,21 +1242,32 @@ def main():
                         "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED"):
                     try:
                         import json as _jj
-                        _best = _jj.loads(row["exit_search_best"].replace("'", '"')) \
+                        _best = _jj.loads(row["exit_search_best"]) \
                             if isinstance(row["exit_search_best"], str) else {}
+                        if isinstance(_best, str):
+                            _best = _jj.loads(_best)
                     except Exception:
                         _best = {}
                     _alts = []
                     if isinstance(_best, dict) and _best:
                         _alts.append({"hold": _best.get("hold", 5),
-                                      "sl": 99.0, "tp": 99.0, "trail": None,
+                                      "sl": 99.0, "tp": 99.0,
+                                      "trail_cfg": {"kind": "none"},
+                                      "stop_type": "NONE",
+                                      "target_type": "NONE",
+                                      "trail_type": "NONE",
                                       "note": "time-only-hold"})
                         _alts.append({"hold": _best.get("hold", 5),
                                       "sl": _best.get("sl", 0.5), "tp": 99.0,
-                                      "trail": None, "note": "hold+stop"})
+                                      "trail_cfg": {"kind": "none"},
+                                      "stop_type": _best.get("stop_type",
+                                                             "FIXED_PERCENT"),
+                                      "target_type": "NONE",
+                                      "trail_type": "NONE",
+                                      "note": "hold+stop"})
                     for _ax in _alts[:2]:
                         _er = (f"hold={_ax['hold']}/sl={_ax['sl']}/"
-                               f"tp={_ax['tp']}/trail={_ax['trail']}")
+                               f"tp={_ax['tp']}/trail={_ax['trail_cfg']}")
                         regx = hreg.register(
                             "EXITVAR", fam, row["feature_definition"],
                             contract_scope=rec.get("contract_scope", "chain"),
@@ -1118,7 +1286,9 @@ def main():
                                    "unresolved_code": row["unresolved_code"],
                                    "next_action": "exit-discovery",
                                    "exit_cfg": {k: _ax[k] for k in
-                                                ("hold", "sl", "tp", "trail")},
+                                                ("hold", "sl", "tp",
+                                                 "trail_cfg", "stop_type",
+                                                 "target_type", "trail_type")},
                                    "train_score": 0.0, "validation_score": 0.0,
                                    "OOS_score": 0.0, "robustness_score": 0.0,
                                    "priority": 0.0, "status": "QUEUED",
@@ -1316,6 +1486,21 @@ def main():
                     converged = True
                 break
         # ================= POST-SEARCH =================
+        # terminal-space bookkeeping (§31/§37), computed once from registry
+        _d1_terminal = all(
+            frontier.items.get(h, {}).get("status")
+            in ("EVALUATED", "REJECTED", "PROMOTED")
+            for h in depth1_hids)
+        _exit_left = any(
+            it.get("unresolved_code")
+            in ("ENTRY_PROMISING_EXIT_UNRESOLVED",
+                "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED")
+            and it["status"] == "QUEUED" for it in frontier.to_json())
+        space_exhausted = bool(frontier.size() == 0 and _d1_terminal
+                               and not _exit_left)
+        search_completed = bool(frontier.size() == 0 and stop_why not in (
+            "HARD_ROUND_CEILING", "HARD_CANDIDATE_CEILING",
+            "RUNTIME_EXHAUSTED"))
         cands_df = pd.DataFrame(all_rows)
         if len(cands_df):
             cands_df["perm_p_adj"] = bh(cands_df["perm_p"].fillna(1).values)
@@ -1349,10 +1534,12 @@ def main():
                 c = discovery_category(d)
                 cats.append(c)
                 lvls.append(str(edge_levels_l1_l8(d)["levels"]))
-                stages.append(oos_stage(d.get("OOS_expectancy"),
-                                        d.get("OOS_events"),
-                                        settings.min_oos_events,
-                                        d.get("mt_pass")))
+                _st = oos_stage(d.get("OOS_expectancy"), d.get("OOS_events"),
+                                settings.min_oos_events, d.get("mt_pass"),
+                                robust_pass=(float(d.get("robustness_score") or 0)
+                                             >= 4.0))
+                stages.append(oos_final_survivor(
+                    _st, d.get("paper_eligible") is True))
             cands_df["discovery_category"] = cats
             cands_df["edge_levels_l1_l8"] = lvls
             cands_df["OOS_stage"] = stages
@@ -1368,6 +1555,16 @@ def main():
             for _, r in cands_df[
                     cands_df["paper_eligible"] == True].iterrows():  # noqa: E712
                 hreg.mark(r["hypothesis_id"], "validated")
+            # MULTIPLE_TEST_REJECTED status (§33): OOS-positive but BH-failed
+            if "perm_p_adj" in cands_df:
+                for _, r in cands_df[
+                        (cands_df["OOS_trading_result"] == "OOS_TRADING_RULE_PASS")
+                        & (cands_df["perm_p_adj"] >= 0.10)].iterrows():
+                    try:
+                        hreg.hypotheses[r["hypothesis_id"]]["registry_status"] = \
+                            "MULTIPLE_TEST_REJECTED"
+                    except Exception:
+                        pass
         else:
             for _c in ("perm_p_adj", "OOS_trading_result", "paper_eligible",
                        "discovery_family"):
@@ -1479,19 +1676,39 @@ def main():
                   "total_cycles": n_round,
                   "total_discoveries": len(all_discoveries),
                   "clone_count": hreg.clone_count,
-                  "cycle_statuses": [l.get("cycle_status") for l in ctrl.round_logs]}
+                  "cycle_statuses": [l.get("cycle_status") for l in ctrl.round_logs],
+                  # §22 multiple-testing ledger (never weakened)
+                  "RAW_TEST_COUNT": hreg.global_test_count,
+                  "EFFECTIVE_TEST_COUNT": int(hreg.n - hreg.clone_count),
+                  "BH_PASS": int(((cands_df["perm_p_adj"] < 0.10)).sum()) if len(cands_df) and "perm_p_adj" in cands_df else 0,
+                  "HOLM_PASS": int(((cands_df["perm_p_holm"] < 0.10)).sum()) if len(cands_df) and "perm_p_holm" in cands_df else 0,
+                  "BONF_PASS": int(((cands_df["perm_p_bonf"] < 0.10)).sum()) if len(cands_df) and "perm_p_bonf" in cands_df else 0,
+                  "SURROGATE_PASS": int(((cands_df["perm_p"] < 0.10)).sum()) if len(cands_df) and "perm_p" in cands_df else 0,
+                  "space_exhausted": bool(space_exhausted)}
         # candidate boards (§43)
+        # candidate boards (§29/§43): entry/exit scored separately; no
+        # overall winner from entry expectancy alone
         boards = {}
         if len(cands_df):
             num = cands_df.copy()
-            boards["TOP_INFORMATION"] = num.nlargest(20, "FWD_expectancy")["candidate"].tolist()
-            boards["TOP_TRAIN"] = num.nlargest(20, "FWD_IS_expectancy")["candidate"].tolist()
-            boards["TOP_VALIDATION"] = boards["TOP_TRAIN"]
-            boards["TOP_OOS_INFORMATION"] = num.nlargest(20, "FWD_OOS_expectancy")["candidate"].tolist()
-            boards["TOP_TRADING_RULE"] = num.nlargest(20, "IS_expectancy")["candidate"].tolist()
+            boards["TOP_INFORMATIONAL"] = num.nlargest(20, "FWD_expectancy")["candidate"].tolist()
+            boards["TOP_PREDICTIVE"] = num.nlargest(20, "FWD_IS_expectancy")["candidate"].tolist()
+            boards["TOP_ENTRY"] = boards["TOP_PREDICTIVE"]
+            boards["TOP_EXIT"] = num.nlargest(20, "DISCOVERED_expectancy")["candidate"].tolist() \
+                if "DISCOVERED_expectancy" in num else []
+            boards["TOP_ENTRY_EXIT"] = num.nlargest(20, "IS_expectancy")["candidate"].tolist()
             boards["TOP_ROBUST"] = num.nlargest(20, "robustness_score")["candidate"].tolist()
-            boards["TOP_MULTIPLE_TESTING"] = num.nsmallest(20, "perm_p_adj")["candidate"].tolist()
+            boards["TOP_OOS"] = num.nlargest(20, "OOS_expectancy")["candidate"].tolist()
+            boards["TOP_MULTIPLE_TEST"] = num.nsmallest(20, "perm_p_adj")["candidate"].tolist()
+            boards["TOP_EXECUTABLE"] = []
             boards["PAPER_ELIGIBLE"] = num[num["paper_eligible"]]["candidate"].tolist()
+            # legacy aliases kept for existing consumers
+            boards["TOP_INFORMATION"] = boards["TOP_INFORMATIONAL"]
+            boards["TOP_TRAIN"] = boards["TOP_PREDICTIVE"]
+            boards["TOP_VALIDATION"] = boards["TOP_PREDICTIVE"]
+            boards["TOP_OOS_INFORMATION"] = num.nlargest(20, "FWD_OOS_expectancy")["candidate"].tolist()
+            boards["TOP_TRADING_RULE"] = boards["TOP_ENTRY_EXIT"]
+            boards["TOP_MULTIPLE_TESTING"] = boards["TOP_MULTIPLE_TEST"]
         meta_out = {"run_id": run_id, "dataset_path": a.path, "data_format": layout, "chain": chain,
                     "dataset_hash": dataset_hash,
                     "settings": settings.to_dict(),
@@ -1554,17 +1771,61 @@ def main():
         print("FINAL_REPORT_SECTIONS=RUN_SUMMARY,DATA,CHAIN,FEATURES,DISCOVERY,"
               "TRADING_RULE_DISCOVERY,RETURN_PATH,ROBUSTNESS,OOS,MULTIPLE_TESTING,"
               "EXECUTION,PAPER_GATE,SEARCH_CONVERGENCE")
+        # §26 EXIT SEARCH AUDIT (mandatory; run incomplete without it)
+        from .exits import EXIT_AUDIT as _EA
+        _mat = pd.DataFrame(_EA["matrix"]) if _EA["matrix"] else pd.DataFrame()
+        if len(_mat):
+            _mat.to_csv(os.path.join(outdir, "exit_audit.csv"), index=False)
+        print("===== EXIT SEARCH AUDIT =====")
+        print(f"EXIT_HYPOTHESES_GENERATED={_EA['generated']}")
+        print(f"EXIT_HYPOTHESES_EVALUATED={_EA['evaluated']}")
+        print(f"EXIT_COMBINATIONS_GENERATED={_EA['generated']}")
+        print(f"EXIT_COMBINATIONS_EVALUATED={_EA['evaluated']}")
+        print(f"EXIT_COMBINATIONS_REJECTED={_EA['rejected']}")
+        print(f"EXIT_COMBINATIONS_UNTESTABLE={_EA['untestable']}")
+        print(f"EXIT_COMBINATIONS_EXCLUDED_INVALID={_EA['excluded_invalid']}")
+        print(f"EXIT_FAMILIES_TESTED={sorted(_EA['families'])}")
+        print(f"EXIT_PARAMETER_VALUES_TESTED=stops:{len(_EA['stop_values']) or 'grid'} "
+              f"targets:{len(_EA['target_values']) or 'grid'} "
+              f"trails:{len(_EA['trail_values']) or 'grid'}")
+        print(f"HOLD_VALUES_TESTED={sorted(_EA['holds'])}")
+        if len(_mat):
+            _show = _mat[["stop", "target", "trail", "hold", "tested",
+                          "trades", "train_exp", "val_exp",
+                          "oos_exp"]].head(40)
+            print(_show.to_markdown(index=False))
+        _unres_exit = [it for it in frontier.to_json()
+                       if it.get("unresolved_code")
+                       in ("ENTRY_PROMISING_EXIT_UNRESOLVED",
+                           "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED")]
+        print(f"EXIT_UNRESOLVED_REMAINING={len(_unres_exit)}")
+        for _it in _unres_exit[:10]:
+            print(f"  {_it['hypothesis_id']} {_it['family']} "
+                  f"{_it.get('unresolved_code')}")
+        # §35 EXIT DISCOVERY SUMMARY (explicit answers)
+        _n_prom = int(((cands_df["FWD_IS_expectancy"] > 0)).sum()) \
+            if len(cands_df) and "FWD_IS_expectancy" in cands_df else 0
+        _n_full = int(((cands_df["exit_combos_evaluated"] > 0)).sum()) \
+            if len(cands_df) and "exit_combos_evaluated" in cands_df else 0
+        print("===== EXIT DISCOVERY SUMMARY =====")
+        print(f"stop_types_tested={sorted({m['stop'] for m in _EA['matrix']})}")
+        print(f"target_types_tested={sorted({m['target'] for m in _EA['matrix']})}")
+        print(f"trail_types_tested={sorted({m['trail'] for m in _EA['matrix']})}")
+        print(f"hold_values_tested={sorted(_EA['holds'])}")
+        print(f"complete_exit_combinations_tested={len(_EA['matrix'])}")
+        print(f"candidate_specific_exits_tested={_n_full}")
+        print(f"promising_entries={_n_prom} "
+              f"full_exit_search_pct="
+              f"{round(100.0 * _n_full / max(1, _n_prom), 1)}%")
+        print(f"entries_remaining_EXIT_UNRESOLVED={len(_unres_exit)}")
+        print(f"exit_combinations_unexplored_capped="
+              f"{sum(1 for m in _EA['matrix'] if m.get('val_exp') == 'NA')}")
         print(f"SEARCH_CONVERGENCE converged={converged} frontier={frontier.size()} "
               f"rounds={n_round} stop_why={stop_why or 'LOOP_END'}")
-        # search_completed: frontier empty and stop was NOT a hard-budget
-        # cutoff. A soft-target stop with nothing left to test is search
-        # completion (→ NO_EDGE), never budget exhaustion.
-        _completed = (frontier.size() == 0 and stop_why not in (
-            "HARD_ROUND_CEILING", "HARD_CANDIDATE_CEILING",
-            "RUNTIME_EXHAUSTED"))
         final_state = final_status(surv_n, converged, frontier.size(),
                                    budget_hit, data_ok, "", "",
-                                   search_completed=_completed)
+                                   search_completed=search_completed,
+                                   space_exhausted=space_exhausted)
         print(f"FINAL_STATUS={final_state}")
         # §32 final report strata (appended after FINAL_STATUS is known)
         try:

@@ -9,9 +9,19 @@ def fingerprint(cid, sl, tp, trail, exit_mode, hold_bars=5):
             f"|hold={hold_bars}|cost=ZERO|model=RESEARCH")
 
 def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="premium",
-             cid="CAND", direction="long", verify=True):
+             cid="CAND", direction="long", verify=True, trail_cfg=None,
+             stop_type="FIXED_PERCENT", target_type="FIXED_PERCENT",
+             trail_type="NONE", oos_flag=False):
     """Path-dependent exits on 1m OHLC *after* entry bar. Long: SL on low, TP on high.
-    Same entries + different TP must diverge when path reaches the level (TEST_A/B/C)."""
+    Same entries + different TP must diverge when path reaches the level (TEST_A/B/C).
+
+    trail_cfg (optional dict) selects the trailing structure; a plain `trail`
+    float means {"kind": "fixed", "value": trail}:
+      fixed:        activate at fav>=value, exit when giveback >= value*0.5
+      breakeven:    when fav>=trigger move stop to entry; optional giveback
+      delayed:      fixed trail activating only after `delay` bars
+      profit_gated: fixed trail activating only after fav>=profit_gate
+    stop_type/target_type/trail_type are recorded on the ledger (§25)."""
     base = feat.loc[mask.fillna(False)].copy()
     if len(base) == 0:
         cols = ["candidate_id", "entry_time", "exit_time", "entry_price", "exit_price",
@@ -20,7 +30,23 @@ def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="pre
                 "initial_sl", "initial_tp", "CONFIG_FINGERPRINT", "model"]
         return pd.DataFrame({c: [] for c in cols})
     base = base.sort_values(["symbol", "timestamp"])
-    fp = fingerprint(cid, sl, tp, trail, exit_mode, hold_bars)
+    # normalize trailing structure first (backward compatible with trail float)
+    if trail_cfg is None and trail is not None:
+        trail_cfg = {"kind": "fixed", "value": float(trail)}
+    if trail_cfg is not None:
+        _k = str(trail_cfg.get("kind", "fixed"))
+        _v = trail_cfg.get("value", trail)
+        _tr = trail if _v is None else _v
+    else:
+        _k, _tr = "none", None
+    _delay = int(trail_cfg.get("delay", 0)) if trail_cfg else 0
+    _trigger = float(trail_cfg.get("trigger", 0.0)) if trail_cfg and trail_cfg.get("trigger") is not None else 0.0
+    _gate = float(trail_cfg.get("profit_gate", 0.0)) if trail_cfg and trail_cfg.get("profit_gate") is not None else 0.0
+    _trail_tag = _k if trail_cfg else "none"
+    _fp_trail = f"{_trail_tag}:{_tr}"
+    fp = (fingerprint(cid, sl, tp, trail, exit_mode, hold_bars)
+          + f"|trail_kind={_trail_tag}|trail_cfg={trail_cfg}"
+          f"|stop_type={stop_type}|target_type={target_type}")
     # per-contract forward bars lookup
     feat_s = feat.sort_values(["symbol", "timestamp"])
     grp = {k: g.set_index("timestamp").sort_index()
@@ -61,7 +87,9 @@ def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="pre
         if last_close.notna().any():
             exit_px = float(last_close.dropna().iloc[-1])
         peak, trough = entry, entry
+        peak_bar, trough_bar = len(window), len(window)
         trail_hit = False
+        dyn_sl_px = sl_px  # breakeven moves this to entry
         for i, (_, b) in enumerate(window.iterrows(), start=1):
             try:
                 hi, lo = float(b["high"]), float(b["low"])
@@ -69,13 +97,15 @@ def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="pre
                 hi, lo = float("nan"), float("nan")
             if np.isfinite(hi) and hi > peak:
                 peak = hi
+                peak_bar = i
             if np.isfinite(lo) and lo < trough:
                 trough = lo
+                trough_bar = i
             if direction == "long":
-                hit_sl = np.isfinite(lo) and lo <= sl_px
+                hit_sl = np.isfinite(lo) and lo <= dyn_sl_px
                 hit_tp = np.isfinite(hi) and hi >= tp_px
             else:
-                hit_sl = np.isfinite(hi) and hi >= sl_px
+                hit_sl = np.isfinite(hi) and hi >= dyn_sl_px
                 hit_tp = np.isfinite(lo) and lo <= tp_px
             if hit_sl and hit_tp:
                 exit_px, reason, dur = sl_px, "SL", i  # conservative: SL first
@@ -86,18 +116,27 @@ def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="pre
             if hit_tp:
                 exit_px, reason, dur = tp_px, "TP", i
                 break
-            if trail is not None:
+            if trail is not None or trail_cfg is not None:
                 fav = (peak - entry) / entry * 100 if direction == "long" else (entry - trough) / entry * 100
-                if fav >= trail:
-                    try:
-                        bc = float(b["close"])
-                    except (TypeError, ValueError):
-                        bc = float("nan")
-                    cur = ((bc - entry) / entry * 100 if direction == "long"
-                           else (entry - bc) / entry * 100) if np.isfinite(bc) else float("nan")
-                    if np.isfinite(cur) and cur <= fav - trail * 0.5:
-                        exit_px, reason, dur = bc, "TRAIL", i
-                        break
+                if _k == "breakeven":
+                    if fav >= (_trigger if _trigger > 0 else 0.3):
+                        dyn_sl_px = entry  # stop moved to entry
+                elif _k in ("delayed", "profit_gated", "fixed"):
+                    _active = fav >= (_tr or 0.5)
+                    if _k == "delayed" and i < _delay:
+                        _active = False
+                    if _k == "profit_gated" and fav < (_gate if _gate > 0 else (_tr or 0.5)):
+                        _active = False
+                    if _active and fav >= (_tr or 0.5):
+                        try:
+                            bc = float(b["close"])
+                        except (TypeError, ValueError):
+                            bc = float("nan")
+                        cur = ((bc - entry) / entry * 100 if direction == "long"
+                               else (entry - bc) / entry * 100) if np.isfinite(bc) else float("nan")
+                        if np.isfinite(cur) and cur <= fav - (_tr or 0.5) * 0.5:
+                            exit_px, reason, dur = bc, "TRAIL", i
+                            break
         if not np.isfinite(exit_px) or not exit_px > 0:
             skipped["nan_exit"] += 1
             continue
@@ -108,18 +147,30 @@ def backtest(feat, mask, hold_bars=5, sl=0.5, tp=1.0, trail=None, exit_mode="pre
                      "event_id": len(rows), "cluster_id": -1,
                      "candidate_id": cid,
                      "contract": f"{sig.get('strike')}_{sig.get('option_type')}",
+                     "contract_id": sig.get("symbol", ""),
                      "expiry": sig.get("expiry", "UNKNOWN"),
                      "strike": sig.get("strike"), "option_type": sig.get("option_type"),
                      "direction": direction,
                      "entry_time": entry_t, "entry_timestamp": entry_t,
+                     "entry_bar": str(entry_t), "signal_time": str(entry_t),
+                     "fill_time": str(entry_t),
                      "exit_time": window.index[dur - 1], "exit_timestamp": window.index[dur - 1],
                      "entry_price": entry, "exit_price": exit_px, "exit_reason": reason,
-                     "ret": ret, "gross_pnl": ret, "cost": 0.0, "net_pnl": ret,
+                     "ret": ret, "gross_pnl": ret, "gross_return": ret,
+                     "cost": 0.0, "net_pnl": ret,
                      "mae": mae, "mfe": mfe, "duration_bars": dur,
-                     "holding_time": dur,
-                     "sl_config": sl, "tp_config": tp, "trail_config": trail,
+                     "holding_time": dur, "hold_limit": hold_bars,
+                     "time_to_MFE": peak_bar, "time_to_MAE": trough_bar,
+                     "stop_type": stop_type, "stop_parameter": sl,
+                     "target_type": target_type, "target_parameter": tp,
+                     "trail_type": trail_type if trail_type != "NONE" else _trail_tag,
+                     "trail_parameter": _tr,
+                     "sl_config": sl, "tp_config": tp, "trail_config": _tr,
                      "exit_model": exit_mode, "initial_sl": sl_px, "initial_tp": tp_px,
-                     "CONFIG_FINGERPRINT": fp, "model": "RESEARCH_PRICE_MODEL"})
+                     "CONFIG_FINGERPRINT": fp,
+                     "model": "RESEARCH_PRICE_MODEL",
+                     "research_model": "RESEARCH_PRICE_MODEL",
+                     "oos_flag": bool(oos_flag)})
     from .ledger import ledger_hash, exit_config_hash
     ledger = pd.DataFrame(rows)
     if verify and len(ledger):

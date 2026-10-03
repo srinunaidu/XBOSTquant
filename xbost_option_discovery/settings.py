@@ -64,6 +64,20 @@ class DiscoverySettings:
     stop_grid: tuple = (0.25, 0.5, 1.0, 1.5)
     target_grid: tuple = (0.5, 1.0, 2.0, 3.0)
     trail_grid: tuple = (0.5, 1.0)
+    # OPTION_EXIT_DISCOVERY grids (§3/§5): research values, never defaults
+    stop_pct_grid: tuple = (0.25, 0.5, 1.0, 1.5, 2.0)
+    atr_stop_mults: tuple = (0.5, 1.0, 1.5)
+    target_pct_grid: tuple = (0.5, 1.0, 2.0, 3.0)
+    atr_target_mults: tuple = (0.5, 1.0, 1.5)
+    trail_values: tuple = (0.5, 1.0)
+    breakeven_triggers: tuple = (0.3, 0.5)
+    trail_delays: tuple = (2, 3)
+    profit_gates: tuple = (0.5, 1.0)
+    max_exit_combos_per_entry: int = 40
+    # contract universe budget (§9)
+    max_contracts_per_hypothesis: int = 0  # 0 = all usable contracts
+    # memory budget (§24/§29)
+    memory_budget_mb: float = 2048.0
     # multiple testing / surrogates (§28/§36)
     n_perm: int = 200
     # checkpointing (§53)
@@ -87,11 +101,32 @@ class DiscoverySettings:
     def to_dict(self):
         d = asdict(self)
         for k in ("forward_horizons", "lag_windows", "hold_grid", "stop_grid",
-                  "target_grid", "trail_grid"):
+                  "target_grid", "trail_grid", "stop_pct_grid",
+                  "atr_stop_mults", "target_pct_grid", "atr_target_mults",
+                  "trail_values", "breakeven_triggers", "trail_delays",
+                  "profit_gates"):
             v = d.get(k)
             if isinstance(v, tuple):
                 d[k] = list(v)
         return d
+
+    # budget aliases (§16/§17): SOFT/HARD candidate limits, soft/hard rounds
+    @property
+    def SOFT_CANDIDATE_LIMIT(self):
+        return self.soft_candidate_budget
+
+    @property
+    def HARD_CANDIDATE_LIMIT(self):
+        return self.hard_candidate_limit if hasattr(
+            self, "hard_candidate_limit") else self.hard_candidate_ceiling
+
+    @property
+    def softMaxRounds(self):
+        return self.maxRounds
+
+    @property
+    def hardMaxRounds(self):
+        return self.hard_round_ceiling
 
     def configuration_hash(self):
         return hashlib.sha256(

@@ -4,6 +4,7 @@ candidate boards (§43). No gate weakening: thresholds are constants."""
 VALIDATED = "VALIDATED_EDGE_FOUND"
 NO_EDGE = "NO_EDGE_FOUND_WITHIN_SEARCH_BUDGET"
 BUDGET_OUT = "SEARCH_BUDGET_EXHAUSTED"
+SPACE_OUT = "SEARCH_SPACE_EXHAUSTED"
 NO_DATA = "INSUFFICIENT_DATA"
 ENG_ERR = "ENGINE_ERROR"
 BLOCKED = "BLOCKED"
@@ -55,8 +56,9 @@ def edge_ladder(row: dict) -> dict:
 
 def final_status(n_validated: int, converged: bool, frontier_size: int,
                  budget_hit: bool, data_ok: bool, engine_error: str = "",
-                 blocked_reason: str = "", search_completed: bool = False) -> str:
-    """Mutually exclusive final statuses (§2)."""
+                 blocked_reason: str = "", search_completed: bool = False,
+                 space_exhausted: bool = False) -> str:
+    """Mutually exclusive final statuses (§2/§31)."""
     if engine_error:
         return ENG_ERR
     if blocked_reason:
@@ -65,6 +67,8 @@ def final_status(n_validated: int, converged: bool, frontier_size: int,
         return NO_DATA
     if n_validated > 0:
         return VALIDATED
+    if space_exhausted and frontier_size == 0:
+        return SPACE_OUT
     if converged and frontier_size == 0:
         return NO_EDGE
     if search_completed and frontier_size == 0:
@@ -109,9 +113,10 @@ def paper_eligible(row: dict, has_bidask: bool) -> tuple:
 # ---- continuous-loop discovery taxonomy (§20/§21) ----
 # L1=INFORMATIONAL L2=PREDICTIVE L3=TRADING_RULE L4=ROBUST L5=OOS_TRADING
 # L6=MULTIPLE_TESTING_SURVIVAL L7=EXECUTABLE L8=PAPER_ELIGIBLE
-LADDER_L1_L8 = ("L1_INFORMATIONAL", "L2_PREDICTIVE", "L3_TRADING_RULE",
-                "L4_ROBUST", "L5_OOS_TRADING", "L6_MULTIPLE_TESTING_SURVIVAL",
-                "L7_EXECUTABLE", "L8_PAPER_ELIGIBLE")
+LADDER_L1_L8 = ("L1_INFORMATIONAL_EDGE", "L2_PREDICTIVE_EDGE",
+                "L3_TRADING_RULE_EDGE", "L4_ROBUST_EDGE",
+                "L5_OOS_TRADING_EDGE", "L6_MULTIPLE_TEST_SURVIVAL",
+                "L7_EXECUTABLE_EDGE", "L8_PAPER_ELIGIBLE")
 
 
 def discovery_category(row: dict) -> str:
@@ -157,25 +162,27 @@ def edge_levels_l1_l8(row: dict) -> dict:
     reached = order.index(cat) if cat in order else -1
     levels = {}
     for i, name in enumerate(LADDER_L1_L8):
-        if name in ("L6_MULTIPLE_TESTING_SURVIVAL",):
+        if name in ("L6_MULTIPLE_TEST_SURVIVAL",):
             on = cat in ("OOS_DISCOVERY", "VALIDATED_EDGE") and (
                 str(row.get("mt_pass")) == "True"
                 or row.get("mt_pass") is True)
-        elif name == "L7_EXECUTABLE":
+        elif name == "L7_EXECUTABLE_EDGE":
             on = str(row.get("execution_model")) == "EXECUTABLE_PRICE_MODEL"
         elif name == "L8_PAPER_ELIGIBLE":
             on = cat == "VALIDATED_EDGE"
         else:
-            rank = {"L1_INFORMATIONAL": 0, "L2_PREDICTIVE": 1,
-                    "L3_TRADING_RULE": 2, "L4_ROBUST": 3,
-                    "L5_OOS_TRADING": 4}[name]
+            rank = {"L1_INFORMATIONAL_EDGE": 0, "L2_PREDICTIVE_EDGE": 1,
+                    "L3_TRADING_RULE_EDGE": 2, "L4_ROBUST_EDGE": 3,
+                    "L5_OOS_TRADING_EDGE": 4}[name]
             on = reached >= rank
         levels[name] = bool(on)
     return {"levels": levels, "category": cat}
 
 
-def oos_stage(expectancy, n_events, min_oos_events, mt_pass) -> str:
-    """FIX 2: OOS_RAW_POSITIVE vs OOS_THRESHOLD_PASS vs OOS_FINAL_SURVIVOR.
+def oos_stage(expectancy, n_events, min_oos_events, mt_pass,
+              robust_pass=False) -> str:
+    """§24: OOS_TESTED → OOS_RAW_POSITIVE → OOS_THRESHOLD_PASS →
+    OOS_ROBUST_PASS → OOS_MULTIPLE_TEST_PASS → OOS_FINAL_SURVIVOR.
     Positive OOS is never reported as validated."""
     try:
         e = float(expectancy)
@@ -185,6 +192,14 @@ def oos_stage(expectancy, n_events, min_oos_events, mt_pass) -> str:
         return "OOS_FAIL"
     if int(n_events or 0) < int(min_oos_events):
         return "OOS_RAW_POSITIVE"
-    if not (str(mt_pass) == "True" or mt_pass is True):
+    if not robust_pass:
         return "OOS_THRESHOLD_PASS"
-    return "OOS_FINAL_SURVIVOR"
+    if not (str(mt_pass) == "True" or mt_pass is True):
+        return "OOS_ROBUST_PASS"
+    return "OOS_MULTIPLE_TEST_PASS"
+
+
+def oos_final_survivor(oos_stage_value, paper_checks_pass: bool) -> str:
+    if oos_stage_value == "OOS_MULTIPLE_TEST_PASS" and paper_checks_pass:
+        return "OOS_FINAL_SURVIVOR"
+    return oos_stage_value
