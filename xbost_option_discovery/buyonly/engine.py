@@ -150,14 +150,21 @@ def cost_points(cost_model, entry_px, cfg):
 
 
 def run_backtest(signals, underlying, quotes, cfg, restrict_to_regime=True,
-                 cost_model=None):
-    """Run the full buy-only backtest. Returns (ledger, audit_dict)."""
+                 cost_model=None, logger=None):
+    """Run the full buy-only backtest. Returns (ledger, audit_dict).
+
+    `logger` (a RunLogger) receives a structured record of every gate decision,
+    contract selection and trade outcome, so a run can be reviewed after the fact.
+    """
     ledger = _empty_ledger()
     audit = {"signals_in": int(len(signals)), "trades": 0,
              "blocked": {}, "skipped_no_contract": 0,
              "skipped_no_entry_bar": 0, "skipped_bad_price": 0,
              "cooldown_bars": 0}
     if signals is None or len(signals) == 0 or quotes is None or len(quotes) == 0:
+        if logger:
+            logger.gate("no signals or no chain: nothing to do",
+                        signals=0 if signals is None else len(signals))
         return ledger, audit
 
     cm = cost_model or OptionCostModel(
@@ -178,6 +185,12 @@ def run_backtest(signals, underlying, quotes, cfg, restrict_to_regime=True,
 
     eng = AdaptiveEngine(cfg, restrict_to_regime_hypothesis=restrict_to_regime)
     sig = signals.sort_values("timestamp").reset_index(drop=True)
+    if logger:
+        logger.regime("engine armed", restrict_to_regime=restrict_to_regime,
+                      max_consecutive_losses=cfg.max_consecutive_losses,
+                      cooldown_bars=cfg.shutdown_cooldown_bars,
+                      breakeven_pts=round(cfg.breakeven_trigger_points(), 3),
+                      min_stop_pts=cfg.min_stop_points, target_r=cfg.target_r)
 
     # one position at a time: no pyramiding, so the win rate stays interpretable
     busy_until = None
@@ -193,22 +206,39 @@ def run_backtest(signals, underlying, quotes, cfg, restrict_to_regime=True,
 
         if busy_until is not None and ts <= busy_until:
             block_counts["ALREADY_IN_POSITION"] = block_counts.get("ALREADY_IN_POSITION", 0) + 1
+            if logger:
+                logger.gate("blocked: already in a position",
+                            ts=str(ts), hypothesis=hypo, regime=regime,
+                            busy_until=str(busy_until))
             continue
 
         in_cooldown = cooldown_until_ts is not None and ts < cooldown_until_ts
         allowed, reason = eng.allow(regime, hypo, in_cooldown=in_cooldown)
         if not allowed:
             block_counts[reason] = block_counts.get(reason, 0) + 1
+            if logger:
+                logger.gate(f"blocked: {reason}", ts=str(ts), hypothesis=hypo,
+                            regime=regime,
+                            expected=REGIME_TO_HYPOTHESIS.get(regime),
+                            consecutive_losses=eng.consecutive_losses,
+                            in_cooldown=bool(in_cooldown))
             if reason == "LOSS_STREAK":
                 # the breaker fires once; force a flat window before it can fire
                 # again, measured in bars on the underlying timeline
                 cooldown_until_ts = _ts_after(u_ts, ts, cfg.shutdown_cooldown_bars)
                 eng.consecutive_losses = 0
+                if logger:
+                    logger.gate("shutdown: 2 consecutive losses -> cooldown",
+                                cooldown_until=str(cooldown_until_ts),
+                                bars=cfg.shutdown_cooldown_bars)
             continue
 
         crow = row_by_ts.get(ts)
         if crow is None:
             block_counts["NO_UNDERLYING_BAR"] = block_counts.get("NO_UNDERLYING_BAR", 0) + 1
+            if logger:
+                logger.gate("blocked: no underlying bar at signal time",
+                            ts=str(ts), hypothesis=hypo)
             continue
 
         sel, sel_reason = select_contract(book, crow, s["direction"], cfg,
@@ -216,7 +246,19 @@ def run_backtest(signals, underlying, quotes, cfg, restrict_to_regime=True,
         if sel is None:
             audit["skipped_no_contract"] += 1
             block_counts[sel_reason] = block_counts.get(sel_reason, 0) + 1
+            if logger:
+                logger.gate(f"blocked: {sel_reason}", ts=str(ts),
+                            hypothesis=hypo, direction=s["direction"],
+                            atm=_round(crow.get("atm")),
+                            atm_source=crow.get("atm_source"))
             continue
+        if logger:
+            logger.at(2, "SELECT", "contract selected", ts=str(ts),
+                      direction=s["direction"], symbol=sel["symbol"],
+                      strike=sel["strike"], moneyness=sel["moneyness"],
+                      itm_steps=sel["itm_steps"], atm=_round(crow.get("atm")),
+                      atm_source=crow.get("atm_source"),
+                      underlying_source=crow.get("underlying_source"))
 
         # entry on the NEXT bar of that contract (causal fill)
         rec, i = book.locate(sel["symbol"], ts)
@@ -248,15 +290,34 @@ def run_backtest(signals, underlying, quotes, cfg, restrict_to_regime=True,
         exit_px = res["exit_price"]
         if not np.isfinite(exit_px) or exit_px <= 0:
             audit["skipped_bad_price"] += 1
+            if logger:
+                logger.gate("blocked: unusable exit price", ts=str(ts),
+                            hypothesis=hypo, entry=_round(entry_px))
             continue
 
         cp = cost_points(cm, entry_px, cfg)
         if not np.isfinite(cp):
             audit["skipped_bad_price"] += 1
+            if logger:
+                logger.gate("blocked: cost model returned NaN", ts=str(ts),
+                            hypothesis=hypo, entry=_round(entry_px))
             continue
         gross = exit_px - entry_px
         net = gross - cp
         net_pct = (net / entry_px * 100.0) if entry_px > 0 else float("nan")
+        if logger:
+            logger.trade("trade closed", trade_id=trade_id + 1, hypothesis=hypo,
+                         regime=regime, side=s["direction"],
+                         contract=f"{sel['symbol']}@{sel['strike']:.0f}",
+                         moneyness=sel["moneyness"], entry=_round(entry_px),
+                         exit=_round(exit_px), reason=res["exit_reason"],
+                         gross=_round(gross), cost=_round(cp), net=_round(net),
+                         net_pct=_round(net_pct, 4), risk=_round(res["risk_points"]),
+                         mfe=_round(res["mfe_points"]), mae=_round(res["mae_points"]),
+                         bars=res["duration_bars"],
+                         be=res["be_moved"], lock=res["profit_locked"],
+                         target=_round(res["target_price"]),
+                         t2t=res["first_target_bar"])
 
         exit_idx = min(j + res["duration_bars"], len(rec["ts"]) - 1)
         exit_t = rec["ts"][exit_idx]
@@ -280,12 +341,28 @@ def run_backtest(signals, underlying, quotes, cfg, restrict_to_regime=True,
             "time_to_target_bars": res["first_target_bar"], "blocked_reason": "",
         })
         eng.on_exit(net)
+        if logger:
+            logger.gate("loss breaker fed", net=_round(net),
+                        consecutive_losses=eng.consecutive_losses,
+                        limit=cfg.max_consecutive_losses)
 
     ledger = pd.DataFrame(rows) if rows else _empty_ledger()
     audit["trades"] = len(ledger)
     audit["blocked"] = block_counts
     audit["engine"] = eng.stats()
+    if logger:
+        logger.rule("engine complete")
+        logger.gate("totals", signals_in=audit["signals_in"], trades=len(ledger),
+                    **{f"blocked_{k}": v for k, v in sorted(block_counts.items())})
     return ledger, audit
+
+
+def _round(v, nd=3):
+    try:
+        f = float(v)
+        return round(f, nd) if np.isfinite(f) else "NA"
+    except (TypeError, ValueError):
+        return "NA"
 
 
 def _ts_after(ts_index, ts, n):

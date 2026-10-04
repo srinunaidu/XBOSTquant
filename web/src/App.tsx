@@ -10,6 +10,7 @@ import Login from './pages/Login';
 import Users from './pages/Users';
 import Home from './pages/Home';
 import Discovery from './pages/Discovery';
+import BuyOnly from './pages/BuyOnly';
 
 function route() {
   return location.hash.replace(/^#\/?/, '');
@@ -54,6 +55,7 @@ export default function App() {
 
   if (!isTerminal) {
     if (r === 'discovery') return <Discovery />;
+    if (r === 'buyonly') return <BuyOnly />;
     return <Home />;
   }
 

@@ -46,7 +46,12 @@ if (!users.some(u => u.username === ADMIN_USER)) {
 }
 
 const app = express();
-app.use(express.json({ limit: '100kb' }));
+// The Buy Only tab POSTs the whole options CSV so the Python engine can run it
+// server-side, which is far larger than any other payload here. Raising the
+// global limit is acceptable because the route that accepts big bodies is
+// session-gated and separately caps the CSV size in buyonly_api.js.
+const JSON_LIMIT = process.env.JSON_BODY_LIMIT || '150mb';
+app.use(express.json({ limit: JSON_LIMIT }));
 app.use(session({
   name: 'xbost.sid',
   secret: SESSION_SECRET,
@@ -114,6 +119,9 @@ app.post('/api/client-error', (req, res) => {
   res.json({ ok: true });
 });
 
+// ---- Buy Only tab: runs the Python buy-only engine and streams its log ----
+require('./buyonly_api')(app);
+
 function requireAdmin(req, res, next) {
   if (!req.session.user) return res.status(401).json({ error: 'unauthorized' });
   if (req.session.user.role !== 'admin') return res.status(403).json({ error: 'admin only' });
@@ -178,7 +186,11 @@ app.use((req, res, next) => {
     return res.status(401).json({ error: 'unauthorized' });
   }
   if (req.method === 'GET' && SHELL_PATHS.has(req.path)) {
-    return res.sendFile(path.join(PUBLIC_DIR, 'index.html'));
+    // Use the {root} form. Passing a bare absolute path here made `send` fail
+    // with NotFound while express.static served the very same file, so a
+    // logged-out browser got a raw 404 error page instead of the app shell the
+    // client router needs in order to render the Login screen.
+    return res.sendFile('index.html', { root: PUBLIC_DIR });
   }
   return res.status(401).json({ error: 'unauthorized' });
 });

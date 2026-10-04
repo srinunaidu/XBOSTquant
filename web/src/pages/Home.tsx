@@ -124,6 +124,22 @@ export default function Home() {
             onClick={() => goTo('futures')}
           />
           <TileCard
+            icon="🎯"
+            title="Buy Only"
+            subtitle="Option Buy-Only Backtester"
+            description="Four hypotheses (volatility coil, OI velocity, liquidity flush, VWAP snap-back), adaptive Trending/Compressing/Choppy regime engine with a 2-loss shutdown, structure-stop → breakeven → 50% lock → 1-candle trail. ATM/ITM only."
+            stats={[
+              { label: 'Side', value: 'Long only' },
+              { label: 'Universe', value: 'ATM/ITM' },
+              { label: 'Exit', value: '4-stage' },
+            ]}
+            ready={optNames.length > 0}
+            status={optNames.length
+              ? `runs the Python engine server-side · ${optNames.length} contracts loaded`
+              : 'No options data yet — upload a CSV above'}
+            onClick={() => navigate('#/buyonly')}
+          />
+          <TileCard
             icon="⚡"
             title="Options Lab"
             subtitle="Nifty / BankNifty Index Options"
