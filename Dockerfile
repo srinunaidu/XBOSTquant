@@ -12,7 +12,7 @@ FROM node:22-slim
 WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
-COPY server.js ./
+COPY server.js buyonly_api.js buyonly_fake.js ./
 COPY public/ ./public/
 COPY --from=webbuild /app/web/dist ./web/dist
 # NOTE: mount your 1-min CSV at /app/public/HDFCBANK_minute.csv (or upload via UI)
