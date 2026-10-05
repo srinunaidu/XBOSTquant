@@ -72,18 +72,18 @@ class HypothesisRegistry:
                        "validated": set()}
 
     def signature(self, feature_sig, ts_rule, label, direction,
-                  contract_scope, entry_rule, exit_rule) -> str:
+                  contract_scope, entry_rule, exit_rule, track="") -> str:
         return "|".join(str(x) for x in (
             feature_sig, ts_rule, label, direction,
-            contract_scope, entry_rule, exit_rule))
+            contract_scope, entry_rule, exit_rule, track))
 
     def register(self, kind, family, feature_sig, ts_rule="signal-close",
                  label="fwd_ret_5m", direction="long", contract_scope="chain",
                  entry_rule="signal-close", exit_rule="hold5/sl.5/tp1",
                  parent_ids=(), depth=1, reason="depth-1-scan",
-                 cycle_id=0) -> dict:
+                 cycle_id=0, track="") -> dict:
         sig = self.signature(feature_sig, ts_rule, label, direction,
-                             contract_scope, entry_rule, exit_rule)
+                             contract_scope, entry_rule, exit_rule, track)
         if sig in self.by_signature:
             self.duplicate_count += 1
             hid = self.by_signature[sig]
@@ -96,6 +96,7 @@ class HypothesisRegistry:
         self.n += 1
         hid = f"H{self.n:06d}"
         rec = {"hypothesis_id": hid, "kind": kind, "family": family,
+               "track": track,
                "feature_signature": str(feature_sig),
                "timestamp_rule": ts_rule, "label": label,
                "direction": direction, "contract_scope": contract_scope,
@@ -406,6 +407,7 @@ def build_next_cycle_plan(frontier, fam_counts, explored_fams,
 
 
 def save_checkpoint(path, payload):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     tmp = path + ".tmp"
     with open(tmp, "w") as f:
         json.dump(payload, f, indent=1, default=str)

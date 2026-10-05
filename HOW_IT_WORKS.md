@@ -67,8 +67,10 @@ browser (React SPA, web/dist) ──HTTPS──▶ node server.js (auth gateway)
   (`timestamp|expiry|strike|option_type|symbol|open|high|low|close|volume[+oi|bid|ask|underlying]`);
   integer timestamps parsed as epoch with magnitude-inferred unit (s/ms/ns).
   `detect_chain` (contracts/strikes/types/expiries, snapshot completeness),
-  `select_focus` (most-liquid N strikes), `module_availability` (each
-  downstream module reports AVAILABLE/UNAVAILABLE, never assumed).
+  `research_universe` (every valid canonical contract — focus never deletes),
+  `compute_priority` (most-liquid N strikes order the frontier queue only),
+  `module_availability` (each downstream module reports AVAILABLE/UNAVAILABLE,
+  never assumed).
 - JS ingestion (`engine.js`): multi-format OHLCV parse + per-contract split,
   IST-pinned resampling to 1–15 m.
 
@@ -135,7 +137,45 @@ VALIDATION → ROBUSTNESS → FROZEN OOS → MULTIPLE TESTING → PAPER GATE`
   dashboard HTML, `tab_bundle.json`, `surrogate_distributions.json`,
   `exit_audit.csv`, checkpoints.
 
-## 5. Buy Only (server-side Python engine)
+## 5. Python discovery engine (`run.py`: unconstrained universe + tracks)
+
+Same frozen pipeline as §4, implemented in `xbost_option_discovery/run.py`
+with the full honesty battery (splits/embargo, lookahead + selector audits,
+exit propagation, ledger hashing, event-time surrogates, BH/Holm/Bonferroni,
+DSR/effectiveN, robustness 0–10, edge ladder, evidence-derived paper gate).
+
+- **Research universe = every valid canonical contract**
+  (`ingestion.research_universe`, instrument-level so same strike/type
+  across expiries never merges). `compute_priority` (most-liquid N strikes)
+  only orders what the dual frontiers try first; `LIQUIDITY_FILTER=FALSE`
+  is printed every run. No ATM/OTM/ITM, CE/PE, strike, or expiry filter.
+- **Track A (OHLCV-only):** single-contract price/volume families, enforced
+  in code at mask resolution (`tracks.track_allows_column` + selector/
+  scope rules); cross-contract/OI/bid-ask/underlying columns resolve to an
+  empty mask with a recorded `track_violation`.
+- **Track B (all available data):** everything in A plus cross-contract
+  relationships (type/cross-strike/breadth/lead-lag/divergence), OI-shock
+  events when OI prints exist, and scope/selector families. Absent fields
+  report `UNSUPPORTED_METHOD`/`INSUFFICIENT_VARIATION`, never fabricated.
+- **Contract selection is searchable:** static scope hypotheses
+  (side/expiry/strike/contract, priority-ordered, budget-capped) plus
+  dynamic trailing rank selectors (volume/momentum rank-1/top-3, audited
+  against history-only recomputation), plus scope-restricted combo
+  children ("signal here, trade there").
+- **Independent scheduling, shared statistics:** one frontier + method
+  memory per track, exit-job reserve per round, coverage-driven priority
+  for untouched contracts; ONE global registry/counter (track-namespaced
+  `A_H…`/`B_H…` IDs) so BH/DSR span both tracks.
+- **Reporting:** `DISCOVERY_UNIVERSE` (totals + searched), per-track
+  hypotheses/evaluated/coverage/exit-jobs/validates/rejects,
+  `SEARCH_BUDGET` (configured vs tested per dimension), checkpoints carry
+  per-track frontiers + coverage + global counts (resume never duplicates
+  or resets).
+- CLI: `--tracks A|B|AB`, `--focus-strikes` (priority depth only),
+  `--max-scope-contracts`, `--no-selectors`, `--surrogate-perms`,
+  `--max-exit-combos`, `--max-runtime-seconds`.
+
+## 6. Buy Only (server-side Python engine)
 
 `web/src/pages/BuyOnly.tsx` is a thin client over `POST /api/buyonly` (SSE).
 The real engine is `xbost_option_discovery/buyonly/` driven by
@@ -153,13 +193,13 @@ provably a no-op so timing is permuted instead, sensitivity grid) → VERDICT
 `by_hypothesis.csv`, `summary.json`, `report.md`, `logic_map.md`,
 `buyonly-bundle.json`, `run_log.txt`, `audit.jsonl`.
 
-## 6. Options Lab
+## 7. Options Lab
 
 Per-contract backtesting tile (same browser runner, `instrumentMode =
 'options'`): ATM auto-select, expiry-day exclusion, premium floor, buy-only
 mode, ATM±1 bake-off, CK/ATR/BE exits.
 
-## 7. Shared methodology (the rules everything obeys)
+## 8. Shared methodology (the rules everything obeys)
 
 - **No lookahead, ever:** features use bars ≤ t; labels/exits strictly after;
   session-grouped windows; labels never leak into features (audited).
@@ -176,7 +216,7 @@ mode, ATM±1 bake-off, CK/ATR/BE exits.
   (not failures), every rejection carries a named reason; verdicts never
   claim more than the evidence.
 
-## 8. Code map
+## 9. Code map
 
 - `public/engine.js` — JS quant library (parse, resample, 30+ indicators,
   masks, regime router, signals, backtester, metrics, grid builders,

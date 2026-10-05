@@ -58,6 +58,14 @@ class DiscoverySettings:
     capital: float = 500000.0
     entry_fill: str = "close"       # close | next_open
     eod_square_off: bool = False
+    # discovery universe + tracks (§2/§8-§10): the research universe is
+    # ALWAYS every valid canonical contract; focus_strikes only orders
+    # compute priority. Tracks select disjoint feature families.
+    tracks: tuple = ("A", "B")        # any of A / B / AB
+    oi_min_coverage: float = 0.5      # OI family needs this print coverage
+    max_scope_contracts: int = 16     # static per-contract seeds by priority
+    exit_reserve_share: float = 0.25  # batch share reserved for exit jobs
+    enable_selectors: bool = True     # dynamic rank-k contract selection
     # search controller (§4/§5/§44/§45): HARD SAFETY LIMITS, not stop targets
     maxRounds: int = 24
     maxTotalCandidates: int = 500

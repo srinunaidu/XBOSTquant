@@ -258,6 +258,40 @@ def load_dataset(path, schema_over=None):
     return norm, layout
 
 
+def research_universe(norm):
+    """Every valid canonical option contract in the frame.
+
+    Identity is instrument-level (symbol|expiry|strike|option_type) so the
+    same strike/type across expiries counts as distinct instruments — they
+    must never merge. A contract is valid when it has a non-empty identity
+    and at least one bar with a finite close. Nothing is removed for being
+    far OTM/ITM, low volume, low premium, non-front expiry, CE or PE.
+    Returns (universe_list, excluded_list).
+    """
+    if "instrument_id" in norm.columns:
+        ident = norm["instrument_id"].astype(str)
+    else:
+        ident = (norm["symbol"].astype(str) + "|" +
+                 norm["expiry"].astype(str) + "|" +
+                 norm["strike"].astype(str) + "|" +
+                 norm["option_type"].astype(str))
+    has_id = ident.notna() & (ident.str.len() > 0) & (ident != "nan")
+    finite_close = pd.to_numeric(norm["close"], errors="coerce").notna()
+    ok_ids = sorted(ident[has_id & finite_close].unique().tolist())
+    all_ids = sorted(ident[has_id].unique().tolist())
+    excluded = [s for s in all_ids if s not in set(ok_ids)]
+    return ok_ids, excluded
+
+
+def compute_priority(norm, meta, n_strikes=3, expiry=None):
+    """Compute-priority ranking over the research universe (most-liquid
+    strikes first). Ordering ONLY — every contract in `research_universe`
+    remains searchable; priority decides what the frontier tries first under
+    a finite budget. Returns (priority_contracts, priority_strikes)."""
+    _sub, strikes, chain = select_focus(norm, meta, n_strikes, expiry)
+    return chain, strikes
+
+
 def detect_chain(norm):
     """Build chain_metadata purely from observed data. No expected values."""
     ts = pd.to_datetime(norm["timestamp"])

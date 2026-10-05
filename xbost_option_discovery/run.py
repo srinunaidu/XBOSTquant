@@ -26,7 +26,8 @@ import pandas as pd
 import numpy as np
 
 from .ingestion import (load_dataset, detect_chain, select_focus,
-                        module_availability, data_health, build_registry)
+                        module_availability, data_health, build_registry,
+                        research_universe, compute_priority)
 from .chain_normalizer import normalize
 from .settings import DiscoverySettings
 from .timeframe import detect_frequency, resample_ohlcv
@@ -182,10 +183,12 @@ def _shift_mask(feat, mask, k):
 def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
                        direction, tf, splits, settings, min_events,
                        hyp, depth, exit_cfg, has_bidask, do_exit_search,
-                       do_entry_search, registry):
+                       do_entry_search, registry, track="B"):
     """Full L1-L8 evaluation of ONE entry hypothesis with first-class exit
     discovery. OOS evaluated once on the locked final rule, frozen."""
     from .metrics import label_metrics as _lm
+    from .tracks import candidate_id as _track_hid
+    _display_id = _track_hid(track, cid)
     mask = mask.fillna(False)
     item_recipe = hyp.get("recipe") if isinstance(hyp, dict) else None
     if mask.sum() < min_events:
@@ -491,7 +494,8 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
     if not oos_trading_pass:
         fail.append("OOS_TRADING_REJECTED")
     row = {
-        "candidate": cid, "hypothesis_id": hyp["hypothesis_id"],
+        "candidate": _display_id, "hypothesis_id": hyp["hypothesis_id"],
+        "track": track,
         "combination_depth": depth, "parent_ids": ";".join(hyp.get("parent_ids", [])),
         "discovery_family": fam, "family_bucket": _bucket(fam),
         "feature_definition": feature_def,
@@ -691,18 +695,46 @@ def evaluate_candidate(feat, mask, cid, fam, feature_def, label, rel,
 def _resolve_mask(feat, hid, hreg, atomic_masks, mask_cache, frontier):
     """Iterative mask resolution (no recursion): atomic → feature column;
     lead/lag → stored params; combo → AND of parent masks + confirm leg;
-    exit-variant → parent mask."""
+    exit-variant → parent mask; scope/selector → identity or rank rule.
+
+    Track enforcement: a Track A hypothesis may only resolve columns in the
+    Track A allowlist (single-contract OHLCV, selectors, identity scope).
+    Anything else resolves to an empty mask and records a track_violation
+    on the hypothesis record — Track A can never silently trade Track B
+    information."""
+    from .tracks import track_allows_column as _allows
     if hid in mask_cache:
         return mask_cache[hid]
+    _rec = hreg.hypotheses.get(hid, {}) if hreg is not None else {}
+    _is_a = _rec.get("track") == "A"
+
+    def _deny(keys):
+        _rec["track_violation"] = (
+            f"Track A blocked columns: {sorted(set(keys))}")
+        return pd.Series(False, index=feat.index)
+
     if hid in atomic_masks:
         try:
+            _sp = atomic_masks[hid] or {}
+            _cols = []
+            _rcp = _sp.get("recipe") or {}
+            if _rcp.get("col"):
+                _cols.append(_rcp["col"])
+            if _rcp.get("kind") == "selector" and _rcp.get("col"):
+                _cols.append(_rcp["col"])
+            if _is_a and any(not _allows("A", c) for c in _cols):
+                return _deny(_cols)
             return atomic_masks[hid]["mask_fn"](feat).fillna(False)
         except Exception:
             return pd.Series(False, index=feat.index)
-    rec = hreg.hypotheses.get(hid, {})
+    rec = _rec
     if "_ll_mask" in rec:
+        if _is_a:
+            return _deny(["leadlag-cross-contract"])
         return rec["_ll_mask"]
     if "_ll_params" in rec:
+        if _is_a:
+            return _deny(["leadlag-cross-contract"])
         try:
             p = rec["_ll_params"]
             src_idx = feat[feat["symbol"] == p["source"]].set_index(
@@ -725,23 +757,43 @@ def _resolve_mask(feat, hid, hreg, atomic_masks, mask_cache, frontier):
         m = m & pm.fillna(False)
     leg = frontier.items.get(hid, {}).get("confirm_feature") if hid in frontier.items else None
     if leg and leg in feat.columns:
+        if _is_a and not _allows("A", leg):
+            return _deny([leg])
         try:
             m = m & (feat[leg] == 1).fillna(False)
+        except Exception:
+            pass
+    # scope-restricted combo child ("signal here, trade there"): re-apply
+    # the scope rule from the stored recipe (resume/transfer paths where
+    # the precomputed mask is unavailable).
+    _srec = (frontier.items.get(hid, {}).get("scope_recipe")
+             if hid in frontier.items else None)
+    if isinstance(_srec, dict) and _srec:
+        try:
+            m = m & apply_recipe(feat, _srec).fillna(False)
         except Exception:
             pass
     return m
 
 
-def build_feature_frame(sub, meta, strikes, mods):
+def build_feature_frame(sub, meta, strikes, mods, oi_min_coverage=0.5):
     """Full feature pipeline on one scope (focus chain or full universe).
     Registry/counters snapshot-restored so a second build for the full
-    universe does not double-count the global research ledger."""
+    universe does not double-count the global research ledger.
+
+    Appends Track B OI events (when the field exists) and trailing
+    contract-selector ranks (both tracks, OHLCV-derived) before labels.
+    Returns (frame, build_info) with per-family availability for the
+    capability map.
+    """
     from .relationships import REL_COUNT as _RC, REGISTRY as _RG
     from .features import FEATURE_COUNT as _FC
     from .sequences import SEQ_COUNT as _SC, STATE_COUNT as _STC
+    from .tracks import add_oi_events, add_selector_columns
     _snap = {"x": list(_RG["x_cols"]), "t": list(_RG["type_cols"]),
              "b": list(_RG["breadth_cols"]), "rel": _RC["n"],
              "feat": _FC["n"], "seq": _SC["n"], "st": _STC["n"]}
+    build_info = {"oi_status": "SKIPPED", "selectors": "SKIPPED"}
     try:
         feat = add_raw(sub)
         feat = add_volume(feat)
@@ -762,8 +814,12 @@ def build_feature_frame(sub, meta, strikes, mods):
         feat = add_combo_events(feat, lead_cols)
         feat = add_sequences(feat)
         feat = add_states(feat, meta)
+        feat, oi_status = add_oi_events(feat, min_coverage=oi_min_coverage)
+        build_info["oi_status"] = oi_status
+        feat = add_selector_columns(feat)
+        build_info["selectors"] = "AVAILABLE"
         feat = add_labels(feat)
-        return feat
+        return feat, build_info
     finally:
         _RG["x_cols"] = _snap["x"]
         _RG["type_cols"] = _snap["t"]
@@ -946,12 +1002,23 @@ def contract_levels_and_transfer(row, recipe, own_id, symbol_store,
     return out
 
 
-def build_depth1_specs(feat, mods, strikes, lead_cols, min_events, quality):
+def build_depth1_specs(feat, mods, strikes, lead_cols, min_events, quality,
+                       track="B", scope=None, oi_ok=False):
     """Depth-1 hypothesis specs (iterative list, no recursion). Every spec
     carries a JSON-serializable mask `recipe` so the same research question
     can be re-applied on another universe (full-contract levels, cross-symbol
-    transfer) without sharing data."""
+    transfer) without sharing data.
+
+    Track gating: only specs whose track matches (or scope/selector specs
+    legal in both tracks) are emitted. Scope families (side/expiry/strike/
+    contract) and dynamic rank selectors make contract selection itself
+    searchable. Returns (specs, skipped) where skipped maps family/up-to
+    reason (UNSUPPORTED_METHOD / INSUFFICIENT_VARIATION).
+    """
+    from .tracks import spec_track, SCOPE_FAMILIES, SELECTOR_FAMILIES
     specs = []
+    skipped = {}
+    scope = scope or {}
 
     def ok(col, depth=1, primary=True):
         if col not in feat.columns:
@@ -960,6 +1027,19 @@ def build_depth1_specs(feat, mods, strikes, lead_cols, min_events, quality):
         if not allowed_use(tier, depth, primary):
             return False
         return True
+
+    def _emit(family, feature, rel, mask_fn, recipe, kind="ATOMIC",
+              extra=None):
+        sp_track = spec_track(family, [recipe.get("col")] if recipe.get("col") else [])
+        if family not in SCOPE_FAMILIES and family not in SELECTOR_FAMILIES:
+            if (track == "A") != (sp_track == "A"):
+                return
+        sp = {"family": family, "feature": feature, "rel": rel,
+              "mask_fn": mask_fn, "recipe": recipe,
+              "depth": 1, "kind": kind, "track": track}
+        if extra:
+            sp.update(extra)
+        specs.append(sp)
 
     fam_map = {"e_large_ret": ("RAW_OPTION_PRICE", "chain"),
                "e_expansion": ("RAW_OPTION_PRICE", "chain"),
@@ -973,69 +1053,123 @@ def build_depth1_specs(feat, mods, strikes, lead_cols, min_events, quality):
                "e_atm_move": ("CROSS_STRIKE_RELATIONSHIP", "chain")}
     for ec, (fam, rel) in fam_map.items():
         if ec in feat.columns and ok(ec):
-            specs.append({"family": fam, "feature": ec, "rel": rel,
-                          "mask_fn": lambda f, c=ec: (f[c] == 1),
-                          "recipe": {"kind": "atomic", "col": ec,
-                                     "op": "eq1"},
-                          "depth": 1, "kind": "ATOMIC"})
+            _emit(fam, ec, rel,
+                  lambda f, c=ec: (f[c] == 1),
+                  {"kind": "atomic", "col": ec, "op": "eq1"})
     for c in lead_cols:
         if c in feat.columns and ok(c) and \
                 mods.get("OPTION_TYPE_RELATIONSHIP", ("", ""))[0] == "AVAILABLE":
-            specs.append({"family": "OPTION_TYPE_RELATIONSHIP", "feature": c,
-                          "rel": "chain",
-                          "mask_fn": lambda f, c=c: (f[c] == 1),
-                          "recipe": {"kind": "atomic", "col": c,
-                                     "op": "eq1"},
-                          "depth": 1, "kind": "ATOMIC"})
+            _emit("OPTION_TYPE_RELATIONSHIP", c, "chain",
+                  lambda f, c=c: (f[c] == 1),
+                  {"kind": "atomic", "col": c, "op": "eq1"})
     if mods.get("STRIKE_RELATIONSHIP", ("", ""))[0] == "AVAILABLE":
         for col in REGISTRY["x_cols"]:
             if "_retdiff" in col and ok(col):
-                specs.append({"family": "STRIKE_RELATIONSHIP", "feature": col,
-                              "rel": "cross-strike",
-                              "mask_fn": lambda f, c=col: (f[c] > 0).fillna(False),
-                              "recipe": {"kind": "atomic", "col": col,
-                                         "op": "gt0"},
-                              "depth": 1, "kind": "ATOMIC"})
+                _emit("STRIKE_RELATIONSHIP", col, "cross-strike",
+                      lambda f, c=col: (f[c] > 0).fillna(False),
+                      {"kind": "atomic", "col": col, "op": "gt0"})
     if "breadth_diff" in feat.columns and ok("breadth_diff"):
-        specs.append({"family": "CHAIN_BREADTH", "feature": "breadth_diff>0",
-                      "rel": "chain",
-                      "mask_fn": lambda f: (f["breadth_diff"] > 0).fillna(False),
-                      "recipe": {"kind": "atomic", "col": "breadth_diff",
-                                 "op": "gt0"},
-                      "depth": 1, "kind": "ATOMIC"})
-        specs.append({"family": "CHAIN_BREADTH", "feature": "breadth_diff<0",
-                      "rel": "chain",
-                      "mask_fn": lambda f: (f["breadth_diff"] < 0).fillna(False),
-                      "recipe": {"kind": "atomic", "col": "breadth_diff",
-                                 "op": "lt0"},
-                      "depth": 1, "kind": "ATOMIC"})
+        _emit("CHAIN_BREADTH", "breadth_diff>0", "chain",
+              lambda f: (f["breadth_diff"] > 0).fillna(False),
+              {"kind": "atomic", "col": "breadth_diff", "op": "gt0"})
+        _emit("CHAIN_BREADTH", "breadth_diff<0", "chain",
+              lambda f: (f["breadth_diff"] < 0).fillna(False),
+              {"kind": "atomic", "col": "breadth_diff", "op": "lt0"})
     for L in (2, 3):
         col = f"seq{L}"
         if col in feat.columns:
             try:
                 vc = feat[col].value_counts()
                 for pat in vc[vc >= min_events].head(6).index:
-                    specs.append({"family": "SEQUENCE", "feature": f"{col}={pat}",
-                                  "rel": "chain",
-                                  "mask_fn": lambda f, c=col, p=pat: (f[c] == p),
-                                  "recipe": {"kind": "atomic", "col": col,
-                                             "op": "eq", "val": str(pat)},
-                                  "depth": 1, "kind": "ATOMIC"})
+                    _emit("SEQUENCE", f"{col}={pat}", "chain",
+                          lambda f, c=col, p=pat: (f[c] == p),
+                          {"kind": "atomic", "col": col, "op": "eq",
+                           "val": str(pat)})
             except Exception:
                 pass
     if "state_id" in feat.columns:
         try:
             vc = feat["state_id"].value_counts()
             for sid in vc[vc >= min_events].head(6).index:
-                specs.append({"family": "CHAIN_STATE", "feature": f"state={sid}",
-                              "rel": "chain",
-                              "mask_fn": lambda f, s=sid: (f["state_id"] == s),
-                              "recipe": {"kind": "atomic", "col": "state_id",
-                                         "op": "eq", "val": str(sid)},
-                              "depth": 1, "kind": "ATOMIC"})
+                _emit("CHAIN_STATE", f"state={sid}", "chain",
+                      lambda f, s=sid: (f["state_id"] == s),
+                      {"kind": "atomic", "col": "state_id", "op": "eq",
+                       "val": str(sid)})
         except Exception:
             pass
-    return specs
+    # ---- Track B OI events (field must actually exist) ----
+    if track == "B":
+        if "e_oi_shock" in feat.columns and ok("e_oi_shock"):
+            _emit("OI_SHOCK", "e_oi_shock", "chain",
+                  lambda f: (f["e_oi_shock"] == 1),
+                  {"kind": "atomic", "col": "e_oi_shock", "op": "eq1"})
+        else:
+            skipped["OI_SHOCK"] = ("UNSUPPORTED_METHOD (no usable oi field)"
+                                   if "e_oi_shock" not in feat.columns
+                                   else "quality-gated")
+    # ---- contract-scope families: WHICH contract is traded ----
+    sides = scope.get("sides") or []
+    if len(sides) >= 2:
+        for _side in sides:
+            _emit("SCOPE_SIDE", f"side={_side}", "scope",
+                  lambda f, s=_side: (f["option_type"].astype(str) == s),
+                  {"kind": "scope", "field": "option_type",
+                   "op": "eq", "val": _side})
+    elif sides:
+        skipped["SCOPE_SIDE"] = "INSUFFICIENT_VARIATION (single side)"
+    expiries = scope.get("expiries") or []
+    if len(expiries) >= 2:
+        for _exp in expiries:
+            _emit("SCOPE_EXPIRY", f"expiry={_exp}", "scope",
+                  lambda f, e=_exp: (f["expiry"].astype(str) == str(e)),
+                  {"kind": "scope", "field": "expiry", "op": "eq",
+                   "val": str(_exp)})
+    else:
+        skipped["SCOPE_EXPIRY"] = ("INSUFFICIENT_VARIATION (single expiry; "
+                                   "EXPIRY_VARIATION_UNAVAILABLE)")
+    _all_strikes = scope.get("all_strikes") or []
+    if len(_all_strikes) >= 2:
+        for _st in _all_strikes:
+            _emit("SCOPE_STRIKE", f"strike={_st}", "scope",
+                  lambda f, s=_st: (
+                      pd.to_numeric(f["strike"], errors="coerce") == float(s)
+                  ).fillna(False),
+                  {"kind": "scope", "field": "strike", "op": "eq",
+                   "val": str(_st)})
+    else:
+        skipped["SCOPE_STRIKE"] = "INSUFFICIENT_VARIATION (single strike)"
+    contracts = scope.get("all_contracts") or []
+    maxc = int(scope.get("max_contracts") or 0)
+    if contracts:
+        _rank = {c: i for i, c in enumerate(scope.get("priority") or [])}
+        _ordered = sorted(contracts,
+                          key=lambda c: (_rank.get(c, 10 ** 9), c))
+        _seed = _ordered if not maxc or len(_ordered) <= maxc else _ordered[:maxc]
+        for _ct in _seed:
+            _emit("SCOPE_CONTRACT", f"contract={_ct}", "scope",
+                  lambda f, c=_ct: (f["symbol"].astype(str) == c),
+                  {"kind": "scope", "field": "symbol", "op": "eq",
+                   "val": _ct})
+        if len(_seed) < len(_ordered):
+            skipped["SCOPE_CONTRACT"] = (
+                f"PRIORITY_CAPPED ({len(_seed)}/{len(_ordered)} seeded by "
+                f"liquidity priority; remainder available for expansion)")
+    # ---- dynamic rank selectors: historical-only contract ranking ----
+    if scope.get("selectors", True):
+        for _col, _fam, _lab in (("sel_vol_rank", "SEL_VOL_RANK",
+                                  "trailing-volume"),
+                                 ("sel_mom_rank", "SEL_MOM_RANK",
+                                  "trailing-momentum")):
+            if _col not in feat.columns:
+                skipped[_fam] = "INSUFFICIENT_DATA (selector column absent)"
+                continue
+            for _k, _klab in ((1, "rank-1"), (3, "top-3")):
+                _emit(_fam, f"{_lab}-{_klab}", "selector",
+                      lambda f, c=_col, k=_k: (
+                          f[c].notna() & (f[c] <= k)).fillna(False),
+                      {"kind": "selector", "col": _col, "op": "le",
+                       "val": _k})
+    return specs, skipped
 
 
 def apply_recipe(feat: pd.DataFrame, recipe: dict):
@@ -1069,7 +1203,46 @@ def apply_recipe(feat: pd.DataFrame, recipe: dict):
                 m = m & (feat[leg] == 1).fillna(False)
             except Exception:
                 pass
+        _sleg = recipe.get("scope_leg")
+        if isinstance(_sleg, dict) and _sleg:
+            try:
+                m = m & apply_recipe(feat, _sleg).fillna(False)
+            except Exception:
+                pass
         return m.fillna(False)
+    if k == "scope":
+        # Contract-scope restriction: identity equality only (symbol, strike,
+        # expiry, option_type). No market information enters the decision.
+        field, val = recipe.get("field"), recipe.get("val")
+        if field not in ("symbol", "strike", "expiry", "option_type"):
+            return pd.Series(False, index=feat.index)
+        try:
+            if field == "strike":
+                m = (pd.to_numeric(feat["strike"], errors="coerce")
+                     == float(val)).fillna(False)
+            else:
+                m = (feat[field].astype(str) == str(val)).fillna(False)
+            return m
+        except Exception:
+            return pd.Series(False, index=feat.index)
+    if k == "selector":
+        # Dynamic rank selector re-application: the rank columns are
+        # trailing-history computations stored on the frame, so re-applying
+        # the threshold reproduces the exact historical-only decision.
+        col, op, val = recipe.get("col"), recipe.get("op"), recipe.get("val")
+        if col not in ("sel_vol_rank", "sel_mom_rank") or \
+                col not in feat.columns:
+            return pd.Series(False, index=feat.index)
+        try:
+            if op == "le":
+                return (feat[col].notna()
+                        & (feat[col] <= int(val))).fillna(False)
+            if op == "eq":
+                return (feat[col].notna()
+                        & (feat[col] == int(val))).fillna(False)
+        except Exception:
+            return pd.Series(False, index=feat.index)
+        return pd.Series(False, index=feat.index)
     return pd.Series(False, index=feat.index)
 
 
@@ -1078,7 +1251,19 @@ def main():
     ap.add_argument("--path", required=True)
     ap.add_argument("--outdir", default=None)
     ap.add_argument("--require-contracts", default=None)
-    ap.add_argument("--focus-strikes", type=int, default=3)
+    ap.add_argument("--focus-strikes", type=int, default=3,
+                    help="compute-priority depth (most-liquid strikes tried "
+                         "first); never removes contracts from the universe")
+    ap.add_argument("--tracks", default="AB", choices=["A", "B", "AB"],
+                    help="discovery tracks: OHLCV-only (A), all-data (B)")
+    ap.add_argument("--max-scope-contracts", type=int, default=16,
+                    help="static per-contract seeds by liquidity priority")
+    ap.add_argument("--no-selectors", action="store_true",
+                    help="disable dynamic rank-k contract selection")
+    ap.add_argument("--surrogate-perms", type=int, default=None,
+                    help="event-time surrogate permutations (default 200)")
+    ap.add_argument("--max-exit-combos", type=int, default=None,
+                    help="cap exit combinations evaluated per entry")
     ap.add_argument("--timeframe", default="RAW")
     ap.add_argument("--ranking-objective", default="composite")
     ap.add_argument("--settings-out", default=None)
@@ -1099,7 +1284,10 @@ def main():
             data_path=a.path, timeframe=a.timeframe, focus_strikes=a.focus_strikes,
             ranking_objective=a.ranking_objective,
             train_frac=fractions[0], validation_frac=fractions[1], oos_frac=fractions[2],
-            min_events=a.min_events)
+            min_events=a.min_events,
+            tracks=tuple(a.tracks),
+            max_scope_contracts=int(a.max_scope_contracts),
+            enable_selectors=not a.no_selectors)
         if a.max_rounds:
             settings.maxRounds = int(a.max_rounds)
         if a.max_candidates:
@@ -1107,6 +1295,11 @@ def main():
             settings.soft_candidate_budget = int(a.max_candidates)
         if a.max_runtime_seconds:
             settings.maxRuntimeSeconds = float(a.max_runtime_seconds)
+        if a.surrogate_perms:
+            settings.surrogate_perms = int(a.surrogate_perms)
+            settings.n_perm = int(a.surrogate_perms)
+        if a.max_exit_combos:
+            settings.max_exit_combos_per_entry = int(a.max_exit_combos)
         if a.resume_from:
             settings.resume_from = a.resume_from
         if a.checkpoint_dir:
@@ -1244,20 +1437,29 @@ def main():
             print(f"OPTIONS_RESEARCH_READY={'YES' if ready else 'NO'}")
 
             focus_exp = meta["expiries"][0] if meta["n_expiries"] == 1 else None
-            chain_sub, strikes, chain = select_focus(norm, meta, a.focus_strikes, focus_exp)
-            print(f"FOCUS chain ({len(chain)} contracts): {chain}")
-            # §13/§14 explicit focus audit: prioritization only, full universe
-            # stays available for validation/robustness/transfer
-            _all_sym_instruments = sorted(norm["symbol"].astype(str).unique().tolist())
-            _non_focus = [c for c in _all_sym_instruments if c not in chain]
-            _liq_filter = bool(meta.get("n_strikes") and len(chain) < len(_all_sym_instruments))
+            # ---- research universe vs compute priority (§2) ----
+            # research_universe = EVERY valid canonical contract. focus
+            # (most-liquid strikes) only orders what the frontier tries
+            # first under a finite budget; it never deletes contracts.
+            universe, excluded_invalid = research_universe(norm)
+            priority_chain, strikes = compute_priority(
+                norm, meta, a.focus_strikes, focus_exp)
+            chain = priority_chain
+            print(f"RESEARCH_UNIVERSE contracts={len(universe)} "
+                  f"excluded_invalid={len(excluded_invalid)} "
+                  f"{universe[:12]}{'...' if len(universe) > 12 else ''}")
+            if excluded_invalid:
+                print(f"  excluded (no usable prices): "
+                      f"{excluded_invalid[:12]}")
+            print(f"COMPUTE_PRIORITY ({len(chain)} contracts, "
+                  f"most-liquid-strikes ordering): {chain}")
             print(f"TOTAL_STRIKES_AVAILABLE={meta.get('n_strikes')} "
-                  f"FOCUS_STRIKES={strikes} NON_FOCUS_STRIKES={len(_non_focus)} "
-                  f"FOCUS_REASON=most-liquid-strikes-prioritization")
-            print(f"LIQUIDITY_FILTER={str(_liq_filter).upper()} "
-                  f"EXCLUDED_CONTRACTS={_non_focus[:12]}"
-                  f"{'...' if len(_non_focus) > 12 else ''} "
-                  f"EXCLUSION_REASON={'focus-prioritization; retained for robustness/transfer' if _non_focus else 'none'}")
+                  f"PRIORITY_STRIKES={strikes} "
+                  f"NON_PRIORITY_CONTRACTS="
+                  f"{len([c for c in universe if c not in chain])} "
+                  f"FOCUS_REASON=most-liquid-strikes-prioritization-only")
+            print("LIQUIDITY_FILTER=FALSE "
+                  "(priority ordering; no contract removed from universe)")
             health = data_health(norm, meta, chain)
             print(f"DATA_HEALTH status={health['status']} "
                   f"missing_intervals={health['missing_interval_count']} "
@@ -1270,19 +1472,27 @@ def main():
                       f"(other symbols continue)")
                 continue
 
-            # ---- 4. features (instrument-pure: grouped by instrument_id) ----
-            feat = build_feature_frame(chain_sub, meta, strikes, mods)
+            # ---- 4. features on the FULL research universe ----
+            # Discovery searches every valid contract; the priority chain
+            # only orders frontier scheduling (see seeding below).
+            feat, build_info = build_feature_frame(
+                norm, meta, meta.get("strikes", strikes), mods,
+                oi_min_coverage=float(settings.oi_min_coverage))
+            print(f"FEATURES oi_family={build_info['oi_status']} "
+                  f"selectors={build_info['selectors']}")
             lead_cols = [c for c in feat.columns if "_leads_" in c]
             feat["day"] = pd.to_datetime(feat["timestamp"]).dt.date
             days = sorted(feat["day"].unique().tolist())
-            # full-universe frame (§13): every usable contract stays available
-            # for levels/robustness/transfer even when discovery prioritizes
-            # the focus chain
-            _full_sub = norm.copy()
-            feat_full = build_feature_frame(_full_sub, meta,
-                                            meta.get("strikes", strikes), mods)
-            feat_full["day"] = pd.to_datetime(feat_full["timestamp"]).dt.date
-            symbol_store[sym_id] = {"feat_full": feat_full}
+            symbol_store[sym_id] = {"feat_full": feat}
+            # ---- track capability map (built from this dataset) ----
+            from .tracks import track_capability, track_allows_column
+            _cap = track_capability(norm, feat)
+            print("TRACK_CAPABILITY " + " ".join(
+                f"{k}={v}" for k, v in _cap.items()))
+            _tracks = tuple(t for t in getattr(settings, "tracks", ("A", "B"))
+                            if t in ("A", "B")) or ("A", "B")
+            print(f"TRACKS_ENABLED={'+'.join(_tracks)} "
+                  f"(independent frontiers/registries, shared global MT)")
 
             splits = chronological_splits(days, fractions)
             if splits is None or mods["OOS_VALIDATION"][0] != "AVAILABLE":
@@ -1312,6 +1522,28 @@ def main():
             if la["status"] == "FAIL_AUDIT_MISMATCH":
                 blocked_reason = "AUDIT_MISMATCH"
                 raise SystemExit("BLOCKED_AUDIT_MISMATCH")
+            # ---- dynamic-selector audit: rank columns must reproduce from
+            # raw OHLCV history only. Any future leakage fails closed here.
+            from .tracks import audit_selectors
+            _sa = audit_selectors(feat)
+            print(f"SELECTOR_AUDIT status={_sa['status']} "
+                  f"checked={_sa['checked']} mismatches={_sa['mismatches']} "
+                  f"note={_sa['note']}")
+            if _sa["status"] == "LOOKAHEAD_DETECTED":
+                blocked_reason = "SELECTOR_LOOKAHEAD"
+                raise SystemExit("BLOCKED_TRUE_LOOKAHEAD")
+            # ---- contract-selection scope for depth-1 (full universe) ----
+            _scope = {
+                "sides": sorted(feat["option_type"].astype(str).unique().tolist()),
+                "expiries": sorted(feat["expiry"].astype(str).unique().tolist()),
+                "all_strikes": sorted(
+                    pd.to_numeric(feat["strike"], errors="coerce").dropna()
+                    .unique().tolist()),
+                "all_contracts": universe,
+                "priority": chain,
+                "max_contracts": int(settings.max_scope_contracts),
+                "selectors": bool(settings.enable_selectors),
+            }
 
             # ---- feature quality tiers (§8) ----
             probe_cols = [c for c in
@@ -1386,15 +1618,19 @@ def main():
             # ================= ITERATIVE FRONTIER SEARCH (§4) =================
             # NOTE: hreg/ctrl/all_rows/all_discoveries/n_round/EXIT_AUDIT are
             # GLOBAL (shared across symbols, §26/§30/§31);
-            # frontier/conv/masks reset per symbol.
-            frontier = FrontierQueue(max_family_share=settings.max_family_share)
+            # frontiers/conv/masks reset per symbol. One frontier per
+            # enabled track (independent scheduling/quotas/memory); the
+            # hypothesis registry and test counter stay GLOBAL so multiple
+            # testing spans both tracks (§11).
+            from .tracks import candidate_id as _track_hid
+            FQS = {tr: FrontierQueue(max_family_share=settings.max_family_share)
+                   for tr in _tracks}
+            frontier = FQS[_tracks[0]]
             conv = ConvergenceChecker(n=settings.convergence_N,
                                       epsilon=settings.convergence_epsilon)
             # BASELINE config exists ONLY as benchmark (§27/§28); evaluation
             # uses discovered or prescribed exits, never a fixed default
             default_exit = None
-            depth1 = build_depth1_specs(feat, mods, strikes, lead_cols,
-                                        a.min_events, quality)
             # capability gating (§3/§7): skip methods the data cannot
             # support (UNSUPPORTED_METHOD) — Level C volume / Level D
             # cross-contract only when capabilities allow
@@ -1404,55 +1640,106 @@ def main():
             if not _x_ok:
                 _skip_fams.update(["OPTION_TYPE_RELATIONSHIP",
                                    "STRIKE_RELATIONSHIP", "LEAD_LAG"])
-            _n0 = len(depth1)
-            depth1 = [sp for sp in depth1 if sp["family"] not in _skip_fams]
             method_skipped = {}
             for _sf in _skip_fams:
                 method_skipped[_sf] = "UNSUPPORTED_METHOD"
-            print(f"DEPTH1_SPECS={len(depth1)} (gated_out={_n0 - len(depth1)} "
-                  f"families={sorted(_skip_fams) if _skip_fams else 'none'})")
-            # seed frontier with depth-1 specs (iterative queue)
-            for i, sp in enumerate(depth1):
-                reg = hreg.register(f"ATOMIC-{i}", sp["family"], sp["feature"],
-                                    contract_scope=sp["rel"], exit_rule="hold5/sl.5/tp1",
-                                    depth=1, reason="depth-1-seed")
-                frontier.add(reg["hypothesis_id"], sp["family"], sp["feature"], 1,
-                             "depth-1-seed")
-                frontier.items[reg["hypothesis_id"]]["recipe"] = sp.get("recipe")
-            # lead/lag top pairs as depth-1 hypotheses
-            if len(ll) and mods["LEAD_LAG"][0] == "AVAILABLE":
+            depth1_by_track, skipped_by_track = {}, {}
+            for _tr in _tracks:
+                _d1, _sk = build_depth1_specs(
+                    feat, mods, strikes, lead_cols, a.min_events, quality,
+                    track=_tr, scope=_scope,
+                    oi_ok=("e_oi_shock" in feat.columns))
+                _n0 = len(_d1)
+                _d1 = [sp for sp in _d1 if sp["family"] not in _skip_fams]
+                _sk.update({f: method_skipped[f] for f in _skip_fams
+                            if f not in _sk})
+                depth1_by_track[_tr] = _d1
+                skipped_by_track[_tr] = _sk
+                print(f"DEPTH1_SPECS track={_tr} n={len(_d1)} "
+                      f"(gated_out={_n0 - len(_d1)})")
+            for _tr, _sk in skipped_by_track.items():
+                for _fam, _why in sorted(_sk.items()):
+                    print(f"  METHOD_SKIPPED track={_tr} family={_fam} "
+                          f"reason={_why}")
+            # priority ordering: focus-chain specs seed first within each
+            # track; the full universe still enters via scope/selector seeds
+            # and the budgeted frontier below (§46).
+            _prio_set = set(chain)
+            def _seed_key(sp):
+                _rec = sp.get("recipe") or {}
+                _val = str(_rec.get("val", ""))
+                return (0 if _rec.get("kind") != "scope" or
+                        _val in _prio_set or _rec.get("field") != "symbol"
+                        else 1)
+            atomic_masks = {}
+            seed_hids_by_track = {}
+            for _tr in _tracks:
+                _FQ = FQS[_tr]
+                _ordered = sorted(depth1_by_track[_tr], key=_seed_key)
+                depth1_by_track[_tr] = _ordered
+                for i, sp in enumerate(_ordered):
+                    _scope_str = sp["rel"]
+                    _rcp = sp.get("recipe") or {}
+                    if _rcp.get("kind") == "scope":
+                        _scope_str = (f"{_rcp.get('field')}={_rcp.get('val')}")
+                    elif _rcp.get("kind") == "selector":
+                        _scope_str = (f"selector:{_rcp.get('col')}"
+                                      f"<={_rcp.get('val')}")
+                    reg = hreg.register(
+                        f"ATOMIC-{i}", sp["family"], sp["feature"],
+                        contract_scope=_scope_str, exit_rule="hold5/sl.5/tp1",
+                        depth=1, reason="depth-1-seed", track=_tr)
+                    _hid = reg["hypothesis_id"]
+                    _FQ.add(_hid, sp["family"], sp["feature"], 1,
+                            "depth-1-seed")
+                    _FQ.items[_hid]["recipe"] = sp.get("recipe")
+                    _FQ.items[_hid]["track"] = _tr
+                    atomic_masks[_hid] = sp
+                seed_hids_by_track[_tr] = [
+                    it["hypothesis_id"] for it in _FQ.to_json()]
+            # lead/lag top pairs as depth-1 hypotheses (cross-contract, so
+            # Track B wherever enabled; otherwise the enabled track)
+            _ll_track = "B" if "B" in FQS else _tracks[0]
+            if len(ll) and mods["LEAD_LAG"][0] == "AVAILABLE" and \
+                    _ll_track in FQS:
                 for _, r in ll.reindex(
                         ll["mean_forward_return"].abs().sort_values(
                             ascending=False).index).head(6).iterrows():
                     reg = hreg.register("LEADLAG", "LEAD_LAG",
                                         f"{r['source']}(>1%)@{int(r['lag'])}bar",
                                         contract_scope=f"{r['source_contract']}->{r['target_contract']}",
-                                        depth=1, reason="leadlag-screen")
+                                        depth=1, reason="leadlag-screen",
+                                        track=_ll_track)
                     tgt_rows = feat[(feat["symbol"] == r["target_contract"]) &
                                     feat["timestamp"].isin(
                                         pd.DatetimeIndex(sorted(by_sym[r["source_contract"]].index)) +
                                                          pd.Timedelta(minutes=int(r["lag"])))]
                     smask = pd.Series(False, index=feat.index)
                     smask.loc[tgt_rows.index] = True
-                    frontier.add(reg["hypothesis_id"], "LEAD_LAG",
-                                 f"{r['source_contract']}->{r['target_contract']}", 1,
-                                 "leadlag-screen")
+                    FQS[_ll_track].add(reg["hypothesis_id"], "LEAD_LAG",
+                                       f"{r['source_contract']}->{r['target_contract']}", 1,
+                                       "leadlag-screen")
+                    FQS[_ll_track].items[reg["hypothesis_id"]]["track"] = _ll_track
                     reg["record"]["_ll_mask"] = smask
                     reg["record"]["_ll_params"] = {
                         "source": r["source_contract"],
                         "target": r["target_contract"],
                         "lag": int(r["lag"])}
 
-            spec_by_hid = {}
-            for sp in depth1:
-                pass  # masks rebuilt from feature col at eval time
-            # map atomic hid -> mask builder
-            atomic_masks = {}
-            # rebuild mapping hid->spec in seed order
-            seed_hids = [it["hypothesis_id"] for it in frontier.to_json()]
-            depth1_hids = seed_hids[:len(depth1)]
-            for hid, sp in zip(seed_hids[:len(depth1)], depth1):
-                atomic_masks[hid] = sp
+            # atomic_masks already maps seed hid -> spec from seeding above;
+            # lead/lag seeds resolve via the registry _ll_mask path.
+            # depth-1 ids per track (terminal-space accounting below).
+            depth1_hids_by_track = {tr: list(seed_hids_by_track[tr])
+                                    for tr in _tracks}
+            # per-track family counters: quotas/diversity stay independent
+            # per track; the global test counter stays shared (§11).
+            fam_counts = {tr: {} for tr in _tracks}
+            # search coverage: contracts/strikes/expiries/sides with at
+            # least one evaluated mask, per track + overall.
+            coverage = {tr: {"contracts": set(), "strikes": set(),
+                             "expiries": set(), "sides": set(),
+                             "evaluated": 0, "exit_jobs": 0}
+                        for tr in _tracks}
 
             no_discovery_streak = 0
             mask_cache = {}
@@ -1461,7 +1748,6 @@ def main():
             best_val, best_oos = float("-inf"), float("-inf")
             prev_best_val, prev_best_oos = float("-inf"), float("-inf")
             seen_families = set()
-            fam_counts = {}
             fam_rejected = 0
             budget_hit = False
             stop_why = ""
@@ -1488,7 +1774,24 @@ def main():
                 for r in cp.get("candidates", []):
                     if r.get("symbol_id", sym_id) == sym_id and r not in all_rows:
                         all_rows.append(r)
-                frontier.load(cp.get("frontier", []))
+                # per-track frontiers (new); legacy single "frontier" key
+                # resumes into Track B (full feature set, old behavior).
+                _resumed_tracks = 0
+                for _tr in _tracks:
+                    _items = cp.get(f"frontier_{_tr}",
+                                    cp.get("frontier", []) if _tr == "B"
+                                    else [])
+                    FQS[_tr].load(_items)
+                    _resumed_tracks += len(_items)
+                for _tr, _cov in (cp.get("coverage") or {}).items():
+                    if _tr in coverage:
+                        for _k in ("contracts", "strikes", "expiries",
+                                   "sides"):
+                            coverage[_tr][_k] = set(_cov.get(_k, []))
+                        coverage[_tr]["evaluated"] = int(
+                            _cov.get("evaluated", 0))
+                        coverage[_tr]["exit_jobs"] = int(
+                            _cov.get("exit_jobs", 0))
                 hreg.global_test_count = max(
                     hreg.global_test_count, int(cp.get("global_test_count", 0)))
                 hreg.n = max(hreg.n, int(cp.get("hypothesis_n", hreg.n)))
@@ -1496,6 +1799,8 @@ def main():
                 _reg = cp.get("registry", {})
                 for _hid, _rec in (_reg.get("hypotheses") or {}).items():
                     _rec.pop("_ll_mask", None)
+                    if "track" not in _rec:
+                        _rec["track"] = "B"
                     hreg.hypotheses[_hid] = _rec
                     hreg.by_signature[_rec.get("signature", _hid)] = _hid
                     if _rec.get("canonical_hash"):
@@ -1513,21 +1818,71 @@ def main():
                     if _d.get("symbol_id", sym_id) == sym_id and \
                             _d not in all_discoveries:
                         all_discoveries.append(_d)
-                for _it in sorted(frontier.to_json(),
-                                  key=lambda x: x.get("combination_depth", 1)):
-                    if _it["status"] == "QUEUED":
-                        try:
-                            mask_cache[_it["hypothesis_id"]] = _resolve_mask(
-                                feat, _it["hypothesis_id"], hreg, atomic_masks,
-                                mask_cache, frontier)
-                        except Exception:
-                            pass
+                for _FQ in FQS.values():
+                    for _it in sorted(
+                            _FQ.to_json(),
+                            key=lambda x: x.get("combination_depth", 1)):
+                        if _it["status"] == "QUEUED":
+                            try:
+                                mask_cache[_it["hypothesis_id"]] = _resolve_mask(
+                                    feat, _it["hypothesis_id"], hreg,
+                                    atomic_masks, mask_cache, _FQ)
+                            except Exception:
+                                pass
                 print(f"RESUMED_FROM_CHECKPOINT round={n_round} "
-                      f"candidates={len(all_rows)} tests={hreg.global_test_count}")
+                      f"candidates={len(all_rows)} tests={hreg.global_test_count} "
+                      f"frontier_items={_resumed_tracks}")
+
+            def _pop_track_batches(k):
+                """Split the round batch across enabled tracks (half each
+                when both have work, else all to the live track). Within
+                each track, unresolved exit jobs pop first up to the exit
+                reserve share, so promising entries are never starved by
+                new-entry discovery (§25). Returns [(item, FQ)]."""
+                _alive = [tr for tr in _tracks if FQS[tr].size() > 0]
+                if not _alive:
+                    return []
+                _share = {}
+                if len(_alive) == 1:
+                    _share[_alive[0]] = k
+                else:
+                    _half = max(1, k // len(_alive))
+                    for tr in _alive:
+                        _share[tr] = _half
+                _reserve = max(0, int(round(
+                    float(settings.exit_reserve_share) * k)))
+                out = []
+                for tr in _alive:
+                    _FQ = FQS[tr]
+                    _take = _share[tr]
+                    _picked = []
+                    if _reserve > 0:
+                        _exit_open = [
+                            it for it in _FQ.exit_unresolved_items()
+                            if it["status"] == "QUEUED"] + [
+                            it for it in _FQ.items.values()
+                            if it["status"] == "QUEUED"
+                            and it.get("unresolved_code")]
+                        _seen_exit = set()
+                        for it in _exit_open:
+                            if it["hypothesis_id"] in _seen_exit:
+                                continue
+                            _seen_exit.add(it["hypothesis_id"])
+                            if len(_picked) >= min(_reserve, _take):
+                                break
+                            _picked.append(it)
+                    _rest = [it for it in _FQ.pop_batch(
+                        max(0, _take - len(_picked)),
+                        fam_counts.get(tr)) if it not in _picked]
+                    for it in _picked + _rest:
+                        it["_fq_track"] = tr
+                        out.append((it, _FQ))
+                    coverage[tr]["exit_jobs"] += len(_picked)
+                return out
 
             while True:
                 n_cands = len(all_rows)
-                fsize = frontier.size()
+                fsize = sum(_FQ.size() for _FQ in FQS.values())
                 eff_limit = ctrl.effective_candidate_limit(fsize, n_cands)
                 stop, why = ctrl.should_stop(n_round, n_cands, fsize, converged)
                 if n_cands >= eff_limit and not ctrl.may_expand_budget(fsize):
@@ -1548,7 +1903,7 @@ def main():
                              len(all_rows) >= int(
                                  getattr(settings, "soft_candidate_budget", 0)
                                  or settings.maxTotalCandidates))
-                _compressed = bool(_soft_hit and frontier.size() > 0)
+                _compressed = bool(_soft_hit and fsize > 0)
                 _batch_k = min(settings.maxEvaluationBatch,
                                settings.maxRawCandidatesPerRound)
                 if _compressed:
@@ -1556,25 +1911,53 @@ def main():
                     print(f"COMPRESSION_ACTIVE round={n_round} batch={_batch_k} "
                           f"(past soft budget; frontier prioritized, continuing)")
                 # §8 method-priority → novelty: historically productive
-                # methods get attention, structurally blocked ones fade
-                for _it in frontier.items.values():
-                    if _it["status"] != "QUEUED":
-                        continue
-                    _mp = method_memory.priority(
-                        f"{sym_id}:{_it['family']}", novelty=1.0,
-                        remaining=1.0)
-                    _it["novelty"] = round(max(0.3, min(2.0, _mp)), 3)
-                batch = frontier.pop_batch(_batch_k, fam_counts)
-                if not batch and frontier.size() > 0:
+                # methods get attention, structurally blocked ones fade.
+                # Method memory is keyed per track: the two tracks learn
+                # independently while sharing the global test ledger.
+                for _FQ in FQS.values():
+                    for _it in _FQ.items.values():
+                        if _it["status"] != "QUEUED":
+                            continue
+                        _mp = method_memory.priority(
+                            f"{sym_id}:{_it.get('track', '?')}:{_it['family']}",
+                            novelty=1.0, remaining=1.0)
+                        _it["novelty"] = round(max(0.3, min(2.0, _mp)), 3)
+                # coverage-driven priority (§24/§46): scope items over
+                # contracts no evaluated mask has touched get a novelty
+                # boost, so the frontier expands across the universe
+                # instead of re-searching covered ground.
+                _covered_all = set()
+                for _c in coverage.values():
+                    _covered_all.update(_c.get("contracts", set()))
+                if _covered_all != set(universe):
+                    import re as _re
+                    for _FQ in FQS.values():
+                        for _it in _FQ.items.values():
+                            if _it["status"] != "QUEUED":
+                                continue
+                            _mm = _re.search(
+                                r"contract=([^\s&]+)",
+                                str(_it.get("feature_signature", "")))
+                            if _mm and _mm.group(1) not in _covered_all:
+                                _it["novelty"] = round(
+                                    min(2.0, float(_it.get("novelty", 1.0))
+                                        + 0.5), 3)
+                _pairs = _pop_track_batches(_batch_k)
+                batch = [it for it, _ in _pairs]
+                if not batch and fsize > 0:
                     # family stops starved the batch while work remains: lift
                     # stops and repop rather than burning a round (§7/§21)
-                    frontier.stopped_families = set()
-                    batch = frontier.pop_batch(_batch_k, fam_counts)
+                    for _FQ in FQS.values():
+                        _FQ.stopped_families = set()
+                    _pairs = _pop_track_batches(_batch_k)
+                    batch = [it for it, _ in _pairs]
                 # batch-proportional quota: each family may take at most
                 # max_family_share of the round batch (min 1 slot); excess items
                 # are deferred only when another family is present in the batch.
+                # Quotas are per track (family keys qualified by track).
                 from collections import Counter as _C
-                _fam_in_batch = _C(it["family"] for it in batch)
+                _fam_in_batch = _C(
+                    (it.get("_fq_track", "?"), it["family"]) for it in batch)
                 _allowed = {f: max(1, int(settings.max_family_share * len(batch)))
                             for f in _fam_in_batch}
                 _batch_idx = {id(it): i for i, it in enumerate(batch)}
@@ -1588,13 +1971,16 @@ def main():
                 round_discoveries = []
                 added = 0
                 round_timeout_hit = False
-                frontier_before = frontier.size()
+                frontier_before = fsize
                 wd.start_round()
                 round_best_val, round_best_oos, round_best_tr, round_best_rob = (
                     float("-inf"), float("-inf"), float("-inf"), float("-inf"))
                 new_fams = set()
                 for item in batch:
                     hid = item["hypothesis_id"]
+                    _trk = item.get("_fq_track") or item.get("track") or \
+                        hreg.hypotheses.get(hid, {}).get("track", "B")
+                    _FQ = FQS.get(_trk, FQS[_tracks[0]])
                     wd.start_candidate()
                     if wd.round_expired():
                         item["status"] = "QUEUED"
@@ -1602,26 +1988,28 @@ def main():
                         break
                     item["status"] = "EVALUATING"
                     fam = item["family"]
+                    _famkey = (_trk, fam)
                     # family quota (§7) against the round batch allowance: defer
                     # the excess only when an alternative family waits in-batch.
                     # Deferred items stay QUEUED for later rounds (no starvation).
-                    if round_fam.get(fam, 0) >= _allowed.get(fam, 1):
+                    if round_fam.get(_famkey, 0) >= _allowed.get(_famkey, 1):
                         alt_in_batch = any(
                             it["family"] != fam and it["status"] == "QUEUED"
                             for it in batch[_batch_idx[id(item)] + 1:])
                         alt_queued = any(
                             it["status"] == "QUEUED" and it["family"] != fam
-                            for it in frontier.items.values())
+                            for it in _FQ.items.values())
                         if alt_in_batch or alt_queued:
                             fam_rejected += 1
                             item["status"] = "QUEUED"  # re-queue, not drop
                             continue
-                    fam_counts[fam] = fam_counts.get(fam, 0) + 1
-                    round_fam[fam] = round_fam.get(fam, 0) + 1
+                    fam_counts.setdefault(_trk, {})
+                    fam_counts[_trk][fam] = fam_counts[_trk].get(fam, 0) + 1
+                    round_fam[_famkey] = round_fam.get(_famkey, 0) + 1
                     hreg.count_test(1)
                     # resolve mask (iterative helper; see _resolve_mask)
                     m = _resolve_mask(feat, hid, hreg, atomic_masks, mask_cache,
-                                      frontier)
+                                      _FQ)
                     if m is None or m.sum() < a.min_events:
                         item["status"] = "REJECTED"
                         skipped_small += 1
@@ -1629,6 +2017,24 @@ def main():
                     mask_cache[hid] = m
                     rec = hreg.hypotheses.get(hid, {})
                     rec["recipe"] = item.get("recipe")
+                    # search coverage: every evaluated mask contributes its
+                    # contracts/strikes/expiries/sides, per track + overall.
+                    try:
+                        _mm = m.fillna(False)
+                        _cov = coverage.get(_trk)
+                        if _cov is not None and _mm.any():
+                            _rows = feat.loc[_mm]
+                            _cov["contracts"].update(
+                                _rows["symbol"].astype(str).unique().tolist())
+                            _cov["strikes"].update(
+                                _rows["strike"].astype(str).unique().tolist())
+                            _cov["expiries"].update(
+                                _rows["expiry"].astype(str).unique().tolist())
+                            _cov["sides"].update(
+                                _rows["option_type"].astype(str).unique().tolist())
+                            _cov["evaluated"] += 1
+                    except Exception:
+                        pass
                     depth = int(rec.get("combination_depth", item.get("combination_depth", 1)))
                     do_exit = depth <= 2  # exit discovery on promising shallow events
                     exit_cfg = item.get("exit_cfg") or default_exit
@@ -1636,18 +2042,19 @@ def main():
                         feat, m, hid, fam, item.get("feature_signature", hid),
                         "fwd_ret_5m", rec.get("contract_scope", "chain"), "long", "5m",
                         splits, settings, a.min_events, rec or {"hypothesis_id": hid},
-                        depth, exit_cfg, has_bidask, do_exit, True, hreg)
+                        depth, exit_cfg, has_bidask, do_exit, True, hreg,
+                        track=_trk)
                     if row is None:
                         item["status"] = "REJECTED"
                         method_memory.record(
-                            f"{sym_id}:{fam}", int(m.sum()), 0.0,
+                            f"{sym_id}:{_trk}:{fam}", int(m.sum()), 0.0,
                             found_signal=False,
                             failure_state="NO_SIGNAL_FOUND",
                             reason="below minimum events",
                             requirements="min_events")
                         continue
-                    # §19 method memory (per-symbol scope: discovery is
-                    # independent per symbol): learn from every attempt
+                    # §19 method memory (per-symbol AND per-track scope:
+                    # the two tracks learn independently): learn every attempt
                     try:
                         _t0 = wd.candidate_start
                         import time as _tm
@@ -1657,7 +2064,7 @@ def main():
                     _sig = bool(pd.notna(row["FWD_IS_expectancy"])
                                 and row["FWD_IS_expectancy"] > 0)
                     method_memory.record(
-                        f"{sym_id}:{fam}", int(m.sum()),
+                        f"{sym_id}:{_trk}:{fam}", int(m.sum()),
                         round(int(m.sum()) / max(1, len(feat)), 4),
                         found_signal=_sig,
                         oos_survived=row["OOS_trading_result"] == "OOS_TRADING_RULE_PASS",
@@ -1665,7 +2072,7 @@ def main():
                         reason="" if _sig else row.get("failure_why", ""),
                         compute_s=_dt)
                     method_memory.record(
-                        f"{sym_id}:{fam}:exit",
+                        f"{sym_id}:{_trk}:{fam}:exit",
                         int(m.sum()), 0.0,
                         found_signal=row.get("exit_discovery_status") == "DISCOVERED",
                         failure_state="" if row.get("exit_discovery_status") == "DISCOVERED" else row.get("exit_discovery_status", ""),
@@ -1765,9 +2172,12 @@ def main():
                         row["FWD_IS_expectancy"] > 0 and row["events"] >= a.min_events
                     if promising and depth + 1 >= 3 and not has_promising_d2:
                         gated_depth3 += 1
-                        frontier.set_status(hid, "EVALUATED")
+                        _FQ.set_status(hid, "EVALUATED")
                     elif promising and depth < settings.maxCombinationDepth:
-                        # top diverse confirmation legs (not yet dominant)
+                        # top diverse confirmation legs (not yet dominant).
+                        # Track rule: a Track A parent may only take Track A
+                        # legs; anything else promotes the child to Track B.
+                        from .tracks import child_track as _child_track
                         legs = [c for c in
                                 ["e_expansion", "e_vol_shock", "e_compression",
                                  "ev_divergence", "ev_convergence", "ev_catchup_setup"]
@@ -1781,22 +2191,26 @@ def main():
                         for leg in legs[:settings.topKConditional]:
                             if added >= 3:
                                 break
+                            _ctrack = _child_track(_trk, [leg])
                             reg2 = hreg.register(
                                 "COMBO", "COMBINATION",
                                 f"{row['feature_definition']}&{leg}",
                                 contract_scope=rec.get("contract_scope", "chain"),
                                 exit_rule="hold5/sl.5/tp1",
                                 parent_ids=[hid], depth=depth + 1,
-                                reason=f"combo-confirm:{leg}", cycle_id=n_round)
+                                reason=f"combo-confirm:{leg}", cycle_id=n_round,
+                                track=_ctrack)
                             if not reg2["duplicate"]:
+                                _CFQ = FQS.get(_ctrack, _FQ)
                                 it2 = {"hypothesis_id": reg2["hypothesis_id"],
+                                       "track": _ctrack,
                                        "family": "COMBINATION",
                                        "feature_signature": f"{row['feature_definition']}&{leg}",
                                        "combination_depth": depth + 1,
                                        "reason_added": f"combo-confirm:{leg}",
                                        "confirm_feature": leg,
                                        "recipe": {"kind": "combo",
-                                                  "parent": frontier.items.get(
+                                                  "parent": _FQ.items.get(
                                                       hid, {}).get("recipe"),
                                                   "leg": leg},
                                        "train_score": 0.0, "validation_score": 0.0,
@@ -1804,16 +2218,80 @@ def main():
                                        "priority": 0.0, "status": "QUEUED",
                                        "parent_hypotheses": [hid],
                                        "information_gain": 0.0, "novelty": 1.0}
-                                frontier.items[reg2["hypothesis_id"]] = it2
+                                _CFQ.items[reg2["hypothesis_id"]] = it2
                                 mask_cache[reg2["hypothesis_id"]] = (
                                     m & (feat[leg] == 1).fillna(False))
                                 hreg.hypotheses[reg2["hypothesis_id"]]["parent_ids"] = [hid]
                                 added += 1
                             else:
                                 dup_hyps += 1
-                        frontier.set_status(hid, "PROMOTED")
+                        _FQ.set_status(hid, "PROMOTED")
+                        # scope-restricted children (§12/§13/§21): "signal
+                        # here, trade there". AND the promising entry with a
+                        # contract-scope rule (side/expiry/strike/contract),
+                        # so WHICH contract is traded becomes a searched
+                        # hypothesis instead of a preselection. Bounded: at
+                        # most 2 per promising entry, SIDE first.
+                        _scope_cands = [
+                            sp for sp in depth1_by_track.get(_trk, [])
+                            if sp.get("family", "").startswith("SCOPE_")
+                            and (sp.get("recipe") or {}).get("kind") == "scope"]
+                        _scope_order = {"SCOPE_SIDE": 0, "SCOPE_EXPIRY": 1,
+                                        "SCOPE_STRIKE": 2, "SCOPE_CONTRACT": 3}
+                        _scope_cands.sort(key=lambda sp: (
+                            _scope_order.get(sp.get("family"), 9),
+                            sp.get("feature", "")))
+                        _added_scope = 0
+                        for _sp in _scope_cands:
+                            if _added_scope >= 2:
+                                break
+                            _srec = _sp.get("recipe") or {}
+                            _sfeat = _sp.get("feature", "")
+                            if _sfeat in _parent_tokens:
+                                continue
+                            _smask = _sp["mask_fn"](feat).fillna(False)
+                            if (m & _smask).sum() < a.min_events:
+                                continue
+                            _cscope = (f"{_srec.get('field')}="
+                                       f"{_srec.get('val')}")
+                            reg3 = hreg.register(
+                                "SCOPED", "COMBINATION",
+                                f"{row['feature_definition']}&{_sfeat}",
+                                contract_scope=_cscope,
+                                exit_rule="hold5/sl.5/tp1",
+                                parent_ids=[hid], depth=depth + 1,
+                                reason=f"scope-restrict:{_sfeat}",
+                                cycle_id=n_round, track=_trk)
+                            if reg3["duplicate"]:
+                                dup_hyps += 1
+                                continue
+                            it3 = {"hypothesis_id": reg3["hypothesis_id"],
+                                   "track": _trk,
+                                   "family": "COMBINATION",
+                                   "feature_signature":
+                                       f"{row['feature_definition']}&{_sfeat}",
+                                   "combination_depth": depth + 1,
+                                   "reason_added": f"scope-restrict:{_sfeat}",
+                                   "recipe": {"kind": "combo",
+                                              "parent": _FQ.items.get(
+                                                  hid, {}).get("recipe"),
+                                              "scope_leg": _srec},
+                                   "scope_recipe": _srec,
+                                   "train_score": 0.0, "validation_score": 0.0,
+                                   "OOS_score": 0.0, "robustness_score": 0.0,
+                                   "priority": 0.0, "status": "QUEUED",
+                                   "parent_hypotheses": [hid],
+                                   "information_gain": 0.0, "novelty": 1.2}
+                            _FQ.items[reg3["hypothesis_id"]] = it3
+                            mask_cache[reg3["hypothesis_id"]] = (
+                                m & _smask)
+                            hreg.hypotheses[
+                                reg3["hypothesis_id"]]["parent_ids"] = [hid]
+                            added += 1
+                            _added_scope += 1
+                        _FQ.set_status(hid, "PROMOTED")
                     else:
-                        frontier.set_status(hid, "EVALUATED")
+                        _FQ.set_status(hid, "EVALUATED")
                     # failure-driven exit variants (§22, FIX 4): predictive signal
                     # with no working trading rule spawns NEW hypotheses carrying
                     # alternative exit structures into the next cycle's queue.
@@ -1854,9 +2332,10 @@ def main():
                                 entry_rule=rec.get("entry_rule", "signal-close"),
                                 exit_rule=_er, parent_ids=[hid], depth=depth,
                                 reason=f"exit-variant:{_ax['note']}",
-                                cycle_id=n_round)
+                                cycle_id=n_round, track=_trk)
                             if not regx["duplicate"]:
                                 itx = {"hypothesis_id": regx["hypothesis_id"],
+                                       "track": _trk,
                                        "family": fam,
                                        "feature_signature": row["feature_definition"],
                                        "combination_depth": depth,
@@ -1865,7 +2344,7 @@ def main():
                                        "reason_unresolved": row["unresolved_code"],
                                        "unresolved_code": row["unresolved_code"],
                                        "next_action": "exit-discovery",
-                                       "recipe": frontier.items.get(
+                                       "recipe": _FQ.items.get(
                                            hid, {}).get("recipe"),
                                        "exit_cfg": {k: _ax[k] for k in
                                                     ("hold", "sl", "tp",
@@ -1876,7 +2355,7 @@ def main():
                                        "priority": 0.0, "status": "QUEUED",
                                        "parent_hypotheses": [hid],
                                        "information_gain": 0.0, "novelty": 1.2}
-                                frontier.items[regx["hypothesis_id"]] = itx
+                                _FQ.items[regx["hypothesis_id"]] = itx
                                 mask_cache[regx["hypothesis_id"]] = m
                                 added += 1
                             else:
@@ -1896,10 +2375,11 @@ def main():
                         hreg.mark(hid, "robust")
                 # exploration seeding (§26): family-diverse probes while budget remains
                 n_new_fam = len(new_fams)
-                fsize = frontier.size()
+                fsize = sum(_FQ.size() for _FQ in FQS.values())
                 # diversity saturated (§5/§7): no QUEUED family is unexplored, or
                 # the evaluated mix already spans families without dominance
-                queued_fams = {it["family"] for it in frontier.items.values()
+                queued_fams = {it["family"] for _FQ in FQS.values()
+                               for it in _FQ.items.values()
                                if it["status"] == "QUEUED"}
                 div_sat = (not queued_fams) or \
                     all(f in seen_families for f in queued_fams)
@@ -1915,26 +2395,41 @@ def main():
                     best_oos = max(best_oos, round_best_oos)
                 # family hard-stop >50% for next cycle (§7) + §17: a
                 # family with many attempts and zero signals is rested for
-                # the next cycle (change family, never weaken gates)
-                fam_total = max(1, sum(fam_counts.values()))
-                stopped = frontier.update_family_stops(fam_counts, fam_total)
+                # the next cycle (change family, never weaken gates).
+                # Quotas and stops are per track; the global ledger stays
+                # shared.
+                _flat_counts = {}
+                for _trk, _fc in fam_counts.items():
+                    for _f, _c in _fc.items():
+                        _flat_counts[(_trk, _f)] = _c
+                stopped = set()
+                for _trk in _tracks:
+                    _fc = fam_counts.get(_trk, {})
+                    _tot = max(1, sum(_fc.values()))
+                    _st = FQS[_trk].update_family_stops(_fc, _tot)
+                    stopped.update(_st)
                 for _mm in method_memory.to_json():
                     if _mm["attempts"] >= 10 and _mm["signals_found"] == 0 \
                             and not _mm["method_id"].endswith(":exit"):
-                        _fam_only = _mm["method_id"].split(":")[-1]
+                        _parts = _mm["method_id"].split(":")
+                        _fam_only = _parts[-1]
                         # per-symbol scope: only rest on the failing symbol
                         if _mm["method_id"].startswith(f"{sym_id}:"):
                             stopped.add(_fam_only)
-                            frontier.stopped_families.add(_fam_only)
-                if stopped - set(fam_counts):
+                            _mtrk = _parts[1] if len(_parts) >= 3 else None
+                            for _trk in _tracks:
+                                if _mtrk is None or _trk == _mtrk:
+                                    FQS[_trk].stopped_families.add(_fam_only)
+                if stopped - set(_flat_counts):
                     print(f"FAMILY_SWITCH rested-on-failure: "
-                          f"{sorted(stopped - set(fam_counts))}")
+                          f"{sorted(stopped - set(_flat_counts))}")
                 # exit / trading-rule research exhausted? (§25)
-                exit_open = sum(1 for it in frontier.items.values()
-                                if it.get("unresolved_code")
-                                in ("ENTRY_PROMISING_EXIT_UNRESOLVED",
-                                    "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED")
-                                and it["status"] == "QUEUED")
+                exit_open = sum(
+                    1 for _FQ in FQS.values() for it in _FQ.items.values()
+                    if it.get("unresolved_code")
+                    in ("ENTRY_PROMISING_EXIT_UNRESOLVED",
+                        "PREDICTIVE_BUT_TRADING_RULE_UNRESOLVED")
+                    and it["status"] == "QUEUED")
                 exit_exhausted = (exit_open == 0)
                 trading_exhausted = (fsize == 0)
                 converged = conv.update(fsize, n_new_fam, dval, doos, div_sat,
@@ -1953,16 +2448,41 @@ def main():
                 # automatic direction change on no-discovery (§21/§22): lift
                 # family stops, boost exploration, reprioritize unseen families
                 if cycle_status == "CYCLE_NO_NEW_DISCOVERY":
-                    frontier.stopped_families = set()
-                    for it in frontier.items.values():
-                        if it["status"] == "QUEUED" \
-                                and it["family"] not in seen_families:
-                            it["novelty"] = 2.0
-                next_plan = build_next_cycle_plan(
-                    frontier, fam_counts, seen_families, stopped,
-                    [d["discovery_id"] for d in all_discoveries])
-                fam_share_after = {k: round(v / max(1, sum(fam_counts.values())), 3)
-                                   for k, v in fam_counts.items()}
+                    for _FQ in FQS.values():
+                        _FQ.stopped_families = set()
+                        for it in _FQ.items.values():
+                            if it["status"] == "QUEUED" \
+                                    and it["family"] not in seen_families:
+                                it["novelty"] = 2.0
+                # next-cycle plan merged across tracks (per-track quotas,
+                # shared global ledger)
+                _plans = [build_next_cycle_plan(
+                    FQS[_trk], fam_counts.get(_trk, {}), seen_families,
+                    stopped, [d["discovery_id"] for d in all_discoveries])
+                    for _trk in _tracks]
+                next_plan = {
+                    "top_unresolved": sorted(
+                        [u for _p in _plans for u in _p["top_unresolved"]],
+                        key=lambda x: -x.get("priority", 0.0))[:10],
+                    "families_needing_exploration": sorted(
+                        {f for _p in _plans
+                         for f in _p["families_needing_exploration"]}),
+                    "families_over_explored": sorted(
+                        {f for _p in _plans
+                         for f in _p["families_over_explored"]}),
+                    "families_blocked": sorted(
+                        {f for _p in _plans
+                         for f in _p["families_blocked"]}),
+                    "new_feature_proposals": [
+                        f"explore:{f}" for f in sorted(
+                            {f for _p in _plans
+                             for f in _p["families_needing_exploration"]})[:5]],
+                    "new_exit_tests": sum(
+                        _p["new_exit_tests"] for _p in _plans),
+                    "recent_discoveries": _plans[0]["recent_discoveries"],
+                }
+                fam_share_after = {k: round(v / max(1, sum(_flat_counts.values())), 3)
+                                   for k, v in _flat_counts.items()}
                 dom = max(fam_share_after.values()) if fam_share_after else 0.0
                 print(f"ROUND {n_round} [{cycle_status}] candidates={len(all_rows)} "
                       f"new={new_hyps} dup={dup_hyps} clones={clone_hyps} "
@@ -2016,17 +2536,31 @@ def main():
                         _rec.get("label", ""), _rec.get("direction", ""),
                         _rec.get("contract_scope", ""),
                         _rec.get("entry_rule", ""),
-                        _rec.get("exit_rule", ""))
+                        _rec.get("exit_rule", ""),
+                        _rec.get("track", ""))
                     _hyps[_hid] = _r
                 _registry = {"hypotheses": _hyps, "memory": mem,
                              "duplicates": hreg.duplicate_count,
                              "clones": hreg.clone_count,
-                             "families": dict(fam_counts)}
+                             "families": {f"{tr}:{f}": c
+                                          for tr, _fc in fam_counts.items()
+                                          for f, c in _fc.items()}}
                 save_checkpoint(os.path.join(ckpt_base, f"{sym_id}.checkpoint.json"), {
                     "run_id": run_id, "round": n_round,
                     "candidates": all_rows[-500:],
                     "discoveries": all_discoveries[-500:],
-                    "frontier": frontier.to_json(),
+                    "frontier": [it for _tr in _tracks
+                                 for it in FQS[_tr].to_json()],
+                    "frontier_A": FQS["A"].to_json() if "A" in FQS else [],
+                    "frontier_B": FQS["B"].to_json() if "B" in FQS else [],
+                    "coverage": {tr: {
+                        "contracts": sorted(coverage[tr]["contracts"]),
+                        "strikes": sorted(coverage[tr]["strikes"]),
+                        "expiries": sorted(coverage[tr]["expiries"]),
+                        "sides": sorted(coverage[tr]["sides"]),
+                        "evaluated": coverage[tr]["evaluated"],
+                        "exit_jobs": coverage[tr]["exit_jobs"]}
+                        for tr in _tracks},
                     "registry": _registry,
                     "global_test_count": hreg.global_test_count,
                     "hypothesis_n": hreg.n, "oos_days": [str(d) for d in splits["pseudo_oos"]],
@@ -2037,7 +2571,8 @@ def main():
                     "registry": _registry,
                     "global_test_count": hreg.global_test_count})
                 save_checkpoint(os.path.join(ckpt_base, f"{sym_id}.frontier.json"),
-                                frontier.to_json())
+                                [it for _tr in _tracks
+                                 for it in FQS[_tr].to_json()])
                 save_checkpoint(os.path.join(ckpt_base, f"{sym_id}.candidate_store.json"),
                                 all_rows[-1000:])
                 save_checkpoint(os.path.join(ckpt_base, f"{sym_id}.oos_store.json"), {
@@ -2081,19 +2616,38 @@ def main():
                         converged = True
                     break
             # ---- per-symbol state handoff (§4): independent frames stored
-            # for global assembly (levels, transfer, boards, audits)
+            # for global assembly (levels, transfer, boards, audits).
+            # Frontiers stored per track AND merged (legacy readers use the
+            # merged list; track-aware readers use frontier_A/B).
+            _merged_frontier = [it for _tr in _tracks
+                                for it in FQS[_tr].to_json()]
+            _merged_d1 = [h for _tr in _tracks
+                          for h in depth1_hids_by_track.get(_tr, [])]
             _handoff = {"feat": feat, "masks": dict(mask_cache),
                         "splits": splits, "meta": meta,
                         "mods": mods, "health": health,
                         "chain": chain, "strikes": strikes,
+                        "universe": universe,
+                        "excluded_invalid": excluded_invalid,
                         "has_bidask": has_bidask,
                         "exec_model": exec_model,
-                        "frontier": frontier.to_json(),
-                        "depth1_hids": list(depth1_hids),
+                        "frontier": _merged_frontier,
+                        "depth1_hids": _merged_d1,
+                        "frontier_A": FQS["A"].to_json() if "A" in FQS else [],
+                        "frontier_B": FQS["B"].to_json() if "B" in FQS else [],
+                        "coverage": {tr: {
+                            "contracts": sorted(coverage[tr]["contracts"]),
+                            "strikes": sorted(coverage[tr]["strikes"]),
+                            "expiries": sorted(coverage[tr]["expiries"]),
+                            "sides": sorted(coverage[tr]["sides"]),
+                            "evaluated": coverage[tr]["evaluated"],
+                            "exit_jobs": coverage[tr]["exit_jobs"]}
+                            for tr in _tracks},
                         "converged": converged,
                         "stop_why": stop_why,
                         "budget_hit": budget_hit,
-                        "frontier_size": frontier.size()}
+                        "frontier_size": sum(_FQ.size()
+                                             for _FQ in FQS.values())}
             _handoff.update(symbol_store.get(sym_id, {}))
             symbol_store[sym_id] = _handoff
             symbol_metas[sym_id] = meta
@@ -2336,6 +2890,103 @@ def main():
         print(f"GLOBAL_TEST_COUNT={hreg.global_test_count} "
               f"UNIQUE_HYPOTHESES={hreg.n} DUPLICATES={hreg.duplicate_count} "
               f"CLONES={hreg.clone_count}")
+        # ---- DISCOVERY UNIVERSE + TRACK + BUDGET reporting (§35-§37) ----
+        _uni_all, _exc_all = set(), set()
+        for _v in symbol_store.values():
+            _uni_all.update(_v.get("universe", []))
+            _exc_all.update(_v.get("excluded_invalid", []))
+        print("DISCOVERY_UNIVERSE")
+        print(f"  total_canonical_contracts={len(_uni_all)} "
+              f"excluded_invalid_data={len(_exc_all)}")
+        for _sym, _v in symbol_store.items():
+            _meta = _v.get("meta", {})
+            print(f"  symbol={_sym} contracts={len(_v.get('universe', []))} "
+                  f"strikes={_meta.get('n_strikes')} "
+                  f"expiries={_meta.get('expiries')} "
+                  f"types={_meta.get('option_types')}")
+        print(f"  research_universe_size={len(_uni_all)} "
+              f"(every valid contract searchable; priority ordering only)")
+        _mer_cov = {"contracts": set(), "strikes": set(),
+                    "expiries": set(), "sides": set()}
+        _trk_cov = {}
+        for _v in symbol_store.values():
+            for _tr, _c in (_v.get("coverage") or {}).items():
+                _t = _trk_cov.setdefault(
+                    _tr, {"contracts": set(), "strikes": set(),
+                          "expiries": set(), "sides": set(),
+                          "evaluated": 0, "exit_jobs": 0})
+                for _k in ("contracts", "strikes", "expiries", "sides"):
+                    _t[_k].update(_c.get(_k, []))
+                    _mer_cov[_k].update(_c.get(_k, []))
+                _t["evaluated"] += int(_c.get("evaluated", 0))
+                _t["exit_jobs"] += int(_c.get("exit_jobs", 0))
+        print(f"  contracts_searched={len(_mer_cov['contracts'])} "
+              f"strikes_searched={len(_mer_cov['strikes'])} "
+              f"expiries_searched={len(_mer_cov['expiries'])} "
+              f"sides_searched={sorted(_mer_cov['sides'])}")
+        _hyps_by_track = {}
+        for _hid, _rec in hreg.hypotheses.items():
+            _t = _rec.get("track", "?")
+            _hyps_by_track[_t] = _hyps_by_track.get(_t, 0) + 1
+        for _tr in sorted(set(list(_trk_cov) + list(_hyps_by_track))):
+            _c = _trk_cov.get(_tr, {})
+            _rows_t = cands_df[cands_df.get("track", pd.Series(
+                ["?"] * len(cands_df), index=cands_df.index)) == _tr] \
+                if len(cands_df) else cands_df
+            _val = int(((_rows_t.get("final_status") == "ROBUST") |
+                        (_rows_t.get("final_status") == "OOS_SURVIVED")).sum()) \
+                if len(_rows_t) and "final_status" in _rows_t else 0
+            _oos = int((_rows_t.get("OOS_trading_result") ==
+                        "OOS_TRADING_RULE_PASS").sum()) \
+                if len(_rows_t) and "OOS_trading_result" in _rows_t else 0
+            _surr = int((_rows_t.get("final_status") ==
+                         "SURROGATE_REJECTED").sum()) \
+                if len(_rows_t) and "final_status" in _rows_t else 0
+            _mt = int((_rows_t.get("final_status") ==
+                       "MULTIPLE_TESTING_REJECTED").sum()) \
+                if len(_rows_t) and "final_status" in _rows_t else 0
+            _rob = int((_rows_t.get("final_status") ==
+                        "ROBUSTNESS_REJECTED").sum()) \
+                if len(_rows_t) and "final_status" in _rows_t else 0
+            print(f"TRACK_{_tr} hypotheses_tested="
+                  f"{_hyps_by_track.get(_tr, 0)} "
+                  f"evaluated={_c.get('evaluated', 0)} "
+                  f"contracts={len(_c.get('contracts', []))} "
+                  f"strikes={len(_c.get('strikes', []))} "
+                  f"expiries={len(_c.get('expiries', []))} "
+                  f"sides={sorted(_c.get('sides', []))} "
+                  f"exit_jobs={_c.get('exit_jobs', 0)} "
+                  f"entry_candidates={len(_rows_t)} "
+                  f"oos_candidates={_oos} validated={_val} "
+                  f"surrogate_rejects={_surr} mt_rejects={_mt} "
+                  f"robustness_rejects={_rob}")
+        _fams_all = [str(_r.get("discovery_family", "")) for _r in all_rows]
+        _n_entry = sum(1 for _f in _fams_all
+                       if not (_f.startswith("SCOPE_") or
+                               _f.startswith("SEL_") or _f == "EXITVAR"))
+        _n_sel = sum(1 for _f in _fams_all
+                     if _f.startswith("SCOPE_") or _f.startswith("SEL_"))
+        _n_exitvar = sum(1 for _f in _fams_all if _f == "EXITVAR")
+        try:
+            from .exits import EXIT_AUDIT as _EA
+            _holds = sorted(_EA.get("holds", set()))
+            _exit_combos = int(_EA.get("evaluated", 0))
+        except Exception:
+            _holds, _exit_combos = [], 0
+        _n_exit_runs = int(pd.to_numeric(
+            cands_df.get("exit_combos_evaluated", pd.Series(
+                [0] * len(cands_df), index=cands_df.index)),
+            errors="coerce").fillna(0).sum()) if len(cands_df) else 0
+        print(f"SEARCH_BUDGET configured_candidates="
+              f"{settings.maxTotalCandidates} configured_rounds="
+              f"{settings.maxRounds} configured_runtime_s="
+              f"{settings.maxRuntimeSeconds} batch={settings.maxEvaluationBatch} "
+              f"tested_hypotheses={hreg.global_test_count} "
+              f"unique={hreg.n} entry={_n_entry} selection={_n_sel} "
+              f"exit_variants={_n_exitvar} exit_search_runs={_n_exit_runs} "
+              f"exit_combos={_exit_combos} holds_tested={_holds} "
+              f"validation_tested={len(cands_df)} "
+              f"oos_tested={int((cands_df.get('OOS_events', pd.Series([0])).fillna(0) > 0).sum()) if len(cands_df) else 0}")
         # FIX 3 surrogate transparency: event-time permutation null per
         # top candidate (mask rolled within symbol/day blocks; labels
         # untouched) — the only valid surrogate in this package
@@ -2418,7 +3069,23 @@ def main():
                   "HOLM_PASS": int(((cands_df["perm_p_holm"] < 0.10)).sum()) if len(cands_df) and "perm_p_holm" in cands_df else 0,
                   "BONF_PASS": int(((cands_df["perm_p_bonf"] < 0.10)).sum()) if len(cands_df) and "perm_p_bonf" in cands_df else 0,
                   "SURROGATE_PASS": int(((cands_df["perm_p"] < 0.10)).sum()) if len(cands_df) and "perm_p" in cands_df else 0,
-                  "space_exhausted": bool(space_exhausted)}
+                  "space_exhausted": bool(space_exhausted),
+                  # §35-§37 universe / track / budget ledger
+                  "research_universe_contracts": len(_uni_all),
+                  "research_universe_searched": len(_mer_cov["contracts"]),
+                  "strikes_searched": len(_mer_cov["strikes"]),
+                  "expiries_searched": len(_mer_cov["expiries"]),
+                  "tracks": {tr: {
+                      "hypotheses": _hyps_by_track.get(tr, 0),
+                      "evaluated": _trk_cov.get(tr, {}).get("evaluated", 0),
+                      "contracts": len(_trk_cov.get(tr, {}).get("contracts", [])),
+                      "exit_jobs": _trk_cov.get(tr, {}).get("exit_jobs", 0)}
+                      for tr in sorted(set(list(_trk_cov) + list(_hyps_by_track)))},
+                  "entry_hypotheses": _n_entry,
+                  "selection_hypotheses": _n_sel,
+                  "exit_variant_hypotheses": _n_exitvar,
+                  "exit_search_runs": _n_exit_runs,
+                  "holds_tested": _holds}
         # candidate boards (§43)
         # candidate boards (§29/§43): entry/exit scored separately; no
         # overall winner from entry expectancy alone
