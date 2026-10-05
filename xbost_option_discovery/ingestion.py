@@ -51,6 +51,23 @@ def _resolve(columns, role):
     return None
 
 
+def _to_datetime(s):
+    """Parse a timestamp column robustly.
+
+    Plain `pd.to_datetime` treats integers as NANOSECONDS, so an epoch-seconds
+    column (e.g. the wide chain sample's `ts` = 1788839520) lands in 1970 and
+    silently corrupts every session/day computation downstream. Infer the unit
+    from magnitude instead; tz is dropped so epoch columns stay comparable
+    with naive string columns like `ist`.
+    """
+    v = pd.to_numeric(s, errors="coerce")
+    if v.notna().any():
+        m = float(v.abs().max())
+        unit = "s" if m < 1e11 else ("ms" if m < 1e14 else "ns")
+        return pd.to_datetime(v, unit=unit, errors="coerce", utc=True).dt.tz_localize(None)
+    return pd.to_datetime(s, errors="coerce")
+
+
 def detect_layout(df):
     """Return 'long' if a strike-like + price-like column set exists, else try 'wide'."""
     cols = list(df.columns)
@@ -187,7 +204,7 @@ def load_long(df, schema_over=None):
     if m["timestamp"] is None or m["close"] is None:
         raise ValueError("Long-form data requires at least timestamp + close columns")
     out = pd.DataFrame()
-    out["timestamp"] = pd.to_datetime(df[m["timestamp"]], errors="coerce")
+    out["timestamp"] = _to_datetime(df[m["timestamp"]])
     out["expiry"] = df[m["expiry"]].astype(str) if m["expiry"] else "UNKNOWN"
     if m["strike"] is not None:
         out["strike"] = pd.to_numeric(df[m["strike"]], errors="coerce")
@@ -212,7 +229,7 @@ def load_wide(df, schema_over=None):
     contracts = _infer_wide_contracts(df)
     if not contracts:
         raise ValueError("No <contract>_<field> columns detected for wide-form data")
-    ts = pd.to_datetime(df[ts_col], errors="coerce")
+    ts = _to_datetime(df[ts_col])
     recs = []
     for token, fmap in contracts.items():
         p = parse_contract_token(token)

@@ -31,27 +31,23 @@ from .costs import OptionCostModel
 
 
 def load_quotes(path):
-    q = pd.read_csv(path)
-    q.columns = [str(c).strip().lower() for c in q.columns]
-    ren = {"date": "timestamp", "time": "timestamp", "datetime": "timestamp",
-           "symbol": "symbol", "contract": "symbol", "strike": "strike",
-           "otype": "option_type", "opt_type": "option_type", "type": "option_type",
-           "expiry": "expiry", "open": "open", "high": "high", "low": "low",
-           "close": "close", "volume": "volume", "vol": "volume",
-           "oi": "oi", "open_interest": "oi", "openinterest": "oi"}
-    q = q.rename(columns={k: v for k, v in ren.items() if k in q.columns})
-    for c in ("open", "high", "low", "close", "volume", "strike"):
-        if c in q.columns:
-            q[c] = pd.to_numeric(q[c], errors="coerce")
-    if "oi" in q.columns:
-        q["oi"] = pd.to_numeric(q["oi"], errors="coerce")
-    q["timestamp"] = pd.to_datetime(q["timestamp"])
+    """Load the options chain via the canonical ingestion (§1-§4).
+
+    Accepts LONG form (one row per contract bar) and WIDE form (one row per
+    timestamp with <contract>_<field> columns, e.g. `54700CE_o … 54900PE_v`
+    plus an `expiry` column). Wide files previously died here with
+    `KeyError: 'timestamp'` because this loader assumed long-form columns.
+    """
+    from .ingestion import load_dataset
+    norm, _layout = load_dataset(path)
+    q = norm.copy()
+    # buyonly-local invariants (canonical frame already coerces numerics and
+    # datetimes, and always provides symbol/expiry/option_type/oi columns).
+    q["timestamp"] = pd.to_datetime(q["timestamp"], errors="coerce")
+    q = q.dropna(subset=["timestamp"]).reset_index(drop=True)
     q["option_type"] = q["option_type"].astype(str).str.upper()
-    if "symbol" not in q.columns or q["symbol"].isna().all():
-        q["symbol"] = ("UNKNOWN|" + q.get("expiry", "").astype(str) + "|"
-                       + q["strike"].astype(str) + "|" + q["option_type"].astype(str))
-    else:
-        q["symbol"] = q["symbol"].astype(str)
+    q["symbol"] = q["symbol"].astype(str)
+    q["expiry"] = q["expiry"].astype(str)
     return q
 
 
