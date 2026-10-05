@@ -180,17 +180,19 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/api/')) return next();
   if (PUBLIC_PATHS.has(req.path)) return next();
   if (!LEGACY && req.path.startsWith('/assets/')) return next();
+  // Dist SPA shell is served BEFORE the session check: the client router
+  // renders Login for anonymous users, and dist/ has no login.html/users.html
+  // files, so letting authenticated GETs fall through to express.static would
+  // 404 ("Cannot GET /login.html") on every reload/bookmark after login.
+  // {root} form: a bare absolute path made `send` fail with NotFound in some
+  // environments while express.static served the very same file.
+  if (!LEGACY && req.method === 'GET' && SHELL_PATHS.has(req.path)) {
+    return res.sendFile('index.html', { root: PUBLIC_DIR });
+  }
   if (req.session && req.session.user) return next();
   if (LEGACY) {
     if (req.path === '/' || req.path === '/index.html') return res.redirect('/login.html');
     return res.status(401).json({ error: 'unauthorized' });
-  }
-  if (req.method === 'GET' && SHELL_PATHS.has(req.path)) {
-    // Use the {root} form. Passing a bare absolute path here made `send` fail
-    // with NotFound while express.static served the very same file, so a
-    // logged-out browser got a raw 404 error page instead of the app shell the
-    // client router needs in order to render the Login screen.
-    return res.sendFile('index.html', { root: PUBLIC_DIR });
   }
   return res.status(401).json({ error: 'unauthorized' });
 });

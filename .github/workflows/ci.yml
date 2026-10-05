@@ -58,6 +58,10 @@ jobs:
             -d '{"username":"admin","password":"ci-smoke-pass"}' \
             http://localhost:8901/api/login -o /dev/null
           curl -sf -b jar http://localhost:8901/ | grep -q 'id="root"'
+          # SPA shell must serve for shell paths AFTER login too (dist/ has no
+          # login.html file — falling through to static 404s reloads/bookmarks).
+          curl -sf -b jar http://localhost:8901/login.html | grep -q 'id="root"'
+          curl -sf -b jar http://localhost:8901/users.html | grep -q 'id="root"'
           curl -sf -b jar http://localhost:8901/engine.js -o /dev/null
           curl -sf -b jar http://localhost:8901/worker.js -o /dev/null
       - name: login + use terminal + manage users
