@@ -1,6 +1,72 @@
 """Chronological validation (§17) + clustering (§16) + OOS gate (§31)."""
 import pandas as pd
 
+IST_OFFSET_MS = 19800000
+MIN_SESSIONS = 50
+MIN_EXPIRIES = 3
+MIN_CONTRACTS = 10
+MAX_SCOPE_CONTRACTS = 8
+
+def assess_data_health(sessions, expiries, contracts):
+    ok = sessions >= MIN_SESSIONS and expiries >= MIN_EXPIRIES and contracts >= MIN_CONTRACTS
+    reason = None if ok else f"DATA_INSUFFICIENT sessions={sessions} expiries={expiries} contracts={contracts}"
+    return {"sessions": sessions, "expiries": expiries, "contracts": contracts, "ok": ok, "reason": reason, "blocked": not ok}
+
+def validate_data_health(sessions, expiries, contracts):
+    dh = assess_data_health(sessions, expiries, contracts)
+    if not dh["ok"]:
+        print(f"[DATA_INSUFFICIENT] sessions={sessions} expiries={expiries} contracts={contracts}")
+    return dh
+
+def expiry_guard(carry, exclude_expiry):
+    if carry and exclude_expiry:
+        return {"blocked": True, "reason": "EXPIRY_GUARD", "paperReady": False}
+    return {"blocked": False, "paperReady": True}
+
+def iv_gate(iv_rank, iv_max_rank=0.3, iv_mode="block"):
+    if iv_rank is None:
+        return {"insufficient": False, "blocked": False, "paperReady": True}
+    if iv_rank > iv_max_rank:
+        if iv_mode == "block":
+            print(f"[IV_INSUFFICIENT] ivRank={iv_rank}")
+            return {"insufficient": True, "blocked": True, "paperReady": False, "reason": "IV_RANK_INSUFFICIENT"}
+        return {"insufficient": True, "blocked": False, "paperReady": True, "warning": f"IV_INSUFFICIENT ivRank={iv_rank}"}
+    return {"insufficient": False, "blocked": False, "paperReady": True}
+
+def validate_scope(scope):
+    if scope is None:
+        return {"scope": [], "truncated": False}
+    if len(scope) > MAX_SCOPE_CONTRACTS:
+        return {"scope": scope[:MAX_SCOPE_CONTRACTS], "truncated": True, "blocked": False}
+    return {"scope": scope, "truncated": False}
+
+def validate_paper_ready(sessions, expiries, contracts, carry=False, exclude_expiry=False, iv_rank=None, iv_max_rank=0.3, iv_mode="block", top1_pct=None, fallback_days=None, max_conf=None, conf_gate=0.6):
+    reasons=[]
+    dh = assess_data_health(sessions, expiries, contracts)
+    if not dh["ok"]:
+        reasons.append(dh["reason"])
+    eg = expiry_guard(carry, exclude_expiry)
+    if eg["blocked"]:
+        reasons.append(eg["reason"])
+    iv = iv_gate(iv_rank, iv_max_rank, iv_mode)
+    if iv["blocked"]:
+        reasons.append(iv["reason"])
+    if top1_pct is not None and top1_pct >= 0.40:
+        reasons.append("TOP1_PCT_GTE_40")
+    if fallback_days is not None and sessions is not None:
+        ratio = fallback_days/sessions if sessions else 0
+        mc = max_conf if max_conf is not None else 1
+        if ratio > 0.30 and mc < conf_gate:
+            reasons.append("LOW_REGIME_CONFIDENCE")
+    paperReady = len(reasons)==0
+    return {"paperReady": paperReady, "blocked": not paperReady, "reasons": reasons}
+
+# slippage validation tag G1
+def validate_slippage(slippage_model, spread_ticks=1, atr_mult=0.05):
+    if slippage_model not in ("none","spread","atr"):
+        return {"ok": False, "reason": "invalid slippageModel"}
+    return {"ok": True, "model": slippage_model, "tag": "G1"}
+
 def chronological_splits(days, fractions=(0.5, 0.2, 0.3), embargo_days=0):
     """Configurable chronological discovery/refinement/pseudo-OOS split (§13).
 
@@ -30,8 +96,7 @@ def audit_split_integrity(feat, splits, horizon_bars=15):
     if not splits or "day" not in feat:
         return {"status": "NOT_APPLICABLE", "violations": 0, "checked_rows": 0}
     day = pd.to_datetime(feat["timestamp"]).dt.date if "timestamp" in feat else feat["day"]
-    label_bar = pd.to_datetime(feat["timestamp"]) + pd.Timedelta(minutes=horizon_bars) \
-        if "timestamp" in feat else None
+    label_bar = pd.to_datetime(feat["timestamp"]) + pd.Timedelta(minutes=horizon_bars)         if "timestamp" in feat else None
     later = set(splits.get("refinement", [])) | set(splits.get("pseudo_oos", []))
     viol = 0
     if label_bar is not None and later:

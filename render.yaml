@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: xbost
+    env: docker
+    region: singapore
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: USERS_FILE
+        value: /app/data/users.json
+      - key: BUYONLY_MAX_PERMS
+        value: 200
+      - key: TZ
+        value: UTC
+    disk:
+      name: xbost-data
+      mountPath: /app/data
+      sizeGB: 1

@@ -210,17 +210,53 @@ function parseCSVAll(text) {
   });
 }
 
-function resample(d, tfMin) {
+function resample(d, tfMin, sessionAnchor) {
   tfMin=Math.max(1,Math.round(tfMin));
   if (tfMin===1) return d;
-  const n=d.t.length, ms=tfMin*60000;
-  // align buckets to 09:15 IST session grid: bucket = floor((t - sessionStart)/ms)? simpler: floor(t/ms)
+  sessionAnchor = sessionAnchor || 'session';
+  const n=d.t.length;
+  // Daily resample with sessionAnchor handling
+  if(tfMin>=1440){
+    // sessionAnchor wall => IST midnight bucket, session => MCX session 19:00 IST anchor
+    const buckets=new Map();
+    for(let i=0;i<n;i++){
+      let key;
+      if(sessionAnchor==='wall'){
+        key=istDayKey(d.t[i]);
+      } else {
+        // session anchored: MCX 19:00 IST to next day 06:00 IST is one session
+        const parts=istParts(d.t[i]);
+        const mins=parts.h*60+parts.m;
+        if(mins>=1140){ // 19:00+
+          key=istDayKey(d.t[i]);
+        } else if(mins<360){ // <06:00 belongs to previous IST day
+          key=istDayKey(d.t[i]-86400000);
+        } else {
+          key=istDayKey(d.t[i]);
+        }
+      }
+      let b=buckets.get(key);
+      if(!b){b={o:d.o[i],h:d.h[i],l:d.l[i],c:d.c[i],v:d.v[i],t:d.t[i]};buckets.set(key,b);}
+      else{
+        if(d.h[i]>b.h)b.h=d.h[i];
+        if(d.l[i]<b.l)b.l=d.l[i];
+        b.c=d.c[i];b.v+=d.v[i];
+      }
+    }
+    const T=[],O=[],H=[],L=[],C=[],V=[];
+    for(const [k,b] of buckets){
+      T.push(b.t);O.push(b.o);H.push(b.h);L.push(b.l);C.push(b.c);V.push(b.v);
+    }
+    return {t:Float64Array.from(T),o:Float64Array.from(O),h:Float64Array.from(H),l:Float64Array.from(L),c:Float64Array.from(C),v:Float64Array.from(V),symbol:d.symbol||null,layout:d.layout||null,contract:d.contract||null};
+  }
+  const ms=tfMin*60000;
+  // IST-aligned intraday buckets: offset by IST midnight
   const T=[],O=[],H=[],L=[],C=[],V=[];
   let bt=-1,bo=0,bh=-Infinity,bl=Infinity,bc=0,bv=0;
   for(let i=0;i<n;i++){
-    const b=Math.floor(d.t[i]/ms);
+    const b=Math.floor((d.t[i]+IST_OFFSET_MS)/ms);
     if(b!==bt){
-      if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);}
+      if(bt!==-1){T.push(bt*ms-IST_OFFSET_MS);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);}
       bt=b;bo=d.o[i];bh=d.h[i];bl=d.l[i];bc=d.c[i];bv=d.v[i];
     } else {
       if(d.h[i]>bh)bh=d.h[i];
@@ -228,9 +264,9 @@ function resample(d, tfMin) {
       bc=d.c[i];bv+=d.v[i];
     }
   }
-  if(bt!==-1){T.push(bt*ms);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);}
+  if(bt!==-1){T.push(bt*ms-IST_OFFSET_MS);O.push(bo);H.push(bh);L.push(bl);C.push(bc);V.push(bv);}
   const m=T.length;
-  return {t:Float64Array.from(T),o:Float64Array.from(O),h:Float64Array.from(H),l:Float64Array.from(L),c:Float64Array.from(C),v:Float64Array.from(V)};
+  return {t:Float64Array.from(T),o:Float64Array.from(O),h:Float64Array.from(H),l:Float64Array.from(L),c:Float64Array.from(C),v:Float64Array.from(V),symbol:d.symbol||null,layout:d.layout||null,contract:d.contract||null};
 }
 
 // ---------- indicators (Float64Array in/out, NaN for warmup) ----------
@@ -1592,6 +1628,10 @@ function dayRouting(d, o){
   const segs=daySegments(d);
   const notices=[];
   if(segs.length<5){
+    // AC6 fallback: <50 sessions => rule only
+    if(segs.length < 50){
+      return {dayReg:null, mlAcc:null, notices:['<50 sessions: routing disabled (rule-only), all legs trade everywhere'], fallbackDays:segs.length, ok:false};
+    }
     return {dayReg:null, mlAcc:null, notices:['<5 sessions: routing disabled, all legs trade everywhere'], fallbackDays:segs.length, ok:false};
   }
   if(source==='ml'){
@@ -1684,9 +1724,75 @@ function timeToMin(s){const[a,b]=s.split(':').map(Number);return a*60+b;}
 // all use IST wall-clock derived from epoch ms. Only display formatting may
 // use local time. Verified identical under TZ=UTC/Asia_Kolkata/America_New_York.
 const IST_OFFSET_MS=19800000;
+const MIN_SESSIONS=50;
+const MIN_EXPIRIES=3;
+const MIN_CONTRACTS=10;
+const DEFAULT_SESSION_ANCHOR='session';
+const DEFAULT_SLIPPAGE_MODEL='none';
+const DEFAULT_SIZING='fixed';
+
 function istParts(t){ const d=new Date(t+IST_OFFSET_MS); return {h:d.getUTCHours(),m:d.getUTCMinutes(),y:d.getUTCFullYear(),mo:d.getUTCMonth(),day:d.getUTCDate()}; }
 function istDayKey(t){ const p=istParts(t); return p.y+'-'+p.mo+'-'+p.day; }
 function istDayIndex(t){ return Math.floor((t+IST_OFFSET_MS)/86400000); }
+function floorToSession(t){ return Math.floor((t+IST_OFFSET_MS)/86400000)*86400000 - IST_OFFSET_MS; }
+function bucketByDay(t){ const p=istParts(t); return p.y+'-'+String(p.mo+1).padStart(2,'0')+'-'+String(p.day).padStart(2,'0'); }
+function assessDataHealth(sessions, expiries, contracts){
+  const ok=sessions>=MIN_SESSIONS && expiries>=MIN_EXPIRIES && contracts>=MIN_CONTRACTS;
+  const reason=ok?undefined:`DATA_INSUFFICIENT sessions=${sessions} expiries=${expiries} contracts=${contracts}`;
+  if(!ok) console.warn('[DATA_INSUFFICIENT] sessions='+sessions+' expiries='+expiries+' contracts='+contracts);
+  return {sessions, expiries, contracts, ok, reason};
+}
+function computeTop1Pct(trades){
+  if(!trades||!trades.length) return 0;
+  const pnls=trades.map(t=>Math.abs(t.pnl)).sort((a,b)=>b-a);
+  const total=pnls.reduce((a,b)=>a+b,0);
+  if(total===0) return 0;
+  const k=Math.max(1,Math.ceil(trades.length*0.01));
+  const top=pnls.slice(0,k).reduce((a,b)=>a+b,0);
+  return top/total;
+}
+function expiryGuard(carry, excludeExpiry){
+  if(carry && excludeExpiry) return {blocked:true, reason:'EXPIRY_GUARD'};
+  return {blocked:false};
+}
+function ivGate(ivRank, ivMaxRank, ivMode){
+  ivMaxRank = ivMaxRank!=null?ivMaxRank:0.3;
+  ivMode = ivMode||'block';
+  if(ivRank==null) return {insufficient:false, blocked:false};
+  if(ivRank > ivMaxRank){
+    if(ivMode==='block') return {insufficient:true, blocked:true, reason:'IV_RANK_INSUFFICIENT'};
+    return {insufficient:true, blocked:false, warning:'IV_INSUFFICIENT'};
+  }
+  return {insufficient:false, blocked:false};
+}
+function computeSizingQty(equity, atr, sizing, winRate, payoff){
+  sizing=sizing||'fixed';
+  if(sizing==='fixed' || !isFinite(atr) || atr<=0) return 1;
+  const riskPct=0.5;
+  const pointValue=1;
+  if(sizing==='volTarget'){
+    let qty=(equity * riskPct/100)/(atr*pointValue);
+    return qty;
+  }
+  if(sizing==='kelly'){
+    const wr=winRate!=null?winRate:0.5;
+    const pf=payoff!=null?payoff:1.5;
+    let kelly=0;
+    if(pf>0) kelly=(pf*wr - (1-wr))/pf;
+    kelly=Math.max(0,kelly);
+    const volQty=(equity * riskPct/100)/(atr*pointValue);
+    const kellyQty=kelly*equity/(atr*pointValue);
+    return Math.min(volQty, kellyQty)||volQty;
+  }
+  return 1;
+}
+const MAX_SCOPE_CONTRACTS=8;
+function enforceScope(scope){
+  if(!scope) return {scope:[], truncated:false};
+  if(scope.length>MAX_SCOPE_CONTRACTS) return {scope:scope.slice(0,MAX_SCOPE_CONTRACTS), truncated:true};
+  return {scope, truncated:false};
+}
+
 function istFromNaive(ms){ // reinterpret a locally-parsed naive stamp as IST wall-clock
   const off=new Date(ms).getTimezoneOffset()*60000;
   return ms-off-IST_OFFSET_MS;
@@ -1868,7 +1974,36 @@ function backtest(d, sigPos, opts){
   opts=opts||{};
   const direction=opts.direction||'Both';
   const slPct=(opts.slPct||0)/100, tpPct=(opts.tpPct||0)/100, trailPct=(opts.trailPct||0)/100;
-  const capital0=opts.capital||100000, qty=opts.qty||1, lotSize=opts.lotSize||1;
+  const capital0=opts.capital||100000;
+  let qty=opts.qty||1;
+  const lotSize=opts.lotSize||1;
+  // AC5 sizing: volTarget / kelly override qty
+  if(opts.sizing && opts.sizing!=='fixed'){
+    try{
+      const atrP = opts.atrPeriod||14;
+      const a = atr(d.h,d.l,d.c,atrP);
+      const lastAtr = a[a.length-1];
+      if(isFinite(lastAtr) && lastAtr>0){
+        const eq = capital0;
+        const riskPct = opts.riskPct!=null?opts.riskPct:0.5;
+        if(opts.sizing==='volTarget'){
+          qty=(eq * riskPct/100)/(lastAtr*(opts.pointValue||1));
+          if(opts.maxConcurrent) qty=qty/Math.max(1,opts.maxConcurrent);
+          // corrCap simplified
+        } else if(opts.sizing==='kelly'){
+          // need winRate/payoff, fallback to 0.5/1.5 if not provided
+          const wr = opts.winRate!=null?opts.winRate:0.5;
+          const pf = opts.payoff!=null?opts.payoff:1.5;
+          const b=pf, p=wr, q=1-p;
+          let k=0; if(b>0) k=(b*p - q)/b; k=Math.max(0,k);
+          const volQty=(eq * riskPct/100)/(lastAtr*(opts.pointValue||1))/Math.max(1,opts.maxConcurrent||1);
+          const kellyQty=k*eq/(lastAtr*(opts.pointValue||1));
+          qty=Math.min(volQty, kellyQty)||volQty;
+        }
+        qty=Math.max(0.01, qty);
+      }
+    }catch(e){}
+  }
   const costPerTrade=opts.cost||0;
   const n=d.c.length;
   const mask=opts.sessionMask||sessionMaskFor(d, opts);
@@ -2005,11 +2140,52 @@ function backtest(d, sigPos, opts){
           else if(reason==='ATRTP'){isTarget=true;const k2=opts.atrTpMult||3, ae2=atrEntryPx>0?atrEntryPx:(atrArr?atrArr[i]:0);lvl=position===1?entryPx+k2*ae2:entryPx-k2*ae2;}
           else if(reason==='TIME')lvl=px; // time stop: known only at bar close
           else lvl=position===1?trailPeak*(1-trailPct):trough*(1+trailPct); // TRAIL
+          // ---- slippageModel (G1) : adverse slippage on stop fills only, with gap-through max(stop, open+slippage)
+          let slippage=0;
+          const slippageModel=opts.slippageModel||'none';
+          const spreadTicks=opts.spreadTicks!=null?opts.spreadTicks:1;
+          const tickSize=opts.tickSize!=null?opts.tickSize:0.05;
+          const atrMultSlip=opts.atrMult!=null?opts.atrMult:0.05;
+          const atrPeriodSlip=opts.atrPeriod||14;
+          if(slippageModel==='spread'){
+            slippage=spreadTicks*tickSize;
+            // do not double-count with costs.slippageTicks : take max
+            if(opts.cost && opts.slippageTicks) slippage=Math.max(slippage, opts.slippageTicks*tickSize);
+          } else if(slippageModel==='atr'){
+            let atrSlip=null;
+            if(atrArr && isFinite(atrArr[i])) atrSlip=atrArr[i];
+            else {
+              // compute ATR on fly if not present
+              try{ const tmpAtr=atr(d.h,d.l,d.c,atrPeriodSlip); atrSlip=tmpAtr[i]; }catch(e){ atrSlip=0; }
+            }
+            if(isFinite(atrSlip)) slippage=atrMultSlip*atrSlip;
+          }
           exitPx=lvl;
+          if(slippage>0 && !isTarget && reason!=='TIME'){
+            // apply adverse slippage to stop level
+            if(position===1) lvl = lvl + slippage;
+            else lvl = lvl - slippage;
+            exitPx = lvl;
+          }
           if(reason!=='TIME'&&isFinite(lvl)&&isFinite(ox)){
             const gappedOpen=isTarget?(position===1?ox>lvl:ox<lvl):(position===1?ox<lvl:ox>lvl);
-            if(gappedOpen){exitPx=ox;reason=reason+'_GAP';}
+            if(gappedOpen){
+              // gap-through: fill = max(stop, open+slippage) for long, min for short
+              if(!isTarget && slippage>0){
+                if(position===1) exitPx=Math.max(lvl, ox);
+                else exitPx=Math.min(lvl, ox);
+                // for gap case, slippage already in lvl, but open gap is worse
+                // ensure max(stop, open+slippage) semantic: lvl already includes slippage, so max(lvl, ox) is equivalent to max(stop, open+slippage) when gapped
+              } else {
+                exitPx=ox;
+              }
+              reason=reason+'_GAP';
+            } else if(!isTarget && slippage>0){
+              // non-gap adverse slippage already applied via lvl
+            }
           }
+          // ensure gapFill max(stop, open+slippage) for slippage model even when not gapped? already done
+          
         }
         const units=qty*lotSize;
         let pnl=(position===1?(exitPx-entryPx):(entryPx-exitPx))*units - costPerTrade;
@@ -2090,7 +2266,12 @@ function backtest(d, sigPos, opts){
   const ddn=dret.filter(x=>x<0);const dsdn=sd(ddn,mean(ddn));
   const sortino=dsdn>0?dm/dsdn*Math.sqrt(252):(dm>0?99.99:0);
   const expectancy=trades.length?net/trades.length:0;
-  return {trades,equity:eq,dd,metrics:{netPnL:net,winRate:wr,totalTrades:trades.length,profitFactor:pf,maxDD:maxDD,sharpe,sortino,expectancy,finalCapital:run,grossProfit:grossP,grossLoss:grossL,tradesPerDay,days,ddPeakTime:d.t[peakIdx],ddTroughTime:d.t[troughIdx],totalCosts:costSum,grossPreCost:(run-capital0)+costSum}};
+  const top1Pct = computeTop1Pct(trades);
+  // dataHealth on result
+  let sessionsCount=0;
+  try{ const seen={}; for(let i=0;i<n;i++){ const k=istDayIndex(d.t[i]); if(!seen[k]){seen[k]=1; sessionsCount++;}} }catch(e){ sessionsCount=0; }
+  const dataHealth = assessDataHealth(sessionsCount, 0, 0);
+  return {trades,equity:eq,dd,metrics:{netPnL:net,winRate:wr,totalTrades:trades.length,profitFactor:pf,maxDD:maxDD,sharpe,sortino,expectancy,finalCapital:run,grossProfit:grossP,grossLoss:grossL,tradesPerDay,days,ddPeakTime:d.t[peakIdx],ddTroughTime:d.t[troughIdx],totalCosts:costSum,grossPreCost:(run-capital0)+costSum,top1Pct, dataHealth}, dataHealth, top1Pct};
 }
 
 function expandRange(min,max,step){
@@ -2480,6 +2661,36 @@ function paperEligible(row, o){
   if(o.cost!=null&&!(o.cost>0)){
     if(o.allowZeroCost) warnings.push('signal-only run (costs zeroed — size positions for real friction before trading)');
     else reasons.push('zero-cost run (set realistic cost/trade)');
+  }
+  // AC1 DataHealth gate
+  const dh = (row.m && row.m.dataHealth) || row.dataHealth || o.dataHealth;
+  if(dh && dh.ok===false) reasons.push(`DATA_INSUFFICIENT sessions=${dh.sessions} expiries=${dh.expiries||0} contracts=${dh.contracts||0}`);
+  if(o.sessions!=null && o.sessions<50) reasons.push(`DATA_INSUFFICIENT sessions=${o.sessions}`);
+  // AC10 ExpiryGuard
+  const carry = (o.carry!=null?o.carry:(row.carry||false));
+  const excl = (o.excludeExpiry!=null?o.excludeExpiry:(row.excludeExpiry||false));
+  if(carry && excl) reasons.push('EXPIRY_GUARD carry+excludeExpiry');
+  // AC7 IV gate
+  const ivRank = o.ivRank!=null?o.ivRank:(row.ivRank!=null?row.ivRank:null);
+  const ivMaxRank = o.ivMaxRank!=null?o.ivMaxRank:(row.ivMaxRank!=null?row.ivMaxRank:0.3);
+  const ivMode = o.ivMode||row.ivMode||'block';
+  if(ivRank!=null && ivRank > ivMaxRank){
+    if(ivMode==='block') reasons.push(`IV_RANK_INSUFFICIENT ivRank=${ivRank} > ${ivMaxRank}`);
+    else warnings.push(`IV_INSUFFICIENT ivRank=${ivRank}`);
+  }
+  // AC9 Concentration cap
+  const top1 = row.m.top1Pct!=null?row.m.top1Pct:(row.top1Pct!=null?row.top1Pct:null);
+  if(top1!=null && top1 >= 0.40) reasons.push(`CONCENTRATION_VETO TOP1_PCT_GTE_40 top1Pct=${top1.toFixed(2)}`);
+  // AC6 regime fallback
+  if(o.fallbackDays!=null && o.sessions!=null){
+    const ratio = o.sessions>0? o.fallbackDays/o.sessions : 0;
+    const confs = o.confidences || [];
+    const maxConf = confs.length?Math.max(...confs): (o.maxConf!=null?o.maxConf:1);
+    if(ratio>0.30 && maxConf < (o.confGate||0.6)) reasons.push(`LOW_REGIME_CONFIDENCE fallbackDays=${o.fallbackDays}/${o.sessions}`);
+  }
+  if(row.fallbackDays!=null && row.sessions!=null){
+    const ratio = row.sessions>0? row.fallbackDays/row.sessions : 0;
+    if(ratio>0.30 && (row.maxConf!=null?row.maxConf:1) < 0.6) reasons.push(`LOW_REGIME_CONFIDENCE fallbackDays=${row.fallbackDays}`);
   }
   if(row.robustScore==null) reasons.push('no robustness score (worker path required)');
   else if(!(row.robustScore>=th)) reasons.push(`robustScore ${(row.robustScore||0).toFixed(2)} < ${th}`);
@@ -3116,7 +3327,10 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,todBucket15,aggregateProfile,classifyCell,mergeBuckets,classifyTransfer,consumeProfile,profileId,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,probabilisticSharpe,expectedMaxSharpe,benchmarkSharpe,deflatedSharpe,perObservationSharpe,effectiveN,normInv,normCdf,EFFECTIVE_N_DEF,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,floorToSession,bucketByDay,assessDataHealth,computeTop1Pct,expiryGuard,ivGate,computeSizingQty,enforceScope,MIN_SESSIONS,MIN_EXPIRIES,MIN_CONTRACTS,DEFAULT_SESSION_ANCHOR,DEFAULT_SLIPPAGE_MODEL,DEFAULT_SIZING,MAX_SCOPE_CONTRACTS,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,todBucket15,aggregateProfile,classifyCell,mergeBuckets,classifyTransfer,consumeProfile,profileId,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,probabilisticSharpe,expectedMaxSharpe,benchmarkSharpe,deflatedSharpe,perObservationSharpe,effectiveN,normInv,normCdf,EFFECTIVE_N_DEF,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
+if(typeof globalThis!=='undefined') globalThis.XBOST_ENGINE=api;
+if(typeof global!=='undefined') global.XBOST_ENGINE=api;
+if(typeof self!=='undefined') self.XBOST_ENGINE=api;
 })(typeof self!=='undefined'?self:this);

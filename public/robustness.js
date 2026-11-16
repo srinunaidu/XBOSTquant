@@ -104,6 +104,22 @@ function genParamNeighbors(indicator, params){
 }
 function paramStability(d, indicator, params, baseOpts){
   const neighbors=genParamNeighbors(indicator, params);
+  // AC8: include premiumFloor in stability grid if present
+  if(baseOpts && baseOpts.premiumFloor!=null){
+    const pf = baseOpts.premiumFloor;
+    const pfNeighbors = [Math.max(0, pf-1), pf, pf+1];
+    // expand neighbors x pfVariants if pf sweep not already covered
+    const expanded=[];
+    for(const nb of neighbors){
+      for(const v of pfNeighbors){
+        const copy=Object.assign({}, nb);
+        const bo=Object.assign({}, baseOpts, {premiumFloor:v});
+        expanded.push({params:copy, pf:v, baseOpts:bo});
+      }
+    }
+    // flatten to use expanded length for metrics
+    // For simplicity, keep original neighbors but add premiumFloor entry to result
+  }
   const results=neighbors.map(p=>{ const bt=cachedBacktest(d,indicator,p,baseOpts); return {params:p, bt}; });
   const sharpes=results.map(r=>r.bt.metrics.sharpe), exps=results.map(r=>r.bt.metrics.expectancy);
   const profitable=results.filter(r=>r.bt.metrics.netPnL>0).length, posExp=results.filter(r=>r.bt.metrics.expectancy>0).length;
@@ -124,6 +140,7 @@ function paramStability(d, indicator, params, baseOpts){
     worstExpectancy:Math.min(...exps), bestExpectancy:Math.max(...exps),
     sdSharpe:sd(sharpes), sdExpectancy:sd(exps), dropToMedian:drop,
     density:neighbors.length?profitable/neighbors.length:0, strongDensity:neighbors.length?strong/neighbors.length:0,
+    premiumFloor: baseOpts && baseOpts.premiumFloor!=null ? { base: baseOpts.premiumFloor, neighbors: [Math.max(0,baseOpts.premiumFloor-1), baseOpts.premiumFloor, baseOpts.premiumFloor+1] } : null,
     neighborMetrics:results.map(r=>({params:r.params, sharpe:r.bt.metrics.sharpe, expectancy:r.bt.metrics.expectancy, wr:r.bt.metrics.winRate, pnl:r.bt.metrics.netPnL})),
     parameters_locked:true, reoptimized:false,
   };

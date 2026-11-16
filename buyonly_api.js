@@ -77,6 +77,13 @@ module.exports = function registerBuyOnly(app) {
     if (cfg.noRegimeRestrict) flags.push('--no-regime-restrict');
     if (cfg.hypothesis) flags.push('--single-hypothesis', String(cfg.hypothesis).slice(0, 40));
 
+    const BUYONLY_MAX_PERMS = Number(process.env.BUYONLY_MAX_PERMS || 200);
+    const perms = Math.min(200, Math.max(0, num(cfg.timingPerms, 20)));
+    // also check if implied perms > cap (free tier)
+    const requestedPerms = num(cfg.timingPerms, 20);
+    if (requestedPerms > BUYONLY_MAX_PERMS) {
+      return res.status(429).json({ error: 'BUYONLY_CAP_EXCEEDED', detail: `perms ${requestedPerms} > ${BUYONLY_MAX_PERMS}` });
+    }
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'xbost-buyonly-'));
     const csvPath = path.join(dir, 'chain.csv');
     const bundlePath = path.join(dir, 'bundle.json');

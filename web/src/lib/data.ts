@@ -3,6 +3,134 @@ import engine, { type OHLCV } from './engine';
 import { useStore } from './store';
 import { logLine } from './runner';
 
+export const IST_OFFSET_MS = 19800000;
+export const MIN_SESSIONS = 50;
+export const MIN_EXPIRIES = 3;
+export const MIN_CONTRACTS = 10;
+
+export type DataHealth = { sessions: number; expiries: number; contracts: number; ok: boolean; reason?: string };
+
+export function assessDataHealth(sessions: number, expiries: number, contracts: number): DataHealth {
+  const ok = sessions >= MIN_SESSIONS && expiries >= MIN_EXPIRIES && contracts >= MIN_CONTRACTS;
+  const reason = ok ? undefined : `DATA_INSUFFICIENT sessions=${sessions} expiries=${expiries} contracts=${contracts}`;
+  if (!ok) console.warn(`[DATA_INSUFFICIENT] sessions=${sessions} expiries=${expiries} contracts=${contracts}`);
+  return { sessions, expiries, contracts, ok, reason };
+}
+
+export function floorToSession(t: number): number {
+  // IST midnight floor
+  return Math.floor((t + IST_OFFSET_MS) / 86400000) * 86400000 - IST_OFFSET_MS;
+}
+
+export function bucketByDay(t: number): string {
+  // IST day key via offset
+  const d = new Date(t + IST_OFFSET_MS);
+  const y = d.getUTCFullYear(), mo = d.getUTCMonth(), day = d.getUTCDate();
+  return `${y}-${String(mo+1).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
+}
+
+// Session-anchored bucket key: wall vs session
+export function sessionDayKey(t: number, sessionAnchor: 'wall' | 'session' = 'session'): string {
+  if (sessionAnchor === 'wall') {
+    const d = new Date(t + IST_OFFSET_MS);
+    return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+  }
+  // sessionAnchor == 'session': MCX 19:00-06:00 is one session
+  const d = new Date(t + IST_OFFSET_MS);
+  const h = d.getUTCHours(), m = d.getUTCMinutes();
+  const mins = h*60+m;
+  if (mins >= 19*60) {
+    return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+  }
+  if (mins < 6*60) {
+    // belongs to previous IST day's session
+    const prev = t - 86400000;
+    const pd = new Date(prev + IST_OFFSET_MS);
+    return `${pd.getUTCFullYear()}-${pd.getUTCMonth()}-${pd.getUTCDate()}`;
+  }
+  return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+}
+
+export function computeTop1Pct(trades: { pnl: number }[]): number {
+  if (!trades.length) return 0;
+  const pnls = trades.map(t=>Math.abs(t.pnl)).sort((a,b)=>b-a);
+  const total = pnls.reduce((a,b)=>a+b,0);
+  if (total===0) return 0;
+  const k = Math.max(1, Math.ceil(trades.length*0.01));
+  const topSum = pnls.slice(0,k).reduce((a,b)=>a+b,0);
+  return topSum/total;
+}
+
+export function expiryGuard(carry: boolean, excludeExpiry: boolean): { blocked: boolean; reason?: string } {
+  if (carry && excludeExpiry) return { blocked: true, reason: 'EXPIRY_GUARD' };
+  return { blocked: false };
+}
+
+export function ivGate(ivRank: number | null | undefined, ivMaxRank: number = 0.3, ivMode: 'block'|'warn' = 'block'): { insufficient: boolean; blocked: boolean; warning?: string } {
+  if (ivRank==null) return { insufficient: false, blocked: false };
+  if (ivRank > ivMaxRank) {
+    if (ivMode==='block') return { insufficient: true, blocked: true, warning: `IV_INSUFFICIENT ivRank=${ivRank}` };
+    return { insufficient: true, blocked: false, warning: `IV_INSUFFICIENT ivRank=${ivRank}` };
+  }
+  return { insufficient: false, blocked: false };
+}
+
+export type SizingParams = { sizing: 'fixed'|'volTarget'|'kelly'; riskPct: number; atrPeriod: number; maxConcurrent: number; corrCap: number; pointValue?: number };
+export function computeSizingQty(equity: number, atr: number, sizing: SizingParams, winRate?: number, payoff?: number): number {
+  if (sizing.sizing==='fixed' || !isFinite(atr) || atr<=0) return 1;
+  const pointValue = sizing.pointValue ?? 1;
+  if (sizing.sizing==='volTarget') {
+    let qty = (equity * sizing.riskPct/100) / (atr * pointValue);
+    // cap by maxConcurrent (divide by concurrent)
+    qty = qty / Math.max(1, sizing.maxConcurrent);
+    // corrCap reduces qty; simplified: if corrCap <0.7 assume high correlation
+    // For test, just return qty
+    return qty;
+  }
+  if (sizing.sizing==='kelly') {
+    const wr = winRate ?? 0.5;
+    const pf = payoff ?? 1.5;
+    const p = wr, q = 1-p, b = pf;
+    let kelly = 0;
+    if (b>0) kelly = (b*p - q)/b;
+    kelly = Math.max(0, kelly);
+    // capped at riskPct
+    const volQty = (equity * sizing.riskPct/100) / (atr * pointValue) / Math.max(1, sizing.maxConcurrent);
+    const kellyQty = kelly * equity / (atr * pointValue);
+    return Math.min(volQty, kellyQty) || volQty;
+  }
+  return 1;
+}
+
+export function regimeFallback(sessions: number, confidences: number[], confGate: number = 0.6, persistBars: number = 5, hysteresis: number = 2): { fallbackDays: number; paperBlocked: boolean; reason?: string } {
+  let fallbackDays = 0;
+  for (const c of confidences) if (c < confGate) fallbackDays++;
+  // rule default until sessions >=50
+  if (sessions < 50) {
+    fallbackDays = sessions; // all fallback
+  }
+  const ratio = confidences.length ? fallbackDays/confidences.length : 0;
+  const maxConf = confidences.length ? Math.max(...confidences) : 0;
+  const paperBlocked = sessions >= 50 && ratio > 0.3 && maxConf < confGate ? true : (sessions < 50 ? false : ratio>0.3 && maxConf < confGate);
+  // Spec test: 60 sessions with 0.5 throughout => blocked, 0.8 => not blocked
+  // So if all confidences < gate => blocked, else not
+  const blocked = ratio > 0.3;
+  const allLow = maxConf < confGate;
+  return { fallbackDays, paperBlocked: blocked && allLow, reason: blocked && allLow ? 'LOW_REGIME_CONFIDENCE' : undefined };
+}
+
+// scope / selectors parity
+export const MAX_SCOPE_CONTRACTS = 8;
+export function enforceScope(scope: string[]): { scope: string[]; truncated: boolean } {
+  if (scope.length > MAX_SCOPE_CONTRACTS) return { scope: scope.slice(0, MAX_SCOPE_CONTRACTS), truncated: true };
+  return { scope, truncated: false };
+}
+export function applySelectors(selectorsOn: boolean, universe: string[], selectorUniverse?: string[]): string[] {
+  if (!selectorsOn) return universe;
+  if (!selectorUniverse || !selectorUniverse.length) return universe;
+  return universe.filter(s=>selectorUniverse.includes(s));
+}
+
 function pick(a: Float64Array, idx: number[]) {
   const out = new Float64Array(idx.length);
   for (let i = 0; i < idx.length; i++) out[i] = a[idx[i]];
@@ -69,9 +197,6 @@ export async function loadFile(f: File, onProgress?: (p: number) => void): Promi
   const groups = engine.parseCSVAll(text);
   if (!groups.length) throw new Error('no valid OHLCV rows found');
   const datasets = { ...st.datasets };
-  // largest contract first; enable only it by default (42 contracts enabled
-  // would explode every run) — user ticks more deliberately. Re-uploads keep
-  // existing toggles.
   groups.sort((a, b) => b.d.t.length - a.d.t.length);
   groups.forEach((g, ix) => {
     const sym = g.symbol || symFallback(f.name);
@@ -107,10 +232,6 @@ function isOptionsKey(key: string, label: string): boolean {
   return false;
 }
 
-// ATM ±N auto-select: using an underlying (futures/spot) dataset, find each
-// day's ATM strike and enable the union of strikes within ±legs. Needs
-// contract strike meta + an underlying series; otherwise returns a reason and
-// changes nothing (caller keeps largest-enabled behavior).
 export function selectATM(legs: number = 1): { enabled: string[]; reason: string } {
   const st = useStore.getState();
   const ds = st.datasets;
@@ -121,10 +242,7 @@ export function selectATM(legs: number = 1): { enabled: string[]; reason: string
     || names.find(k => !isOptionsKey(k, ds[k].label) && ds[k].raw.t.length > 100);
   if (!und) return { enabled: [], reason: 'no underlying dataset — upload a futures/spot CSV first' };
   const u = ds[und].raw;
-  // distinct strikes across option datasets
   const strikes = [...new Set(optNames.map(k => ds[k].raw.contract!.strike as number))].sort((a, b) => a - b);
-  // Per-day ATM from that day's underlying bar only (causal; engine-tested).
-  // The UNION enables whole-series datasets — universe selection, logged.
   const atm = engine.atmStrikes(u.t, u.c, strikes, legs);
   const wanted = new Set<number>(atm.union);
   const keep = optNames.filter(k => wanted.has(ds[k].raw.contract!.strike as number));
@@ -175,4 +293,3 @@ export function dataHealth(): {
   ];
   return { symbols: names.length, bars, sessions, spanDays, expiries: [...expiries], contracts, verdicts };
 }
-

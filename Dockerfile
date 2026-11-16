@@ -22,8 +22,12 @@ RUN npm ci --omit=dev
 COPY server.js buyonly_api.js buyonly_fake.js ./
 COPY xbost_option_discovery/ ./xbost_option_discovery/
 COPY public/ ./public/
+RUN mkdir -p /app/data
 COPY --from=webbuild /app/web/dist ./web/dist
 # NOTE: mount your 1-min CSV at /app/public/HDFCBANK_minute.csv (or upload via UI)
-EXPOSE 8901
-ENV PORT=8901
+VOLUME /app/data
+EXPOSE 10000
+ENV PORT=10000
+ENV USERS_FILE=/app/data/users.json
+ENV BUYONLY_MAX_PERMS=200
 CMD ["node", "server.js"]
