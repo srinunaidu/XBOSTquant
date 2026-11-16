@@ -103,8 +103,23 @@ function genParamNeighbors(indicator, params){
   return res.map(list=>{ const o=Object.assign({},params); for(const kv of list) o[kv.key]=kv.val; return o; });
 }
 function paramStability(d, indicator, params, baseOpts){
-  const neighbors=genParamNeighbors(indicator, params);
-  const results=neighbors.map(p=>{ const bt=cachedBacktest(d,indicator,p,baseOpts); return {params:p, bt}; });
+  let neighbors=genParamNeighbors(indicator, params);
+  let expandedForFloor = null;
+  // AC8: include premiumFloor in stability grid if present — expand neighbors to include pf variants
+  if(baseOpts && baseOpts.premiumFloor!=null){
+    const pf = baseOpts.premiumFloor;
+    const pfNeighbors = [Math.max(0, pf-1), pf, pf+1];
+    const expanded=[];
+    for(const nb of neighbors){
+      for(const v of pfNeighbors){
+        const copy=Object.assign({}, nb);
+        expanded.push({params:copy, pf:v});
+      }
+    }
+    expandedForFloor = expanded;
+  }
+  // run cachedBacktest for each expanded neighbor with premiumFloor variant, else base neighbors
+  const results = expandedForFloor ? expandedForFloor.map(e=>{ const bo=Object.assign({}, baseOpts, {premiumFloor: e.pf}); const bt=cachedBacktest(d,indicator,e.params,bo); return {params:e.params, pf:e.pf, bt}; }) : neighbors.map(p=>{ const bt=cachedBacktest(d,indicator,p,baseOpts); return {params:p, bt}; });
   const sharpes=results.map(r=>r.bt.metrics.sharpe), exps=results.map(r=>r.bt.metrics.expectancy);
   const profitable=results.filter(r=>r.bt.metrics.netPnL>0).length, posExp=results.filter(r=>r.bt.metrics.expectancy>0).length;
   const strong=results.filter(r=>r.bt.metrics.sharpe>1.0).length;
@@ -113,17 +128,19 @@ function paramStability(d, indicator, params, baseOpts){
   const medSharpe=median(sharpes), medExp=median(exps);
   const p5Sharpe=percentile(sharpes,0.05), p95Sharpe=percentile(sharpes,0.95);
   const drop=baseSharpe?((baseSharpe-medSharpe)/Math.abs(baseSharpe)):0;
+  const total = results.length;
   return {
-    neighbors:neighbors.length, profitable, posExp, strong,
-    profitableDensity:neighbors.length?profitable/neighbors.length:0,
-    posExpDensity:neighbors.length?posExp/neighbors.length:0,
-    strongDensity:neighbors.length?strong/neighbors.length:0,
+    neighbors: total, profitable, posExp, strong,
+    profitableDensity:total?profitable/total:0,
+    posExpDensity:total?posExp/total:0,
+    strongDensity:total?strong/total:0,
     medianSharpe:medSharpe, medianExpectancy:medExp, medianWR:median(results.map(r=>r.bt.metrics.winRate)),
     p5Sharpe, p95Sharpe, p5Expectancy:percentile(exps,0.05),
     worstSharpe:Math.min(...sharpes), bestSharpe:Math.max(...sharpes),
     worstExpectancy:Math.min(...exps), bestExpectancy:Math.max(...exps),
     sdSharpe:sd(sharpes), sdExpectancy:sd(exps), dropToMedian:drop,
-    density:neighbors.length?profitable/neighbors.length:0, strongDensity:neighbors.length?strong/neighbors.length:0,
+    density:total?profitable/total:0, strongDensity:total?strong/total:0,
+    premiumFloor: baseOpts && baseOpts.premiumFloor!=null ? { base: baseOpts.premiumFloor, neighbors: [Math.max(0,baseOpts.premiumFloor-1), baseOpts.premiumFloor, baseOpts.premiumFloor+1] } : null,
     neighborMetrics:results.map(r=>({params:r.params, sharpe:r.bt.metrics.sharpe, expectancy:r.bt.metrics.expectancy, wr:r.bt.metrics.winRate, pnl:r.bt.metrics.netPnL})),
     parameters_locked:true, reoptimized:false,
   };

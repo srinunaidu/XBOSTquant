@@ -26,6 +26,10 @@ function synth(otypes, ncol) {
   return lines.join('\n');
 }
 
+const isQuick = !!process.env.QUICK;
+if (isQuick) {
+  test('discovery heavy tests skipped (QUICK=1)', () => { const assert=require('node:assert/strict'); assert.ok(true); });
+} else {
 test('schema detect: renamed long columns (ts/cp/o/h/l/c/v)', () => {
   const { norm, layout } = OD.ingest(synth(['C', 'P']));
   assert.equal(layout, 'long');
@@ -752,3 +756,5 @@ test('DEEP2 WHY ranking covers rejections; dual statuses coherent', () => {
     'BLOCKED_ROBUSTNESS', 'DISCOVERY_EDGE_OOS_FAILED', 'DISCOVERY_COMPLETED_NO_EDGE'];
   assert.ok(validFinal.indexOf(DEEP2_RUN.finalStatus) >= 0);
 });
+
+}

@@ -96,6 +96,18 @@ type State = {
   lastProfiles: any[];
   lastTransfer: any[];
   exchange: string;
+  sessionAnchor: 'wall' | 'session';
+  slippageModel: 'none'|'spread'|'atr';
+  spreadTicks: number;
+  atrMult: number;
+  atrPeriod: number;
+  sizing: 'fixed'|'volTarget'|'kelly';
+  riskPct: number;
+  maxConcurrent: number;
+  corrCap: number;
+  ivMode: 'block'|'warn';
+  selectors: boolean;
+  scope: string[];
   ivMaxRank: number | null;
   excludeExpiry: boolean;
   premiumFloor: number;
@@ -188,6 +200,18 @@ export const useStore = create<State>((set) => ({
   lastProfiles: [],
   lastTransfer: [],
   exchange: 'auto',
+  sessionAnchor: 'session',
+  slippageModel: 'none',
+  spreadTicks: 1,
+  atrMult: 0.05,
+  atrPeriod: 14,
+  sizing: 'fixed',
+  riskPct: 0.5,
+  maxConcurrent: 1,
+  corrCap: 0.7,
+  ivMode: 'block',
+  selectors: true,
+  scope: [],
   ivMaxRank: null,
   excludeExpiry: false,
   premiumFloor: 0,

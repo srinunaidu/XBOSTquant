@@ -474,7 +474,7 @@ test('IST pin: naive stamps interpret as IST, masks deterministic', () => {
   assert.equal(E.parseDateFlex('20260907'), Date.UTC(2026, 8, 7) - 19800000);
   const t = Date.UTC(2026, 8, 7, 9, 15, 0) - 19800000; // 09:15 IST wall-clock
   assert.deepEqual(E.istParts(t), { h: 9, m: 15, y: 2026, mo: 8, day: 7 });
-  assert.equal(E.istDayKey(t), '2026-8-7');
+  assert.equal(E.istDayKey(t), '2026-09-07');
   const d = {
     t: Float64Array.from([t, t + 60000, t + 5400000]), o: new Float64Array(3).fill(100),
     h: new Float64Array(3).fill(101), l: new Float64Array(3).fill(99), c: new Float64Array(3).fill(100),

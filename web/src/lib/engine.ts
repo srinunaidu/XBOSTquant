@@ -154,7 +154,7 @@ export interface Engine {
 // on first actual use (post-login), when the script serves 200.
 const engine: Engine = new Proxy({} as Engine, {
   get(_t, prop) {
-    const E = (window as unknown as { XBOST_ENGINE?: Engine }).XBOST_ENGINE;
+    const E = ((typeof window !== 'undefined' ? (window as any).XBOST_ENGINE : undefined) || (typeof globalThis !== 'undefined' ? (globalThis as any).XBOST_ENGINE : undefined) || (typeof global !== 'undefined' ? (global as any).XBOST_ENGINE : undefined)) as Engine | undefined;
     if (!E) throw new Error('XBOST_ENGINE not loaded — sign in first (engine.js is auth-guarded).');
     const v = (E as unknown as Record<string | symbol, unknown>)[prop];
     return typeof v === 'function' ? (v as Function).bind(E) : v;

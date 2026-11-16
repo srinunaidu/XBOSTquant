@@ -10,14 +10,21 @@ const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
 
-const PORT = process.env.PORT || 8901;
+const PORT = process.env.PORT || 10000;
 // Serve the React build when present, else fall back to the classic terminal.
 const DIST_DIR = path.join(__dirname, 'web', 'dist');
 const PUBLIC_DIR = fs.existsSync(path.join(DIST_DIR, 'index.html')) ? DIST_DIR : path.join(__dirname, 'public');
-const USERS_FILE = process.env.USERS_FILE || path.join(__dirname, 'users.json');
+const USERS_FILE = process.env.USERS_FILE || '/app/data/users.json';
+if (process.env.USERS_FILE && !require('fs').existsSync(require('path').dirname(USERS_FILE))) console.warn(`[auth] USERS_FILE dir ${require('path').dirname(USERS_FILE)} does not exist — will attempt to create`);
+if (!process.env.USERS_FILE) console.warn('[auth] USERS_FILE not set — using default /app/data/users.json (ensure /app/data is a persistent disk)');
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'changeme';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'xbost-dev-secret-change-me';
+const BUYONLY_MAX_PERMS = Number(process.env.BUYONLY_MAX_PERMS || 200);
+// Ensure data dir exists for Render disk mount (best-effort, no throw in local dev/CI)
+try { require('fs').mkdirSync('/app/data', {recursive:true}); } catch(e){ /* cannot create /app/data in local env, will fallback */ }
+// fallback: if /app/data not writable, use repo-local users.json
+try { require('fs').accessSync('/app/data', require('fs').constants.W_OK); } catch(e) { /* use USERS_FILE as is, saveUsers will mkdir parent */ }
 
 if (!process.env.SESSION_SECRET) console.warn('[auth] SESSION_SECRET not set — using dev default. Set it in production.');
 if (!process.env.ADMIN_PASS) console.warn('[auth] ADMIN_PASS not set — admin password is "changeme". Change it on first login.');
@@ -26,13 +33,14 @@ if (!process.env.ADMIN_PASS) console.warn('[auth] ADMIN_PASS not set — admin p
 let users = [];
 function loadUsers() {
   try { users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); if (!Array.isArray(users)) users = []; }
-  catch (e) { users = []; }
+  catch (e) { try { const fb=require('path').join(__dirname,'users.json'); users = JSON.parse(require('fs').readFileSync(fb,'utf8')); if(!Array.isArray(users)) users=[]; } catch(e2){ users = []; } }
 }
 function saveUsers() {
-  fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true });
+  try { fs.mkdirSync(path.dirname(USERS_FILE), { recursive: true }); } catch(e){ /* fallback to local users.json if /app/data not writable */ try { const fallback = require('path').join(__dirname, 'users.json'); const tmp2=fallback+'.tmp'; require('fs').writeFileSync(tmp2, JSON.stringify(users)); require('fs').renameSync(tmp2, fallback); return; } catch(e2){} throw e; }
   const tmp = USERS_FILE + '.tmp';
-  fs.writeFileSync(tmp, JSON.stringify(users));
-  fs.renameSync(tmp, USERS_FILE);
+  try { fs.writeFileSync(tmp, JSON.stringify(users)); fs.renameSync(tmp, USERS_FILE); } catch(e){ // fallback
+    try { const fallback = require('path').join(__dirname, 'users.json'); const tmp2=fallback+'.tmp'; require('fs').writeFileSync(tmp2, JSON.stringify(users)); require('fs').renameSync(tmp2, fallback); } catch(e2){ throw e; }
+  }
 }
 loadUsers();
 
@@ -92,6 +100,7 @@ app.post('/api/logout', (req, res) => {
   req.session.destroy(() => res.json({ ok: true }));
 });
 
+app.get('/health', (req,res)=>res.json({ok:true, uptime:process.uptime()}));
 app.get('/api/me', (req, res) => {
   if (!req.session.user) return res.status(401).json({ error: 'unauthorized' });
   res.json({ user: req.session.user });
