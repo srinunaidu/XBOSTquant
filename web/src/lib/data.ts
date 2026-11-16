@@ -33,22 +33,22 @@ export function bucketByDay(t: number): string {
 export function sessionDayKey(t: number, sessionAnchor: 'wall' | 'session' = 'session'): string {
   if (sessionAnchor === 'wall') {
     const d = new Date(t + IST_OFFSET_MS);
-    return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
   }
   // sessionAnchor == 'session': MCX 19:00-06:00 is one session
   const d = new Date(t + IST_OFFSET_MS);
   const h = d.getUTCHours(), m = d.getUTCMinutes();
   const mins = h*60+m;
   if (mins >= 19*60) {
-    return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
   }
   if (mins < 6*60) {
     // belongs to previous IST day's session
     const prev = t - 86400000;
     const pd = new Date(prev + IST_OFFSET_MS);
-    return `${pd.getUTCFullYear()}-${pd.getUTCMonth()}-${pd.getUTCDate()}`;
+    return `${pd.getUTCFullYear()}-${String(pd.getUTCMonth()+1).padStart(2,'0')}-${String(pd.getUTCDate()).padStart(2,'0')}`;
   }
-  return `${d.getUTCFullYear()}-${d.getUTCMonth()}-${d.getUTCDate()}`;
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
 }
 
 export function computeTop1Pct(trades: { pnl: number }[]): number {
@@ -83,8 +83,9 @@ export function computeSizingQty(equity: number, atr: number, sizing: SizingPara
     let qty = (equity * sizing.riskPct/100) / (atr * pointValue);
     // cap by maxConcurrent (divide by concurrent)
     qty = qty / Math.max(1, sizing.maxConcurrent);
-    // corrCap reduces qty; simplified: if corrCap <0.7 assume high correlation
-    // For test, just return qty
+    // corrCap: when correlation cap <1, reduce qty proportionally (no-op if >=1)
+    // Documented: corrCap 0..1 scales exposure; e.g. 0.7 => 30% reduction
+    if (isFinite(sizing.corrCap) && sizing.corrCap < 1 && sizing.corrCap > 0) qty *= sizing.corrCap;
     return qty;
   }
   if (sizing.sizing==='kelly') {
@@ -102,21 +103,37 @@ export function computeSizingQty(equity: number, atr: number, sizing: SizingPara
   return 1;
 }
 
-export function regimeFallback(sessions: number, confidences: number[], confGate: number = 0.6, persistBars: number = 5, hysteresis: number = 2): { fallbackDays: number; paperBlocked: boolean; reason?: string } {
+export function regimeFallback(sessions: number, confidences: number[], confGate: number = 0.6, persistBars: number = 5, hysteresis: number = 2): { fallbackDays: number; paperBlocked: boolean; reason?: string; persistBars: number; hysteresis: number } {
+  persistBars = Math.max(1, Math.round(persistBars || 5));
+  hysteresis = Math.max(0, Math.round(hysteresis || 2));
   let fallbackDays = 0;
-  for (const c of confidences) if (c < confGate) fallbackDays++;
-  // rule default until sessions >=50
   if (sessions < 50) {
-    fallbackDays = sessions; // all fallback
+    fallbackDays = sessions; // rule-only: all fallback
+  } else if (confidences.length) {
+    // persistence + hysteresis smoothing on fallback flag: fallback must persist `persistBars` sessions before confirmed,
+    // with extra `hysteresis` cost after each switch (anti flicker). Mirrors smoothRegime.
+    const n = confidences.length;
+    const raw = confidences.map(c => c < confGate ? 1 : 0);
+    let confirmed = raw[0] ?? 0;
+    let need = persistBars, contender = -1, run = 0;
+    const smoothed: number[] = [];
+    for (let i=0;i<n;i++) {
+      const r = raw[i];
+      if (r===confirmed) { contender=-1; run=0; }
+      else {
+        if (r!==contender) { contender=r; run=1; }
+        else run++;
+        if (run>=need) { confirmed=r; need=persistBars+hysteresis; contender=-1; run=0; }
+      }
+      smoothed.push(confirmed);
+    }
+    fallbackDays = smoothed.reduce((a,v)=>a+v,0);
   }
-  const ratio = confidences.length ? fallbackDays/confidences.length : 0;
+  const ratio = confidences.length ? fallbackDays/confidences.length : (sessions? fallbackDays/sessions : 0);
   const maxConf = confidences.length ? Math.max(...confidences) : 0;
-  const paperBlocked = sessions >= 50 && ratio > 0.3 && maxConf < confGate ? true : (sessions < 50 ? false : ratio>0.3 && maxConf < confGate);
-  // Spec test: 60 sessions with 0.5 throughout => blocked, 0.8 => not blocked
-  // So if all confidences < gate => blocked, else not
   const blocked = ratio > 0.3;
   const allLow = maxConf < confGate;
-  return { fallbackDays, paperBlocked: blocked && allLow, reason: blocked && allLow ? 'LOW_REGIME_CONFIDENCE' : undefined };
+  return { fallbackDays, paperBlocked: blocked && allLow, reason: blocked && allLow ? 'LOW_REGIME_CONFIDENCE' : undefined, persistBars, hysteresis };
 }
 
 // scope / selectors parity

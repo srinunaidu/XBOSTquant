@@ -1732,7 +1732,7 @@ const DEFAULT_SLIPPAGE_MODEL='none';
 const DEFAULT_SIZING='fixed';
 
 function istParts(t){ const d=new Date(t+IST_OFFSET_MS); return {h:d.getUTCHours(),m:d.getUTCMinutes(),y:d.getUTCFullYear(),mo:d.getUTCMonth(),day:d.getUTCDate()}; }
-function istDayKey(t){ const p=istParts(t); return p.y+'-'+p.mo+'-'+p.day; }
+function istDayKey(t){ const p=istParts(t); return p.y+'-'+String(p.mo+1).padStart(2,'0')+'-'+String(p.day).padStart(2,'0'); }
 function istDayIndex(t){ return Math.floor((t+IST_OFFSET_MS)/86400000); }
 function floorToSession(t){ return Math.floor((t+IST_OFFSET_MS)/86400000)*86400000 - IST_OFFSET_MS; }
 function bucketByDay(t){ const p=istParts(t); return p.y+'-'+String(p.mo+1).padStart(2,'0')+'-'+String(p.day).padStart(2,'0'); }
@@ -1791,6 +1791,34 @@ function enforceScope(scope){
   if(!scope) return {scope:[], truncated:false};
   if(scope.length>MAX_SCOPE_CONTRACTS) return {scope:scope.slice(0,MAX_SCOPE_CONTRACTS), truncated:true};
   return {scope, truncated:false};
+}
+function regimeFallback(sessions, confidences, confGate, persistBars, hysteresis){
+  confGate = confGate!=null?confGate:0.6;
+  persistBars = Math.max(1,Math.round(persistBars||5));
+  hysteresis = Math.max(0,Math.round(hysteresis||2));
+  let fallbackDays=0;
+  if(sessions<50){
+    fallbackDays=sessions;
+  } else if(confidences && confidences.length){
+    const n=confidences.length;
+    const raw=new Array(n);
+    for(let i=0;i<n;i++) raw[i]=confidences[i] < confGate ? 1:0;
+    let confirmed=raw[0]||0;
+    let need=persistBars, contender=-1, run=0;
+    const sm=new Array(n);
+    for(let i=0;i<n;i++){
+      const r=raw[i];
+      if(r===confirmed){ contender=-1; run=0; }
+      else { if(r!==contender){ contender=r; run=1; } else run++; if(run>=need){ confirmed=r; need=persistBars+hysteresis; contender=-1; run=0; } }
+      sm[i]=confirmed;
+    }
+    for(let i=0;i<n;i++) if(sm[i]) fallbackDays++;
+  }
+  const ratio = (confidences&&confidences.length) ? fallbackDays/confidences.length : (sessions? fallbackDays/sessions:0);
+  const maxConf = (confidences&&confidences.length)? Math.max(...confidences):0;
+  const blocked = ratio>0.3;
+  const allLow = maxConf < confGate;
+  return {fallbackDays, paperBlocked: blocked && allLow, reason: blocked && allLow ? 'LOW_REGIME_CONFIDENCE': undefined, persistBars, hysteresis};
 }
 
 function istFromNaive(ms){ // reinterpret a locally-parsed naive stamp as IST wall-clock
@@ -2149,8 +2177,8 @@ function backtest(d, sigPos, opts){
           const atrPeriodSlip=opts.atrPeriod||14;
           if(slippageModel==='spread'){
             slippage=spreadTicks*tickSize;
-            // do not double-count with costs.slippageTicks : take max
-            if(opts.cost && opts.slippageTicks) slippage=Math.max(slippage, opts.slippageTicks*tickSize);
+            // do not double-count with slippageTicks: take max of model slippage vs slippageTicks*tickSize
+            if(opts.slippageTicks!=null) slippage=Math.max(slippage, (+opts.slippageTicks)*tickSize);
           } else if(slippageModel==='atr'){
             let atrSlip=null;
             if(atrArr && isFinite(atrArr[i])) atrSlip=atrArr[i];
@@ -2168,20 +2196,21 @@ function backtest(d, sigPos, opts){
             exitPx = lvl;
           }
           if(reason!=='TIME'&&isFinite(lvl)&&isFinite(ox)){
-            const gappedOpen=isTarget?(position===1?ox>lvl:ox<lvl):(position===1?ox<lvl:ox>lvl);
+            // lvl currently includes adverse slippage if applied above (rawStop +/- slippage)
+            // Recover rawStop for spec formula max(stop, open+slippage)
+            const rawStop = (slippage>0 && !isTarget && reason!=='TIME') ? (position===1 ? lvl - slippage : lvl + slippage) : lvl;
+            const gappedOpen=isTarget?(position===1?ox>rawStop:ox<rawStop):(position===1?ox<rawStop:ox>rawStop);
             if(gappedOpen){
-              // gap-through: fill = max(stop, open+slippage) for long, min for short
               if(!isTarget && slippage>0){
-                if(position===1) exitPx=Math.max(lvl, ox);
-                else exitPx=Math.min(lvl, ox);
-                // for gap case, slippage already in lvl, but open gap is worse
-                // ensure max(stop, open+slippage) semantic: lvl already includes slippage, so max(lvl, ox) is equivalent to max(stop, open+slippage) when gapped
+                // spec: long = max(stop, ox + slippage), short = min(stop, ox - slippage)
+                if(position===1) exitPx=Math.max(rawStop, ox + slippage);
+                else exitPx=Math.min(rawStop, ox - slippage);
               } else {
                 exitPx=ox;
               }
               reason=reason+'_GAP';
             } else if(!isTarget && slippage>0){
-              // non-gap adverse slippage already applied via lvl
+              // non-gap adverse slippage already applied via lvl (exitPx == lvl)
             }
           }
           // ensure gapFill max(stop, open+slippage) for slippage model even when not gapped? already done
@@ -2270,7 +2299,32 @@ function backtest(d, sigPos, opts){
   // dataHealth on result
   let sessionsCount=0;
   try{ const seen={}; for(let i=0;i<n;i++){ const k=istDayIndex(d.t[i]); if(!seen[k]){seen[k]=1; sessionsCount++;}} }catch(e){ sessionsCount=0; }
-  const dataHealth = assessDataHealth(sessionsCount, 0, 0);
+  // expiries = distinct expiryMs values; contracts = datasets length or 1+contract check
+  let expiriesCount = 0, contractsCount = 0;
+  try {
+    const ds = (opts && opts.datasets) ? opts.datasets : null;
+    if (ds && Array.isArray(ds) && ds.length) {
+      contractsCount = ds.length;
+      const expSet = new Set();
+      for (const dsEntry of ds) {
+        const c = dsEntry && (dsEntry.contract || (dsEntry.d && dsEntry.d.contract));
+        if (c && isFinite(c.expiryMs)) expSet.add(c.expiryMs);
+        else if (c && c.expiry) expSet.add(c.expiry);
+      }
+      expiriesCount = expSet.size || (contractsCount>1?contractsCount:1);
+    } else if (d && d.contract && isFinite(d.contract.expiryMs)) {
+      expiriesCount = 1;
+      contractsCount = 1;
+    } else {
+      // single dataset without contract meta => infer
+      expiriesCount = 1;
+      contractsCount = 1;
+    }
+    // fallback: if we still have 0, use 1 to avoid spurious block when caller didn't provide datasets
+    if (!expiriesCount) expiriesCount = 1;
+    if (!contractsCount) contractsCount = 1;
+  } catch(e) { expiriesCount = 1; contractsCount = 1; }
+  const dataHealth = assessDataHealth(sessionsCount, expiriesCount, contractsCount);
   return {trades,equity:eq,dd,metrics:{netPnL:net,winRate:wr,totalTrades:trades.length,profitFactor:pf,maxDD:maxDD,sharpe,sortino,expectancy,finalCapital:run,grossProfit:grossP,grossLoss:grossL,tradesPerDay,days,ddPeakTime:d.t[peakIdx],ddTroughTime:d.t[troughIdx],totalCosts:costSum,grossPreCost:(run-capital0)+costSum,top1Pct, dataHealth}, dataHealth, top1Pct};
 }
 
@@ -3327,7 +3381,7 @@ function rankResults(rows, objective){
   return r.concat(flat);
 }
 
-const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,floorToSession,bucketByDay,assessDataHealth,computeTop1Pct,expiryGuard,ivGate,computeSizingQty,enforceScope,MIN_SESSIONS,MIN_EXPIRIES,MIN_CONTRACTS,DEFAULT_SESSION_ANCHOR,DEFAULT_SLIPPAGE_MODEL,DEFAULT_SIZING,MAX_SCOPE_CONTRACTS,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,todBucket15,aggregateProfile,classifyCell,mergeBuckets,classifyTransfer,consumeProfile,profileId,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,probabilisticSharpe,expectedMaxSharpe,benchmarkSharpe,deflatedSharpe,perObservationSharpe,effectiveN,normInv,normCdf,EFFECTIVE_N_DEF,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit};
+const api={parseCSV,parseCSVAll,resample,ema,sma,hma,dema,wma,rsi,atr,macd,bollinger,keltner,stoch,supertrend,adx,vwapSeries,chandeKroll,pocSeries,kama,fisherTransform,ttmSqueeze,connorsRSI,vwapBands,cvdSeries,fvgZones,choppiness,cyberCycle,vwma,cmo,aroon,hilbertDC,itrend,adaptivePeriod,smoothRegime,applyMaskPersistence,haltonSequence,buildHaltonGrid,purgedFolds,bayesianRefine,paperEligible,demoteKnifeEdge,parseExpiryFlex,detectExchange,resolveSession,EXCHANGE_SESSIONS,ivRankSeries,ivRankMask,buildExpiryMask,RESEARCH_OBJS,researchValue,researchCmp,auditRankingIntegrity,IST_OFFSET_MS,istParts,istDayKey,istDayIndex,floorToSession,bucketByDay,assessDataHealth,computeTop1Pct,expiryGuard,ivGate,computeSizingQty,enforceScope,MIN_SESSIONS,MIN_EXPIRIES,MIN_CONTRACTS,DEFAULT_SESSION_ANCHOR,DEFAULT_SLIPPAGE_MODEL,DEFAULT_SIZING,MAX_SCOPE_CONTRACTS,regimeSeries,ROUTER,FAMILY,regimeMask,regimeFeatures,trainSoftmax,predictSoftmax,trainRegimeML,daySegments,dayFeatures,dayRuleLabels,trainDayML,dayRegimeMask,dayRouting,validateLayers,buildSignals,backtest,buildSessionMask,buildWindowMask,combineMasks,sessionMaskFor,buildGrid,rankResults,objectiveValue,paramNeighbors,cfgKey,exitOptsFromParams,expandRange,SCHEMA,timeToMin,parseDateFlex,dteMask,atmStrikes,underlyingSignal,todBucket15,aggregateProfile,classifyCell,mergeBuckets,classifyTransfer,consumeProfile,profileId,SCORE_DEF,sampleTier,sharpeAdj,sharpeReliability,probabilisticSharpe,expectedMaxSharpe,benchmarkSharpe,deflatedSharpe,perObservationSharpe,effectiveN,normInv,normCdf,EFFECTIVE_N_DEF,strategyScore,rankableScore,whyNotRanked,robustEligible,paretoFrontier,researchUnion,fnv1a,hashRecord,replayAudit,regimeFallback};
 if(typeof module!=='undefined'&&module.exports)module.exports=api;
 root.XBOST_ENGINE=api;
 if(typeof globalThis!=='undefined') globalThis.XBOST_ENGINE=api;

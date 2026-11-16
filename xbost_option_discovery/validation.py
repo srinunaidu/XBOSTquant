@@ -67,6 +67,25 @@ def validate_slippage(slippage_model, spread_ticks=1, atr_mult=0.05):
         return {"ok": False, "reason": "invalid slippageModel"}
     return {"ok": True, "model": slippage_model, "tag": "G1"}
 
+
+def validate_session_anchor(session_anchor):
+    if session_anchor not in ("wall","session"):
+        return {"ok": False, "reason": "invalid sessionAnchor"}
+    return {"ok": True, "anchor": session_anchor}
+
+def validate_sizing(sizing, risk_pct=0.5, atr_period=14, max_concurrent=1, corr_cap=0.7):
+    if sizing not in ("fixed","volTarget","kelly"):
+        return {"ok": False, "reason": "invalid sizing"}
+    if not (0 < risk_pct <= 5):
+        return {"ok": False, "reason": "riskPct out of range"}
+    if not (1 <= atr_period <= 100):
+        return {"ok": False, "reason": "atrPeriod out of range"}
+    if max_concurrent < 1:
+        return {"ok": False, "reason": "maxConcurrent <1"}
+    if not (0 < corr_cap <= 1):
+        return {"ok": False, "reason": "corrCap out of range"}
+    return {"ok": True, "sizing": sizing, "riskPct": risk_pct, "atrPeriod": atr_period, "maxConcurrent": max_concurrent, "corrCap": corr_cap}
+
 def chronological_splits(days, fractions=(0.5, 0.2, 0.3), embargo_days=0):
     """Configurable chronological discovery/refinement/pseudo-OOS split (§13).
 

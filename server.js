@@ -15,6 +15,8 @@ const PORT = process.env.PORT || 10000;
 const DIST_DIR = path.join(__dirname, 'web', 'dist');
 const PUBLIC_DIR = fs.existsSync(path.join(DIST_DIR, 'index.html')) ? DIST_DIR : path.join(__dirname, 'public');
 const USERS_FILE = process.env.USERS_FILE || '/app/data/users.json';
+if (process.env.USERS_FILE && !require('fs').existsSync(require('path').dirname(USERS_FILE))) console.warn(`[auth] USERS_FILE dir ${require('path').dirname(USERS_FILE)} does not exist — will attempt to create`);
+if (!process.env.USERS_FILE) console.warn('[auth] USERS_FILE not set — using default /app/data/users.json (ensure /app/data is a persistent disk)');
 const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || 'changeme';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'xbost-dev-secret-change-me';
