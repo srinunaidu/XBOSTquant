@@ -38,19 +38,6 @@ function isBrowser(): boolean {
   return typeof window !== "undefined" && typeof window.sessionStorage !== "undefined"
 }
 
-function bytesToBase64(bytes: Uint8Array): string {
-  let binary = ""
-  for (const b of bytes) binary += String.fromCharCode(b)
-  return btoa(binary)
-}
-
-function base64ToBytes(b64: string): Uint8Array {
-  const binary = atob(b64)
-  const out = new Uint8Array(binary.length)
-  for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i)
-  return out
-}
-
 async function fetchCsrfToken(): Promise<string> {
   try {
     const r = await fetch("/auth/csrf-token", { credentials: "include" })
@@ -87,74 +74,6 @@ async function decryptViaServer(blob: string): Promise<string> {
   return data.plaintext as string
 }
 
-const FALLBACK_PASSWORD = "test-app-key-12345678901234567890-test-key-123456"
-
-async function getAesKey(password: string): Promise<CryptoKey> {
-  const enc = new TextEncoder()
-  const salt = enc.encode("angel-one-input")
-  const material = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveKey"])
-  return crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt, iterations: 100000, hash: "SHA-256" },
-    material,
-    { name: "AES-GCM", length: 256 },
-    false,
-    ["encrypt", "decrypt"]
-  )
-}
-
-async function localEncrypt(plaintext: string): Promise<string> {
-  const key = await getAesKey(FALLBACK_PASSWORD)
-  const iv = crypto.getRandomValues(new Uint8Array(12))
-  const enc = new TextEncoder()
-  const ctAndTagBuf = await crypto.subtle.encrypt({ name: "AES-GCM", iv: iv as unknown as BufferSource }, key, enc.encode(plaintext) as unknown as BufferSource)
-  const ctAndTag = new Uint8Array(ctAndTagBuf)
-  const tag = ctAndTag.slice(ctAndTag.length - 16)
-  const ciphertext = ctAndTag.slice(0, ctAndTag.length - 16)
-  const payload = { iv: bytesToBase64(iv), ciphertext: bytesToBase64(ciphertext), tag: bytesToBase64(tag) }
-  return btoa(JSON.stringify(payload))
-}
-
-async function localDecrypt(blob: string): Promise<string> {
-  const json = atob(blob)
-  const payload = JSON.parse(json) as { iv: string; ciphertext: string; tag: string }
-  if (!payload.iv || !payload.ciphertext || !payload.tag) throw new Error("invalid_blob")
-  const iv = base64ToBytes(payload.iv)
-  const ciphertext = base64ToBytes(payload.ciphertext)
-  const tag = base64ToBytes(payload.tag)
-  const ctAndTag = new Uint8Array([...ciphertext, ...tag])
-  const key = await getAesKey(FALLBACK_PASSWORD)
-  const plainBuf = await crypto.subtle.decrypt({ name: "AES-GCM", iv: iv as unknown as BufferSource }, key, ctAndTag as unknown as BufferSource)
-  return new TextDecoder().decode(plainBuf)
-}
-
-async function encryptBlob(plaintext: string): Promise<string> {
-  try {
-    const blob = await encryptViaServer(plaintext)
-    try {
-      const inner = atob(blob)
-      const p = JSON.parse(inner)
-      if (p.iv && p.ciphertext && p.tag) return blob
-    } catch { /* fallthrough */ }
-    return blob
-  } catch {
-    return localEncrypt(plaintext)
-  }
-}
-
-async function decryptBlob(blob: string): Promise<string | null> {
-  try {
-    const text = await decryptViaServer(blob)
-    return text
-  } catch {
-    try {
-      const text = await localDecrypt(blob)
-      return text
-    } catch {
-      return null
-    }
-  }
-}
-
 function persistToSession(state: AngelState) {
   if (!isBrowser()) return
   try {
@@ -179,15 +98,54 @@ async function persistToLocal(state: AngelState) {
       return
     }
     const plaintext = JSON.stringify(state.creds)
-    const blob = await encryptBlob(plaintext)
+    // Strictly via server; no static fallback
+    const blob = await encryptViaServer(plaintext)
     localStorage.setItem(REMEMBER_KEY, blob)
-  } catch { /* ignore */ }
+  } catch (e) {
+    // Server encrypt failed: disable Remember and surface error, no fallback
+    try { localStorage.removeItem(REMEMBER_KEY) } catch {}
+    const msg = e instanceof Error ? e.message : "encrypt_failed"
+    try {
+      useAngelStore.setState({ remember: false, status: "error", error: msg })
+      // keep sessionStorage in sync: remember false
+      try {
+        const raw = sessionStorage.getItem(SESSION_KEY)
+        if (raw) {
+          const data = JSON.parse(raw)
+          data.remember = false
+          sessionStorage.setItem(SESSION_KEY, JSON.stringify(data))
+        }
+      } catch {}
+    } catch {}
+  }
+}
+
+async function decryptBlob(blob: string): Promise<string | null> {
+  try {
+    const text = await decryptViaServer(blob)
+    return text
+  } catch {
+    return null
+  }
 }
 
 function clearAllStorage() {
   if (!isBrowser()) return
   try { sessionStorage.removeItem(SESSION_KEY) } catch {}
   try { localStorage.removeItem(REMEMBER_KEY) } catch {}
+}
+
+function isSessionValid(): boolean {
+  if (!isBrowser()) return false
+  try {
+    const raw = localStorage.getItem("xbost-auth") || sessionStorage.getItem("xbost-auth")
+    // Also check cookie session via fetch? For now presence of xbost-auth
+    // If no auth marker, session is invalid
+    if (!raw) return false
+    return true
+  } catch {
+    return false
+  }
 }
 
 const initialCreds: AngelCreds = { apiKey: "", clientCode: "", password: "", totpSecret: "" }
@@ -246,6 +204,7 @@ export const useAngelStore = create<AngelState>()((set) => ({
       const ns = { ...s, remember } as AngelState
       persistToSession(ns)
       void persistToLocal(ns)
+      // if enabling remember fails, persistToLocal will reset remember to false and set error
       return { remember }
     }),
 
@@ -271,6 +230,14 @@ export const useAngelStore = create<AngelState>()((set) => ({
 
   hydratate: async () => {
     if (!isBrowser()) return
+    // If session invalid, clear angel state (logout/expiry)
+    if (!isSessionValid()) {
+      // Do not auto-restore from localStorage when session invalid
+      clearAllStorage()
+      // reset without triggering storage write loop
+      try { useAngelStore.setState({ creds: { ...initialCreds }, remember: false, jwt: null, status: "idle", error: null }) } catch {}
+      return
+    }
     try {
       const raw = sessionStorage.getItem(SESSION_KEY)
       if (raw) {
@@ -296,6 +263,15 @@ export const useAngelStore = create<AngelState>()((set) => ({
         if (decrypted) {
           const creds = JSON.parse(decrypted)
           set({ creds, remember: true })
+          // also sync to sessionStorage
+          try {
+            const ns = { creds, exchange: useAngelStore.getState().exchange, symbol: useAngelStore.getState().symbol, interval: useAngelStore.getState().interval, fromDate: useAngelStore.getState().fromDate, toDate: useAngelStore.getState().toDate, remember: true } as AngelState
+            persistToSession(ns)
+          } catch {}
+        } else {
+          // decrypt failed: disable Remember
+          try { localStorage.removeItem(REMEMBER_KEY) } catch {}
+          set({ remember: false, error: "decrypt_failed", status: "error" })
         }
       }
     } catch {}
@@ -305,21 +281,43 @@ export const useAngelStore = create<AngelState>()((set) => ({
 if (isBrowser()) {
   void useAngelStore.getState().hydratate()
   window.addEventListener("beforeunload", () => {
-    try { sessionStorage.removeItem(SESSION_KEY) } catch {}
-  })
-  const checkExpiry = () => {
     try {
-      const raw = localStorage.getItem("xbost-auth") || sessionStorage.getItem("xbost-auth")
-      if (!raw) return
-    } catch {}
-  }
+      const remember = useAngelStore.getState().remember
+      // Only clear sessionStorage when Remember is off (session-only mode)
+      // When Remember is on, keep session for fast restore until explicit logout
+      if (!remember) sessionStorage.removeItem(SESSION_KEY)
+    } catch {
+      try { sessionStorage.removeItem(SESSION_KEY) } catch {}
+    }
+  })
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") {
+      if (!isSessionValid()) {
+        try { useAngelStore.getState().reset() } catch {}
+        return
+      }
       try { void useAngelStore.getState().hydratate() } catch {}
+      // Probe server session as well
+      try {
+        fetch("/api/me", { credentials: "include" }).then((r) => {
+          if (!r.ok) {
+            try { useAngelStore.getState().reset() } catch {}
+          }
+        }).catch(() => {})
+      } catch {}
+    }
+  })
+  // Listen for explicit logout via storage or custom event
+  window.addEventListener("storage", (e) => {
+    if (e.key === "xbost-auth" && !e.newValue) {
+      try { useAngelStore.getState().reset() } catch {}
     }
   })
 }
 
 export function clearAngelStorage() {
   clearAllStorage()
+}
+export function is_session_valid(): boolean {
+  return isSessionValid()
 }

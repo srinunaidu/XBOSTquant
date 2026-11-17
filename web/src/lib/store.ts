@@ -41,6 +41,7 @@ type State = {
   datasets: Record<string, { raw: OHLCV; label: string; enabled?: boolean }>;
   fromDate: string; toDate: string;
   dataInfo: string;
+  dataSource: "csv" | "angel" | null;
   timeframes: number[];
   objective: string;
   topN: number; cap: number;
@@ -83,10 +84,10 @@ type State = {
   paperThreshold: number;
   lastPaper: { eligible: boolean; reasons: string[] } | null;
   // ---- trials-aware inference (multiple-testing correction) ----
-  dsrThreshold: number;        // deflated-Sharpe gate for the VALIDATED board (default 0.95)
-  leadsN: number;              // LEADS pool size (top by composite, validated or not)
-  effectiveNSample: number;    // max signal series rebuilt for effectiveN (bounded)
-  effectiveNBarSubsample: number; // max bars retained per series for effectiveN
+  dsrThreshold: number;
+  leadsN: number;
+  effectiveNSample: number;
+  effectiveNBarSubsample: number;
   leads: BoardRow[];
   validatedBoard: BoardRow[];
   paperBoard: BoardRow[];
@@ -145,6 +146,7 @@ export const useStore = create<State>((set) => ({
   datasets: {},
   fromDate: '', toDate: '',
   dataInfo: 'No file loaded — upload a 1-min CSV to begin.',
+  dataSource: null,
   timeframes: [...TFS],
   objective: 'sharpe',
   topN: 500, cap: 60000,
@@ -245,7 +247,6 @@ if (typeof window !== 'undefined') {
   (window as any).__XBOST__ = { getState: useStore.getState, setState: useStore.setState };
 }
 
-// Angel One store re-export for contract AC2
+// Angel One store slice — re-export for contract AC2 (store must expose angel state)
 export const useAngelStore = _useAngelStore;
-export { clearAngelStorage } from './angelStore';
-
+export { clearAngelStorage, is_session_valid } from './angelStore';

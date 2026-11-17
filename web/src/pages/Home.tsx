@@ -5,7 +5,7 @@ import { useNavigate } from '../lib/router';
 import { loadFile, dataHealth } from '../lib/data';
 import { useAngelStore } from '../lib/angelStore';
 import { fetchCandles, testConnection } from '../lib/angelClient';
-import { checkDataHealth, resampleCandles } from '../lib/dataHealth';
+import { checkDataHealth, resampleCandles } from '../lib/data';
 import { BUILD_INFO } from '../lib/buildinfo';
 
 // A dataset belongs to the Options Lab if its contract key or source label
@@ -106,48 +106,32 @@ function AngelDataPanel() {
       }
       const resampled = resampleCandles(raw as unknown as Parameters<typeof resampleCandles>[0], interval);
       setFetchData(resampled);
-      // Wire fetched Data[] into existing backtest engine, same resample/health path with dataSource:"angel"
+      // Wire fetched Data[] into existing backtest engine, same resample/health path with dataSource:"angel" persisted
       try {
-        const payload = { data: resampled, dataSource: "angel" as const, interval, symbol, exchange, fromDate, toDate };
-        // Try server backtest endpoint if available (best-effort)
-        const csrfRes = await fetch('/auth/csrf-token', { credentials: 'include' }).catch(() => null);
-        let csrf = '';
-        try {
-          const j = await csrfRes?.json();
-          csrf = j?.csrf_token || j?.csrfToken || '';
-        } catch {}
-        await fetch('/api/backtest/run', {
-          method: 'POST',
-          credentials: 'include',
-          headers: { 'Content-Type': 'application/json', ...(csrf ? { 'X-CSRFToken': csrf } : {}) },
-          body: JSON.stringify(payload),
-        }).catch(() => {});
-        // Also populate XBOST datasets for terminal runner: convert to OHLCV
-        try {
-          const { useStore } = await import('../lib/store');
-          if (resampled && Array.isArray(resampled) && resampled.length) {
-            const n = resampled.length;
-            const t = new Float64Array(n);
-            const o = new Float64Array(n);
-            const h = new Float64Array(n);
-            const l = new Float64Array(n);
-            const c = new Float64Array(n);
-            const v = new Float64Array(n);
-            for (let i = 0; i < n; i++) {
-              const d = resampled[i] as { t: number; o: number; h: number; l: number; c: number; v: number };
-              t[i] = d.t; o[i] = d.o; h[i] = d.h; l[i] = d.l; c[i] = d.c; v[i] = d.v;
-            }
-            const ohlcv = { t, o, h, l, c, v, symbol, layout: 'angel' } as unknown as import('../lib/engine').OHLCV;
-            const st = useStore.getState();
-            // Register as dataset AND set as active data (so runGrid can use it)
-            const datasets = { ...st.datasets };
-            const key = symbol || 'ANGEL:' + exchange + ':' + (resampled[0] as { t: number }).t;
-            datasets[key] = { raw: ohlcv, label: 'Angel ' + symbol + ' ' + exchange + ' ' + fromDate + '→' + toDate, enabled: true };
-            useStore.getState().set({ datasets, raw: ohlcv, data: ohlcv, dataInfo: 'Angel ' + symbol + ' ' + exchange + ' ' + fromDate + '→' + toDate + ' · ' + n.toLocaleString() + ' 1m bars · dataSource:angel', symbol: key });
-            // Force data health re-evaluation via store update already
-            void payload.dataSource;
+        const { useStore } = await import('../lib/store');
+        const { runGrid } = await import('../lib/runner');
+        if (resampled && Array.isArray(resampled) && resampled.length) {
+          const n = resampled.length;
+          const t = new Float64Array(n);
+          const o = new Float64Array(n);
+          const h = new Float64Array(n);
+          const l = new Float64Array(n);
+          const c = new Float64Array(n);
+          const v = new Float64Array(n);
+          for (let i = 0; i < n; i++) {
+            const d = resampled[i] as { t: number; o: number; h: number; l: number; c: number; v: number };
+            t[i] = d.t; o[i] = d.o; h[i] = d.h; l[i] = d.l; c[i] = d.c; v[i] = d.v;
           }
-        } catch {}
+          const ohlcv = { t, o, h, l, c, v, symbol, layout: 'angel' } as unknown as import('../lib/engine').OHLCV;
+          const st = useStore.getState();
+          const datasets = { ...st.datasets };
+          const key = symbol || 'ANGEL:' + exchange + ':' + (resampled[0] as { t: number }).t;
+          datasets[key] = { raw: ohlcv, label: 'Angel ' + symbol + ' ' + exchange + ' ' + fromDate + '→' + toDate, enabled: true };
+          // Persist dataSource:"angel" flag in store (AC6) and set active data
+          useStore.getState().set({ datasets, raw: ohlcv, data: ohlcv, dataInfo: 'Angel ' + symbol + ' ' + exchange + ' ' + fromDate + '→' + toDate + ' · ' + n.toLocaleString() + ' 1m bars · dataSource:angel', symbol: key, dataSource: "angel" as const });
+          // Trigger grid search with angel dataSource
+          void runGrid();
+        }
       } catch {}
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : 'fetch_failed';
