@@ -6,6 +6,9 @@
 'use strict';
 const express = require('express');
 const session = require('express-session');
+const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
+const NodeCache = require('node-cache');
+const { TOTP } = require('otpauth');
 const bcrypt = require('bcryptjs');
 const fs = require('fs');
 const path = require('path');
@@ -182,6 +185,316 @@ app.patch('/api/users/:id', requireAdmin, (req, res) => {
 // proxies that strip them. Unauthenticated navigations get the app shell
 // (HTTP 200) and the client router renders Login; the JS bundle itself is
 // public so the form can boot, while engine/worker/data stay guarded.
+
+// ---- Angel One proxy: POST /api/angel/login + /api/angel/candles ----
+// Throttling + caching + TOTP window=1 + redacted logging + mapping to Data{t,o,h,l,c,v} sorted
+const angelCache = new NodeCache({ stdTTL: 300, checkperiod: 60, maxKeys: 100 });
+let angelCacheCount = 0;
+
+// Redact helper for logs
+function redact(str) {
+  if (!str) return str;
+  const s = String(str);
+  if (s.length <= 4) return '***';
+  return s.slice(0,2) + '***' + s.slice(-2);
+}
+function redactLog(obj) {
+  if (!obj || typeof obj !== 'object') return redact(String(obj));
+  const out = { ...obj };
+  for (const k of Object.keys(out)) {
+    if (/apiKey|clientCode|password|totp|authorization|x-privatekey/i.test(k)) out[k] = '***';
+  }
+  return out;
+}
+
+function isAngelAuthenticated(req) {
+  return !!(req.session && req.session.user);
+}
+
+// rate limiters
+const angelLoginLimiter = rateLimit({
+  windowMs: 60000,
+  max: 5,
+  keyGenerator: (req) => ipKeyGenerator(req.ip),
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.setHeader('Retry-After', '60');
+    res.status(429).json({ ok: false, error: 'rate_limited' });
+  }
+});
+
+const angelCandlesLimiter = rateLimit({
+  windowMs: 60000,
+  max: 10,
+  keyGenerator: (req) => (req.session && req.session.user ? String(req.session.user.id || req.session.user.username) : ipKeyGenerator(req.ip)),
+  standardHeaders: true,
+  legacyHeaders: false,
+  handler: (req, res) => {
+    res.setHeader('Retry-After', '60');
+    res.status(429).json({ error: 'rate_limited' });
+  }
+});
+
+function validateAngelDate(s) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(s)) throw new Error('invalid_date');
+  const d = new Date(s + 'T00:00:00');
+  if (isNaN(d.getTime())) throw new Error('invalid_date');
+  return d;
+}
+
+function todayISTStr() {
+  const now = new Date();
+  const istOffset = 5.5*60;
+  const utc = now.getTime() + now.getTimezoneOffset()*60000;
+  const ist = new Date(utc + istOffset*60000);
+  return ist.toISOString().slice(0,10);
+}
+function parseISTTimestamp(tsStr) {
+  // tsStr like "2026-11-14T09:15:00" IST → epoch ms
+  let dt = null;
+  for (const fmt of ['%Y-%m-%dT%H:%M:%S','%Y-%m-%d %H:%M:%S']) { /* not used */ }
+  // Try ISO parse assuming IST if no tz
+  try {
+    // If contains T, treat as IST
+    if (tsStr.includes('T')) {
+      const [date, time] = tsStr.split('T');
+      const [y,m,d] = date.split('-').map(Number);
+      const [hh,mm,ss] = time.split(':').map(Number);
+      // IST is UTC+5:30 → UTC = IST - 5:30
+      const utcMs = Date.UTC(y, m-1, d, hh, mm, ss || 0) - (5.5*60*60*1000);
+      return utcMs;
+    } else {
+      const [date, time] = tsStr.split(' ');
+      const [y,m,d] = date.split('-').map(Number);
+      const [hh,mm] = time.split(':').map(Number);
+      const utcMs = Date.UTC(y, m-1, d, hh, mm, 0) - (5.5*60*60*1000);
+      return utcMs;
+    }
+  } catch { return null; }
+}
+
+// POST /api/angel/login
+app.post('/api/angel/login', angelLoginLimiter, async (req, res) => {
+  if (!isAngelAuthenticated(req)) return res.status(401).json({ ok: false, error: 'unauthorized' });
+  const body = req.body || {};
+  const apiKey = String(body.apiKey || body.api_key || '').trim();
+  const clientCode = String(body.clientCode || body.client_code || body.clientcode || '').trim();
+  const password = String(body.password || '').trim();
+  const totpSecret = String(body.totpSecret || body.totp_secret || body.totp || '').trim();
+  if (!apiKey || !clientCode || !password || !totpSecret) {
+    return res.status(400).json({ ok: false, error: 'missing_fields' });
+  }
+  // Generate TOTP with window=1 (±30s)
+  let totpCandidates = [];
+  try {
+    const totp = new TOTP({ secret: totpSecret, digits: 6, period: 30, algorithm: 'SHA1' });
+    const now = Date.now();
+    for (const delta of [-30000, 0, 30000]) {
+      try {
+        const c = totp.generate({ timestamp: now + delta });
+        if (!totpCandidates.includes(c)) totpCandidates.push(c);
+      } catch {}
+    }
+    if (!totpCandidates.length) totpCandidates = [totp.generate()];
+  } catch (e) {
+    console.warn('[angel] TOTP generation failed: ' + redact(String(e.message || e)));
+    return res.status(401).json({ ok: false, error: 'auth_failed' });
+  }
+  console.log('[angel] login attempt clientCode=' + redact(clientCode) + ' apiKey=' + redact(apiKey.slice(0,4)) + '...');
+  const url = 'https://apiconnect.angelbroking.com/rest/auth/angelbroking/user/v1/loginByPassword';
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'X-UserType': 'USER',
+    'X-SourceID': 'WEB',
+    'X-ClientLocalIP': req.ip || '127.0.0.1',
+    'X-ClientPublicIP': req.ip || '127.0.0.1',
+    'X-MACAddress': '00:00:00:00:00:00',
+    'X-PrivateKey': apiKey,
+  };
+  let lastResp = null;
+  for (const totp of totpCandidates) {
+    const payload = { clientcode: clientCode, password, totp };
+    try {
+      const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(10000) });
+      let j = {};
+      try { j = await resp.json(); } catch {
+        try { const t = await resp.text(); j = JSON.parse(t); } catch {}
+      }
+      if (resp.status === 200 && j && j.status === true) {
+        let jwt = '';
+        const dataField = j.data || {};
+        if (typeof dataField === 'object') jwt = dataField.jwtToken || dataField.jwt || dataField.accessToken || '';
+        if (!jwt) {
+          jwt = resp.headers.get('authorization') || '';
+          if (jwt.toLowerCase().startsWith('bearer ')) jwt = jwt.slice(7);
+        }
+        req.session.angel_jwt = jwt;
+        req.session.angelClientCode = clientCode;
+        req.session.angelApiKey = apiKey;
+        console.log('[angel] login success clientCode=' + redact(clientCode));
+        return res.json({ ok: true, clientCode, jwt: jwt ? jwt.slice(0,20) + '...' : null });
+      }
+      lastResp = { status: resp.status, body: j };
+      console.warn('[angel] login attempt failed clientCode=' + redact(clientCode) + ' totp=' + redact(totp.slice(0,2)) + '.. status=' + resp.status + ' msg=' + redact(j && j.message));
+    } catch (e) {
+      lastResp = { error: String(e) };
+      console.warn('[angel] login upstream error: ' + redact(String(e.message || e)));
+    }
+  }
+  console.warn('[angel] login failed clientCode=' + redact(clientCode) + ' after ' + totpCandidates.length + ' candidates');
+  return res.status(401).json({ ok: false, error: 'auth_failed' });
+});
+
+// POST /api/angel/candles
+app.post('/api/angel/candles', angelCandlesLimiter, async (req, res) => {
+  if (!isAngelAuthenticated(req)) return res.status(401).json({ error: 'unauthorized' });
+  const body = req.body || {};
+  const exchange = String(body.exchange || '').trim().toUpperCase();
+  const interval = String(body.interval || '').trim();
+  const fromDate = String(body.fromDate || body.fromdate || body.from_date || '').trim();
+  const toDate = String(body.toDate || body.todate || body.to_date || '').trim();
+  let rawSymbol = String(body.symbolToken || body.symbol_token || body.symboltoken || body.symbol || '').trim();
+  if (!rawSymbol && body.symbol) rawSymbol = String(body.symbol).trim();
+
+  if (!['NSE','BSE','MCX','NFO'].includes(exchange)) return res.status(400).json({ error: 'invalid_exchange' });
+  if (interval !== 'ONE_MINUTE') return res.status(400).json({ error: 'invalid_interval' });
+  if (!fromDate || !toDate) return res.status(400).json({ error: 'missing_dates' });
+  let fromDt, toDt;
+  try { fromDt = validateAngelDate(fromDate); toDt = validateAngelDate(toDate); } catch (e) { return res.status(400).json({ error: 'invalid_date' }); }
+  if (toDt < fromDt) return res.status(400).json({ error: 'invalid_range' });
+  const todayStr = todayISTStr();
+  if (toDate > todayStr) return res.status(400).json({ error: 'invalid_range' });
+  const diffDays = Math.round((toDt - fromDt)/86400000);
+  if (diffDays > 30) return res.status(400).json({ error: 'invalid_range' });
+
+  // Resolve token
+  let token = null;
+  try {
+    const { resolveSymbol } = require('./server/utils/angel_tokens');
+    token = resolveSymbol(rawSymbol, exchange);
+  } catch (e) {
+    return res.status(400).json({ error: 'unknown_symbol' });
+  }
+  if (!token) return res.status(400).json({ error: 'unknown_symbol' });
+
+  const jwt = req.session.angel_jwt;
+  const apiKey = req.session.angelApiKey;
+  if (!jwt) return res.status(401).json({ error: 'not_authenticated', message: 'Please Test Connection first' });
+
+  const cacheKey = exchange + ':' + token + ':' + interval + ':' + fromDate + ':' + toDate;
+  const cached = angelCache.get(cacheKey);
+  if (cached !== undefined) {
+    res.setHeader('X-Cache', 'HIT');
+    return res.json({ data: cached, cached: true });
+  }
+
+  const fromStr = fromDate + ' 09:15';
+  const toStr = toDate + ' 15:30';
+  const payload = { exchange, symboltoken: token, interval, fromdate: fromStr, todate: toStr };
+  const headers = {
+    'Content-Type': 'application/json',
+    'Accept': 'application/json',
+    'X-PrivateKey': apiKey || '',
+    'Authorization': 'Bearer ' + jwt,
+    'X-UserType': 'USER',
+    'X-SourceID': 'WEB',
+    'X-ClientLocalIP': req.ip || '127.0.0.1',
+    'X-ClientPublicIP': req.ip || '127.0.0.1',
+    'X-MACAddress': '00:00:00:00:00:00',
+  };
+  console.log('[angel] candles fetch ' + redact(cacheKey) + ' ' + fromStr + '->' + toStr);
+  try {
+    const url = 'https://apiconnect.angelbroking.com/rest/secure/angelbroking/historical/v1/getCandleData';
+    const resp = await fetch(url, { method: 'POST', headers, body: JSON.stringify(payload), signal: AbortSignal.timeout(15000) });
+    if (resp.status === 429) {
+      return res.status(502).json({ error: 'upstream_rate_limit', retry_after: resp.headers.get('Retry-After') || '60' });
+    }
+    let j = null;
+    try { j = await resp.json(); } catch { j = {}; }
+    if (resp.status !== 200 || !j || !j.status) {
+      const msg = (j && j.message) ? j.message : 'no_data_for_range';
+      console.warn('[angel] candles upstream fail ' + resp.status + ' ' + redact(msg));
+      return res.status(502).json({ error: 'upstream_error', message: 'no_data_for_range' });
+    }
+    const rawData = j.data || [];
+    const mapped = [];
+    for (const row of rawData) {
+      try {
+        if (!Array.isArray(row) || row.length < 6) continue;
+        const tsStr = String(row[0]);
+        const o = row[1], h = row[2], l = row[3], c = row[4], v = row[5];
+        const t = parseISTTimestamp(tsStr);
+        if (t == null || isNaN(t)) continue;
+        mapped.push({ t, o: Number(o), h: Number(h), l: Number(l), c: Number(c), v: Number(v) || 0 });
+      } catch {}
+    }
+    mapped.sort((a,b) => a.t - b.t);
+    angelCache.set(cacheKey, mapped);
+    // enforce max 100 is handled by NodeCache maxKeys, but also manual evict if needed
+    res.setHeader('X-Cache', 'MISS');
+    return res.json({ data: mapped, cached: false });
+  } catch (e) {
+    console.warn('[angel] candles upstream exception: ' + redact(String(e.message || e)));
+    return res.status(502).json({ error: 'upstream_error' });
+  }
+});
+
+// POST /api/angel/encrypt
+app.post('/api/angel/encrypt', angelCandlesLimiter, async (req, res) => {
+  if (!isAngelAuthenticated(req)) return res.status(401).json({ error: 'unauthorized' });
+  const body = req.body || {};
+  let plaintext = String(body.plaintext || body.text || body.data || '');
+  if (!plaintext && body.creds) {
+    try { plaintext = JSON.stringify(body.creds); } catch {}
+  }
+  if (!plaintext && typeof body === 'object' && (body.apiKey || body.clientCode || body.password || body.totpSecret)) {
+    plaintext = JSON.stringify(body);
+  }
+  if (!plaintext) return res.status(400).json({ error: 'missing_plaintext' });
+  try {
+    const { encrypt } = require('./server/utils/encryption');
+    const blob = encrypt(plaintext);
+    return res.json({ blob });
+  } catch (e) {
+    console.warn('[angel] encrypt failed: ' + redact(String(e.message || e)));
+    return res.status(400).json({ error: 'encrypt_failed' });
+  }
+});
+
+// POST /api/angel/decrypt
+app.post('/api/angel/decrypt', angelCandlesLimiter, async (req, res) => {
+  if (!isAngelAuthenticated(req)) return res.status(401).json({ error: 'unauthorized' });
+  const body = req.body || {};
+  const blob = String(body.blob || '');
+  if (!blob) return res.status(400).json({ error: 'missing_blob' });
+  try {
+    const { decrypt } = require('./server/utils/encryption');
+    const plaintext = decrypt(blob);
+    return res.json({ plaintext });
+  } catch (e) {
+    console.warn('[angel] decrypt failed: ' + redact(String(e.message || e)));
+    return res.status(400).json({ error: 'decrypt_failed' });
+  }
+});
+
+app.post('/api/angel/decrypt-check', angelCandlesLimiter, async (req, res) => {
+  if (!isAngelAuthenticated(req)) return res.status(401).json({ error: 'unauthorized' });
+  const body = req.body || {};
+  const blob = String(body.blob || '');
+  if (!blob) return res.status(400).json({ error: 'missing_blob' });
+  try {
+    const { decrypt } = require('./server/utils/encryption');
+    decrypt(blob);
+    return res.json({ ok: true });
+  } catch (e) {
+    console.warn('[angel] decrypt-check failed: ' + redact(String(e.message || e)));
+    return res.status(400).json({ ok: false, error: 'decrypt_failed' });
+  }
+});
+
+
 const LEGACY = PUBLIC_DIR.endsWith('public');
 const PUBLIC_PATHS = new Set(LEGACY ? ['/login.html'] : []);
 const SHELL_PATHS = new Set(['/', '/index.html', '/login.html', '/users.html']);

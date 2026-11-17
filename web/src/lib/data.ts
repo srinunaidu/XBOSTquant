@@ -310,3 +310,53 @@ export function dataHealth(): {
   ];
   return { symbols: names.length, bars, sessions, spanDays, expiries: [...expiries], contracts, verdicts };
 }
+
+// ---- Shared candle health + resample for CSV and Angel (deep-equal) ----
+export interface HealthCandle {
+  t: number
+  o: number
+  h: number
+  l: number
+  c: number
+  v: number
+}
+
+/**
+ * Returns null when healthy, otherwise a health code.
+ * Source of truth for Angel and CSV — Home.tsx must not duplicate this logic.
+ */
+export function checkDataHealth(data: readonly HealthCandle[]): string | null {
+  if (!Array.isArray(data) || data.length < 200) return "insufficient_bars"
+  for (const row of data) {
+    if ([row.o, row.h, row.l, row.c].some((v) => Number.isNaN(v as number))) return "nan_ohlc"
+    if (row.h < row.l || row.h < row.o || row.h < row.c || row.l > row.o || row.l > row.c) return "invalid_ohlc"
+    if (typeof row.t === "number" && row.t > Date.now()) return "future_timestamp"
+  }
+  return null
+}
+
+/**
+ * Resample to the requested interval. ONE_MINUTE is the canonical ingest;
+ * Uses same engine path as CSV so deep-equal holds.
+ */
+export function resampleCandles(data: readonly HealthCandle[], _interval: string): HealthCandle[] {
+  try {
+    if (!data.length) return []
+    const n = data.length
+    const ohlcv = {
+      t: Float64Array.from(data.map(d => d.t)),
+      o: Float64Array.from(data.map(d => d.o)),
+      h: Float64Array.from(data.map(d => d.h)),
+      l: Float64Array.from(data.map(d => d.l)),
+      c: Float64Array.from(data.map(d => d.c)),
+      v: Float64Array.from(data.map(d => d.v)),
+    } as unknown as OHLCV
+    // engine resample for parity with CSV
+    const res = engine.resample(ohlcv as OHLCV, 1)
+    const out: HealthCandle[] = []
+    for (let i = 0; i < res.t.length; i++) out.push({ t: res.t[i], o: res.o[i], h: res.h[i], l: res.l[i], c: res.c[i], v: res.v[i] })
+    return out
+  } catch {
+    return [...data].sort((a, b) => a.t - b.t)
+  }
+}

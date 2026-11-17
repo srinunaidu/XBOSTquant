@@ -23,6 +23,16 @@ export async function login(username: string, password: string): Promise<{ ok: b
 
 export async function logout(): Promise<void> {
   await fetch('/api/logout', { method: 'POST' });
+  try {
+    if (typeof window !== 'undefined') {
+      sessionStorage.removeItem('angel:creds:session');
+      localStorage.removeItem('angel:creds:remember');
+      sessionStorage.removeItem('angel:creds:remember');
+      localStorage.removeItem('angel:creds:session');
+    }
+    const { useAngelStore } = await import('./angelStore');
+    try { useAngelStore.getState().reset(); } catch {}
+  } catch {}
 }
 
 export async function listUsers(): Promise<User[]> {
