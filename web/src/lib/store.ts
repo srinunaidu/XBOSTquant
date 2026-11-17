@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import type { BoardRow, OHLCV, Trade } from './engine';
 import { DEFAULT_RANGES, IND_META, TFS } from './config';
 import type { User } from './api';
+import { useAngelStore as _useAngelStore } from './angelStore';
 
 export type Detail = {
   cfg: BoardRow;
@@ -243,3 +244,8 @@ export function resetRun(): RunState {
 if (typeof window !== 'undefined') {
   (window as any).__XBOST__ = { getState: useStore.getState, setState: useStore.setState };
 }
+
+// Angel One store re-export for contract AC2
+export const useAngelStore = _useAngelStore;
+export { clearAngelStorage } from './angelStore';
+
