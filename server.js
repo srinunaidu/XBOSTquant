@@ -331,8 +331,8 @@ app.post('/api/angel/login', angelLoginLimiter, async (req, res) => {
           if (jwt.toLowerCase().startsWith('bearer ')) jwt = jwt.slice(7);
         }
         req.session.angel_jwt = jwt;
-        req.session.angel_client_code = clientCode;
-        req.session.angel_api_key = apiKey;
+        req.session.angelClientCode = clientCode;
+        req.session.angelApiKey = apiKey;
         console.log('[angel] login success clientCode=' + redact(clientCode));
         return res.json({ ok: true, clientCode, jwt: jwt ? jwt.slice(0,20) + '...' : null });
       }
@@ -380,7 +380,7 @@ app.post('/api/angel/candles', angelCandlesLimiter, async (req, res) => {
   if (!token) return res.status(400).json({ error: 'unknown_symbol' });
 
   const jwt = req.session.angel_jwt;
-  const apiKey = req.session.angel_api_key;
+  const apiKey = req.session.angelApiKey;
   if (!jwt) return res.status(401).json({ error: 'not_authenticated', message: 'Please Test Connection first' });
 
   const cacheKey = exchange + ':' + token + ':' + interval + ':' + fromDate + ':' + toDate;

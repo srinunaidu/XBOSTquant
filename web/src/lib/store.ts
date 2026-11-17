@@ -146,7 +146,7 @@ export const useStore = create<State>((set) => ({
   datasets: {},
   fromDate: '', toDate: '',
   dataInfo: 'No file loaded — upload a 1-min CSV to begin.',
-  dataSource: null,
+  dataSource: "csv",
   timeframes: [...TFS],
   objective: 'sharpe',
   topN: 500, cap: 60000,
